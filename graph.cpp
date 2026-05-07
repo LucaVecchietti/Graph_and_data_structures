@@ -1,7 +1,6 @@
 #include <bits/stdc++.h>
 
 using namespace std;
-using namespace std;
 
 /**
  * Base node struct — type-erased, holds the adjacency map.
