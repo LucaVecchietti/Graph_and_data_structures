@@ -3,15 +3,19 @@
 using namespace std;
 using namespace std;
 
-// Base node struct — type-erased, holds the adjacency map.
-// neighborgs: relation_type -> { neighbor_index -> (weight, neighbor_ptr) }
+/**
+ * Base node struct — type-erased, holds the adjacency map.
+ * neighborgs: relation_type -> { neighbor_index -> (weight, neighbor_ptr) }
+ */
 struct BaseNode
 {
     virtual ~BaseNode() = default;
     map<string, map<int, pair<int, BaseNode *>>> neighborgs;
 };
 
-// Typed node — inherits adjacency from BaseNode and adds the actual data payload
+/** 
+ * Typed node — inherits adjacency from BaseNode and adds the actual data payload
+ */
 template <typename T>
 struct Node : public BaseNode
 {
@@ -35,20 +39,25 @@ public:
         }
     }
 
-    // Creates a new typed node, assigns its value and appends it to the node list.
-    // The index of the node in the vector acts as its ID.
+    /**
+     * Creates a new typed node, assigns its value and appends it to the node list.
+     * The index of the node in the vector acts as its ID.
+     * Insert with move — avoid copies of large data structures.
+     */
     template <typename T>
-    void insert(T value)
+    void insert(T&& value)  // forward reference 
     {
 
-        Node<T> *newNode = new Node<T>(); // Create a new node
-        newNode->data = value;            // Assign the input value
+        Node<T> *newNode = new Node<T>();       // Create a new node
+        newNode->data = forward<T>(value);      // Assign the input value and mantain lvalue\rvalue
 
-        nodes.push_back(newNode); // Add to the base nodes vector
+        nodes.push_back(newNode);   // Add to the base nodes vector
     }
 
-    // Adds a directed edge from start to end with an optional type and weight.
-    // The edge is stored under the given relation type in the adjacency map.
+    /**
+     * Adds a directed edge from start to end with an optional type and weight.
+     * The edge is stored under the given relation type in the adjacency map.
+     */
     void add_edge(int start, int end, string type = "", int weight = 1)
     {
 
