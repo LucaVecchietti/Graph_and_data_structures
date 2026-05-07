@@ -22,51 +22,55 @@ struct Node : public BaseNode
     T data;
 };
 
+/**
+ * Graph data structure is build to store differente type of data in an efficente way and to seva relation.
+ */
+
 class Graph
 {
 
-private:
-    vector<BaseNode *> nodes; // Owns all nodes — responsible for their lifetime
+    private:
+        vector<BaseNode *> nodes; // Owns all nodes — responsible for their lifetime
 
-public:
-    Graph() {} // Basic constructor
+    public:
+        Graph() {} // Basic constructor
 
-    virtual ~Graph()
-    { // Destructor — frees all heap-allocated nodes
-        for (auto node : nodes)
-        {
-            delete node;
+        virtual ~Graph()
+        { // Destructor — frees all heap-allocated nodes
+            for (auto node : nodes)
+            {
+                delete node;
+            }
         }
-    }
 
-    /**
-     * Creates a new typed node, assigns its value and appends it to the node list.
-     * The index of the node in the vector acts as its ID.
-     * Insert with move — avoid copies of large data structures.
-     */
-    template <typename T>
-    void insert(T&& value)  // forward reference 
-    {
+        /**
+         * Creates a new typed node, assigns its value and appends it to the node list.
+         * The index of the node in the vector acts as its ID.
+         * Insert with move — avoid copies of large data structures.
+         */
+        template <typename T>
+        void insert(T&& value)  // forward reference 
+        {
 
-        Node<T> *newNode = new Node<T>();       // Create a new node
-        newNode->data = forward<T>(value);      // Assign the input value and mantain lvalue\rvalue
+            Node<T> *newNode = new Node<T>();       // Create a new node
+            newNode->data = forward<T>(value);      // Assign the input value and mantain lvalue\rvalue
 
-        nodes.push_back(newNode);   // Add to the base nodes vector
-    }
+            nodes.push_back(newNode);   // Add to the base nodes vector
+        }
 
-    /**
-     * Adds a directed edge from start to end with an optional type and weight.
-     * The edge is stored under the given relation type in the adjacency map.
-     */
-    void add_edge(int start, int end, string type = "", int weight = 1)
-    {
+        /**
+         * Adds a directed edge from start to end with an optional type and weight.
+         * The edge is stored under the given relation type in the adjacency map.
+         */
+        void add_edge(int start, int end, string type = "", int weight = 1)
+        {
 
-        BaseNode *node = nodes[start];                         // Get the start node from the base nodes vector
-        auto edge = pair<int, BaseNode *>(weight, nodes[end]); // Create the edge and assign the weight
+            BaseNode *node = nodes[start];                         // Get the start node from the base nodes vector
+            auto edge = pair<int, BaseNode *>(weight, nodes[end]); // Create the edge and assign the weight
 
-        // Add the edge and the near node to the neighborgs based on the type of the relation
-        node->neighborgs[type][end] = edge;
-    }
+            // Add the edge and the near node to the neighborgs based on the type of the relation
+            node->neighborgs[type][end] = edge;
+        }
 };
 
 int main () {
