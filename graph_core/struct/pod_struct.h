@@ -76,5 +76,6 @@ struct Edge
     uint64_t id;      // Edge  ID
     int64_t weight;   // Weight of the edge
     uint64_t to_node; // Destination node idx on nodes.idx file [ to_node → NodeIndex(id == to_node)]
+    uint64_t from_node; // Source node idx on nodes.idx file [ from_node → NodeIndex(id == from_node)]
 };
 #pragma pack(pop)

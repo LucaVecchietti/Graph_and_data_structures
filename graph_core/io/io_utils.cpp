@@ -74,9 +74,25 @@ std::string read_string(std::ifstream &in)
 /**
  * Writes a 64-bit offset to the output stream.
  */
-void write_offset(const uint64_t offset, std::ostream &out);
+void write_offset(const uint64_t offset, std::ostream &out)
+{
+    if (!out)
+    {
+        throw std::invalid_argument("Output stream is not valid.");
+    }
+    out.write(reinterpret_cast<const char *>(&offset), sizeof(offset));
+}
 
 /**
  * Reads a 64-bit offset from the input stream.
  */
-uint64_t read_offset(std::ifstream &in);
+uint64_t read_offset(std::ifstream &in)
+{
+    if (!in)
+    {
+        throw std::invalid_argument("Input stream is not valid.");
+    }
+    uint64_t offset;
+    in.read(reinterpret_cast<char *>(&offset), sizeof(offset));
+    return offset;
+}
