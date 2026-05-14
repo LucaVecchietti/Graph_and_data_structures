@@ -16,7 +16,7 @@ Graph::Graph(){
 } // Basic constructor
 
 Graph::~Graph(){
-    for (auto node : nodes)
+    for (auto [idx, node] : nodes)
     {
         delete node;
     }
@@ -63,13 +63,18 @@ void Graph::load_meta()
  * Adds a directed edge from start to end with an optional type and weight.
  * The edge is stored under the given relation type in the adjacency map.
  */
-void Graph::add_edge(int start, int end, std::string type = "", int weight = 1)
+void Graph::add_edge(int start, int end, std::string type, int weight = 1)
 {
     if (type.length() > RELATION_TYPE_MAX_SIZE)
     {
         throw std::invalid_argument(
             "The size of the sring '" + type + "' is over the limit of " +
             std::to_string(RELATION_TYPE_MAX_SIZE) + " characters by " + std::to_string(type.length() - RELATION_TYPE_MAX_SIZE) + " characters.");
+    }
+
+    if (nodes.find(start) == nodes.end() || nodes.find(end) == nodes.end())
+    {
+        throw std::out_of_range("Start or end node does not exist.");
     }
 
     BaseNode *node = nodes[start];                              // Get the start node from the base nodes vector

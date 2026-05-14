@@ -1,6 +1,6 @@
 #pragma once
 
-#include <map>
+#include <unordered_map>
 #include <string>
 #include <utility>
 
@@ -15,7 +15,7 @@
 struct BaseNode
 {
     virtual ~BaseNode() = default;
-    std::map<std::string, std::map<int, std::pair<int, BaseNode *>>> neighborgs;
+    std::unordered_map<std::string, std::unordered_map<int, std::pair<int, BaseNode *>>> neighborgs;
 };
 
 /**

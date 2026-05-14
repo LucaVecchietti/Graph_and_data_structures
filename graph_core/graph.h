@@ -1,6 +1,8 @@
 #pragma once
 
 #include <vector>
+#include <unordered_map>
+#include <unordered_set>
 #include <string>
 #include <stdexcept>
 #include "costants.h"
@@ -17,7 +19,7 @@ class Graph
 {
 
 private:
-    std::vector<BaseNode *> nodes; // Owns all nodes — responsible for their lifetime
+    std::unordered_map<int, BaseNode *> nodes; // Owns all nodes — responsible for their lifetime
 
     MetaRecord meta; // Metadata for disk storage management
 
@@ -27,13 +29,7 @@ private:
 public:
     Graph();// Basic constructor
 
-    virtual ~Graph()
-    { // Destructor — frees all heap-allocated nodes
-        for (auto node : nodes)
-        {
-            delete node;
-        }
-    }
+    ~Graph(); // Destructor — frees all heap-allocated nodes
 
     /**
      * Creates a new typed node, assigns its value and appends it to the node list.
@@ -48,10 +44,11 @@ public:
         Node<ValueType> *newNode = new Node<ValueType>(); // Create a new node
         newNode->data = std::forward<T>(value);                // Assign the input value and mantain lvalue\rvalue
 
-        nodes.push_back(newNode); // Add to the base nodes vector
+        nodes[meta.next_id] = newNode; // Add to the base nodes map with the next available ID as the key
 
         // Update metadata
         meta.node_count++;
+        meta.next_id++; // Increment the next available ID
 
         // Persist the new node and updated metadata to disk
         std::ofstream out(std::filesystem::path(DB_PATH) / "nodes.idx", std::ios::binary | std::ios::app); // Open in append mode to add new nodes
@@ -83,15 +80,15 @@ public:
      * EdgeFn: callback(int from, int to, int weight) — fired for every edge explored
      */
     template <typename Policy, typename NodeFn, typename EdgeFn>
-    void traverse(int start, const std::string &type, NodeFn &&on_node, EdgeFn on_edge)
+    void traverse(int start, const std::string &type, NodeFn &&on_node, EdgeFn &&on_edge)
     {
-        std::vector<bool> visited(nodes.size(), false);
+        std::unordered_set<int> visited;
         typename Policy::Frontier frontier;
 
         // Marks a node as visited, fires the node callback, pushes to frontier
         auto visit = [&](int idx)
         {
-            visited[idx] = true;
+            visited.insert(idx);
             on_node(idx);
             Policy::push(frontier, idx);
         };
@@ -100,17 +97,21 @@ public:
 
         while (!Policy::empty(frontier))
         {
-
             int current = Policy::pop(frontier);
 
-            auto it = nodes[current]->neighborgs.find(type);
-            if (it == nodes[current]->neighborgs.end())
+            // save some time by looking up the node once instead of per edge
+            auto nodeIt = nodes.find(current);
+            if (nodeIt == nodes.end())
+                continue; // nodo non esiste
+
+            auto it = nodeIt->second->neighborgs.find(type);
+            if (it == nodeIt->second->neighborgs.end())
                 continue;
 
             for (auto &[neighborgIdx, edge] : it->second)
             {
-                on_edge(current, neighborgIdx, edge.first); // fired for every edge, visited or not
-                if (!visited[neighborgIdx])
+                on_edge(current, neighborgIdx, edge.first);
+                if (visited.find(neighborgIdx) == visited.end())
                     visit(neighborgIdx);
             }
         }
@@ -120,12 +121,12 @@ public:
     template <typename NodeFn, typename EdgeFn>
     void bfs(int start, const std::string &type, NodeFn &&on_node, EdgeFn &&on_edge)
     {
-        traverse<BFSPolicy>(start, type, forward<NodeFn>(on_node), forward<EdgeFn>(on_edge));
+        traverse<BFSPolicy>(start, type, std::forward<NodeFn>(on_node), std::forward<EdgeFn>(on_edge));
     }
 
     template <typename NodeFn, typename EdgeFn>
     void dfs(int start, const std::string &type, NodeFn &&on_node, EdgeFn &&on_edge)
     {
-        traverse<DFSPolicy>(start, type, forward<NodeFn>(on_node), forward<EdgeFn>(on_edge));
+        traverse<DFSPolicy>(start, type, std::forward<NodeFn>(on_node), std::forward<EdgeFn>(on_edge));
     }
 };
