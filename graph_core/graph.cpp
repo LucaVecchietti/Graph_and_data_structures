@@ -1,43 +1,80 @@
-#include <iostream>
 #include "graph.h"
+#include "costants.h"
+#include "struct/pod_struct.h"
+#include "io/io_utils.h"
+#include <filesystem>
 
-using namespace std;
+Graph::Graph(){
+    if (!std::filesystem::exists(std::filesystem::path(DB_PATH) / "meta.dat") || std::filesystem::file_size(std::filesystem::path(DB_PATH) / "meta.dat") == 0)
+    {
+        init_meta();
+    }
+    else
+    {
+        load_meta();
+    }
+} // Basic constructor
 
-int main()
+Graph::~Graph(){
+    for (auto node : nodes)
+    {
+        delete node;
+    }
+} // Destructor — frees all heap-allocated nodes
+
+// ---- Private Methods ----
+
+void Graph::init_meta()
 {
-    Graph g;
+    // Initialize metadata on disk, such as next available node ID and node count.
+    // This is necessary for maintaining the integrity of the graph across sessions.
 
-    // Insert nodes — storing simple ints as payload
-    g.insert(0); // node 0
-    g.insert(1); // node 1
-    g.insert(2); // node 2
-    g.insert(3); // node 3
+    MetaRecord meta;
+    meta.next_id = 0; // Start with ID 0 for the first node
+    meta.node_count = 0; // No nodes initially
+    meta.free_count = 0; // No free offsets initially
 
-    // Build a simple directed graph
-    //
-    //   0 ──(road,5)──→ 1
-    //   0 ──(road,3)──→ 2
-    //   1 ──(road,2)──→ 3
-    //   2 ──(road,4)──→ 3
-    //
-    g.add_edge(0, 1, "road", 5);
-    g.add_edge(0, 2, "road", 3);
-    g.add_edge(1, 3, "road", 2);
-    g.add_edge(2, 3, "road", 4);
+    std::ofstream out(std::filesystem::path(DB_PATH) / "meta.dat", std::ios::binary);
+    if (!out)
+    {
+        throw std::runtime_error("Failed to initialize metadata file.");
+    }
 
-    // ── BFS ────────────────────────────────────────────────────────────────
-    cout << "=== BFS ===\n";
-    g.bfs(0, "road", [](int idx)
-          { cout << "  [node] visited: " << idx << "\n"; }, [](int from, int to, int weight)
-          { cout << "  [edge] " << from << " -> " << to
-                 << "  (weight=" << weight << ")\n"; });
+    write_pod(meta, out); // Write the initial metadata to disk
+}
 
-    // ── DFS ────────────────────────────────────────────────────────────────
-    cout << "\n=== DFS ===\n";
-    g.dfs(0, "road", [](int idx)
-          { cout << "  [node] visited: " << idx << "\n"; }, [](int from, int to, int weight)
-          { cout << "  [edge] " << from << " -> " << to
-                 << "  (weight=" << weight << ")\n"; });
+void Graph::load_meta()
+{
+    // Load metadata from disk, such as next available node ID and node count.
+    // This is necessary for maintaining the integrity of the graph across sessions.
 
-    return 0;
+    std::ifstream in(std::filesystem::path(DB_PATH) / "meta.dat", std::ios::binary);
+    if (!in)
+    {
+        throw std::runtime_error("Failed to load metadata file.");
+    }
+
+    Graph::meta = read_pod<MetaRecord>(in); // Read the metadata from disk
+}
+
+// ---- Public Methods ----
+
+/**
+ * Adds a directed edge from start to end with an optional type and weight.
+ * The edge is stored under the given relation type in the adjacency map.
+ */
+void Graph::add_edge(int start, int end, std::string type = "", int weight = 1)
+{
+    if (type.length() > RELATION_TYPE_MAX_SIZE)
+    {
+        throw std::invalid_argument(
+            "The size of the sring '" + type + "' is over the limit of " +
+            std::to_string(RELATION_TYPE_MAX_SIZE) + " characters by " + std::to_string(type.length() - RELATION_TYPE_MAX_SIZE) + " characters.");
+    }
+
+    BaseNode *node = nodes[start];                              // Get the start node from the base nodes vector
+    auto edge = std::pair<int, BaseNode *>(weight, nodes[end]); // Create the edge and assign the weight
+
+    // Add the edge and the near node to the neighborgs based on the type of the relation
+    node->neighborgs[type][end] = edge;
 }

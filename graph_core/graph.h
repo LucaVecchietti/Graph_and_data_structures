@@ -18,8 +18,13 @@ class Graph
 private:
     std::vector<BaseNode *> nodes; // Owns all nodes — responsible for their lifetime
 
+    MetaRecord meta; // Metadata for disk storage management
+
+    void init_meta();
+    void load_meta();
+
 public:
-    Graph() {} // Basic constructor
+    Graph();// Basic constructor
 
     virtual ~Graph()
     { // Destructor — frees all heap-allocated nodes
@@ -49,21 +54,7 @@ public:
      * Adds a directed edge from start to end with an optional type and weight.
      * The edge is stored under the given relation type in the adjacency map.
      */
-    void add_edge(int start, int end, std::string type = "", int weight = 1)
-    {
-        if (type.length() > RELATION_TYPE_MAX_SIZE)
-        {
-            throw std::invalid_argument(
-                "The size of the sring '" + type + "' is over the limit of " +
-                std::to_string(RELATION_TYPE_MAX_SIZE) + " characters by " + std::to_string(type.length() - RELATION_TYPE_MAX_SIZE) + " characters.");
-        }
-
-        BaseNode *node = nodes[start];                         // Get the start node from the base nodes vector
-        auto edge = std::pair<int, BaseNode *>(weight, nodes[end]); // Create the edge and assign the weight
-
-        // Add the edge and the near node to the neighborgs based on the type of the relation
-        node->neighborgs[type][end] = edge;
-    }
+    void add_edge(int start, int end, std::string type = "", int weight = 1);
 
     /**
      * Generic graph traversal — behavior determined by Policy at compile time.
@@ -116,6 +107,4 @@ public:
     {
         traverse<DFSPolicy>(start, type, forward<NodeFn>(on_node), forward<EdgeFn>(on_edge));
     }
-
-    // TODO: implement save/load method to persist the graph on the disc.
 };

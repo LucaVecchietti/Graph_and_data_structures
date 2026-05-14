@@ -9,6 +9,12 @@
 // ---- I/O Nodes ----
 
 /**
+ * Write Node, which consists of a NodeIndex, a NodeRecord, and a RelationNodeList, to the output stream. 
+ */
+template <typename T>
+void write_node(const Node<T> &node, std::ofstream &out);
+
+/**
  * Writes a NodeIndex struct to the output stream.
  */
 void write_node_index(const NodeIndex &idx, std::ofstream &out);
