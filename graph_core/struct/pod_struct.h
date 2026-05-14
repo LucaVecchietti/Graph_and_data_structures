@@ -79,3 +79,23 @@ struct Edge
     uint64_t from_node; // Source node idx on nodes.idx file [ from_node → NodeIndex(id == from_node)]
 };
 #pragma pack(pop)
+
+/**
+ * Metadata struct POD for the graph, hold the offset of the next free position on the disc and the number of nodes in the graph.
+ */
+
+#pragma pack(push, 1)
+struct MetaRecord
+{
+    uint64_t next_id;
+    uint64_t node_count;
+    uint64_t free_count; // How many offsets are available in freelist.dat
+};
+#pragma pack(pop)
+
+#pragma pack(push, 1)
+struct FreeRecord
+{
+    uint64_t offset; // free offset in nodes.dat
+};
+#pragma pack(pop)
