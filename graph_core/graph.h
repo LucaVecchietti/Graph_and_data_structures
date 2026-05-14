@@ -7,6 +7,7 @@
 #include "struct/functions_policies.h"
 #include "struct/domain_struct.h"
 #include "struct/pod_struct.h"
+#include "io/graph_io.h"
 
 /**
  * Graph data structure is build to store differente type of data in an efficente way and to seva relation.
@@ -48,6 +49,26 @@ public:
         newNode->data = std::forward<T>(value);                // Assign the input value and mantain lvalue\rvalue
 
         nodes.push_back(newNode); // Add to the base nodes vector
+
+        // Update metadata
+        meta.node_count++;
+
+        // Persist the new node and updated metadata to disk
+        std::ofstream out(std::filesystem::path(DB_PATH) / "nodes.idx", std::ios::binary | std::ios::app); // Open in append mode to add new nodes
+        if (!out)        {
+            throw std::runtime_error("Failed to open nodes index file for writing.");
+        }
+
+        write_node(*newNode, out, meta); // Write the new node to disk
+        out.close();
+
+        std::ofstream metaOut(std::filesystem::path(DB_PATH) / "meta.dat", std::ios::binary | std::ios::trunc); // Open in truncate mode to overwrite metadata
+        if (!metaOut)        {
+            throw std::runtime_error("Failed to open metadata file for writing.");
+        }
+
+        write_pod(meta, metaOut); // Update metadata on disk
+        metaOut.close();
     }
 
     /**
