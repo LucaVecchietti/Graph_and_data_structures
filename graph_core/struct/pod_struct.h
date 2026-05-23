@@ -2,6 +2,15 @@
 
 #include <cstdint>
 
+enum class NodeType : uint8_t
+{
+    INT    = 0,
+    FLOAT  = 1,
+    DOUBLE = 2,
+    CHAR   = 3,
+    BOOL   = 4,
+};
+
 /**
  * DISC optimized struct for I/O | POD
  */
@@ -15,6 +24,7 @@ struct NodeIndex
     uint64_t id;              // ID of the node
     uint64_t offset;          // Offset to NodeRecord
     uint64_t relation_offset; // Offset to RelationNodeList
+    NodeType type_id;         // Type tag of the stored data
 };
 #pragma pack(pop)
 

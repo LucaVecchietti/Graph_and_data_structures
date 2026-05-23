@@ -2,6 +2,7 @@
 
 #include "../struct/pod_struct.h"
 #include "../struct/domain_struct.h"
+#include "../struct/type_registry.h"
 #include "../odt/node_odt.h"
 #include "../costants.h"
 #include "io_utils.h"
@@ -16,7 +17,7 @@
  * Writes a NodeIndex to nodes.idx. record_offset and relation_offset are the
  * positions already written by write_node_record / write_relation_node_list.
  */
-void write_node_index(uint64_t record_offset, uint64_t relation_offset, std::ofstream &out, const MetaRecord &meta);
+void write_node_index(uint64_t record_offset, uint64_t relation_offset, NodeType type_id, std::ofstream &out, const MetaRecord &meta);
 
 NodeIndex        read_node_index(std::ifstream &in);
 RelationNodeList read_relation_node_list(std::ifstream &in);
@@ -69,7 +70,7 @@ void write_node(const Node<T> &node, const MetaRecord &meta)
 
     std::ofstream idx_out(std::filesystem::path(DB_PATH) / "nodes.idx", std::ios::binary | std::ios::app);
     if (!idx_out) throw std::runtime_error("Failed to open nodes index file for writing.");
-    write_node_index(record_offset, relation_offset, idx_out, meta);
+    write_node_index(record_offset, relation_offset, node_type_of_v<T>, idx_out, meta);
 }
 
 template <typename T>

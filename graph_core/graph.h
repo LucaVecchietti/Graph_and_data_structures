@@ -5,6 +5,7 @@
 #include <unordered_set>
 #include <string>
 #include <stdexcept>
+#include "logger.h"
 #include "costants.h"
 #include "struct/functions_policies.h"
 #include "struct/domain_struct.h"
@@ -22,6 +23,8 @@ private:
     std::unordered_map<int, BaseNode *> nodes; // Owns all nodes — responsible for their lifetime
 
     MetaRecord meta; // Metadata for disk storage management
+
+    Logger logger = Logger("graph.log", LogLevel::DEBUG); // Logger instance for debugging and info
 
     void init_meta();
     void load_meta();
@@ -51,6 +54,9 @@ public:
         // Update metadata
         meta.node_count++;
         meta.next_id++; // Increment the next available ID
+
+        // Log the insertion of the new node
+        logger.info("Inserted node with ID " + std::to_string(meta.next_id - 1) + " and value " + std::to_string(newNode->data));
 
         write_meta(meta);
     }

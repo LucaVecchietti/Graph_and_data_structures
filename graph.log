@@ -1,0 +1,7 @@
+2026-05-23 18:51:22 [INFO ] Inserted node with ID 6 and value 10
+2026-05-23 18:51:22 [INFO ] Inserted node with ID 7 and value 20
+2026-05-23 18:51:22 [INFO ] Inserted node with ID 8 and value 30
+2026-05-23 18:54:24 [INFO ] Inserted node with ID 9 and value 10
+2026-05-23 18:54:24 [INFO ] Inserted node with ID 10 and value 20
+2026-05-23 18:54:24 [INFO ] Inserted node with ID 11 and value 30
+2026-05-23 18:54:24 [ERROR] Failed to add edge: start or end node does not exist.

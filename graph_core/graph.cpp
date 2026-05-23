@@ -54,6 +54,7 @@ void Graph::add_edge(int start, int end, std::string type, int weight)
 {
     if (type.length() > RELATION_TYPE_MAX_SIZE)
     {
+        Graph::logger.error("Failed to add edge: relation type '" + type + "' exceeds maximum allowed size of " + std::to_string(RELATION_TYPE_MAX_SIZE) + " characters.");
         throw std::invalid_argument(
             "The size of the sring '" + type + "' is over the limit of " +
             std::to_string(RELATION_TYPE_MAX_SIZE) + " characters by " + std::to_string(type.length() - RELATION_TYPE_MAX_SIZE) + " characters.");
@@ -61,11 +62,14 @@ void Graph::add_edge(int start, int end, std::string type, int weight)
 
     if (nodes.find(start) == nodes.end() || nodes.find(end) == nodes.end())
     {
+        Graph::logger.error("Failed to add edge: start or end node does not exist.");
         throw std::out_of_range("Start or end node does not exist.");
     }
 
     BaseNode *node = nodes[start];                              // Get the start node from the base nodes vector
     auto edge = std::pair<int, BaseNode *>(weight, nodes[end]); // Create the edge and assign the weight
+
+    logger.info("Adding edge from node " + std::to_string(start) + " to node " + std::to_string(end) + " with type '" + type + "' and weight " + std::to_string(weight));
 
     // Add the edge and the near node to the neighborgs based on the type of the relation
     node->neighborgs[type][end] = edge;
