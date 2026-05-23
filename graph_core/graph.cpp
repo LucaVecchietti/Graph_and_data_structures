@@ -52,7 +52,7 @@ void Graph::load_meta()
  * Adds a directed edge from start to end with an optional type and weight.
  * The edge is stored under the given relation type in the adjacency map.
  */
-void Graph::add_edge(int start, int end, std::string type, int weight = 1)
+void Graph::add_edge(int start, int end, std::string type, int weight)
 {
     if (type.length() > RELATION_TYPE_MAX_SIZE)
     {

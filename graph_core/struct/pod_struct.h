@@ -2,10 +2,6 @@
 
 #include <cstdint>
 
-// ---- Costants ----
-
-const uint8_t RELATION_TYPE_MAX_SIZE = 255;
-
 /**
  * DISC optimized struct for I/O | POD
  */

@@ -16,9 +16,9 @@
  */
 template <typename T>
 void write_pod(const T &pod, std::ostream &out){
-    std::static_assert(std::is_trivially_assignable_v<T>, "Template parameter\ T must be a POD type!");
+    static_assert(std::is_trivially_copyable_v<T>, "Template parameter T must be a POD type!");
     if (!out) throw std::invalid_argument("Output stream is not valid.");
-    out.write(std::reinterpret_cast<const char*>(&pod), sizeof(T));
+    out.write(reinterpret_cast<const char*>(&pod), sizeof(T));
 }
 
 /**
@@ -27,7 +27,7 @@ void write_pod(const T &pod, std::ostream &out){
  */
 template <typename T>
 T read_pod(std::ifstream &in){
-    std::static_assert(std::is_trivially_assignable_v<T>, "Template parameter\ T must be a POD type!");
+    static_assert(std::is_trivially_copyable_v<T>, "Template parameter T must be a POD type!");
     if (!in) throw std::invalid_argument("Input stream is not valid.");
     T pod;
     in.read(reinterpret_cast<char*>(&pod), sizeof(T));

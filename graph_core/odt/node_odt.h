@@ -2,6 +2,7 @@
 
 #include "../struct/domain_struct.h"
 #include "../struct/pod_struct.h"
+#include <type_traits>
 
 // ---- Node ODT ----
 /**
@@ -17,7 +18,13 @@
  */
 
 template <typename T>
-NodeRecord<T> node_to_record(const Node<T> &node);
+NodeRecord<T> node_to_record(const Node<T> &node)
+{
+    static_assert(std::is_trivially_copyable_v<T>, "Template parameter T must be a POD type!");
+    NodeRecord<T> record;
+    record.data = node.data;
+    return record;
+}
 
 /**
  * Translates a typed Node struct to a RelationNodeList POD struct for serialization.

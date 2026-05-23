@@ -1,0 +1,4 @@
+C:/Users/lucav/Desktop/graphs/pointer_graphs/build/CMakeFiles/graph_core.dir
+C:/Users/lucav/Desktop/graphs/pointer_graphs/build/CMakeFiles/graph.dir
+C:/Users/lucav/Desktop/graphs/pointer_graphs/build/CMakeFiles/edit_cache.dir
+C:/Users/lucav/Desktop/graphs/pointer_graphs/build/CMakeFiles/rebuild_cache.dir
