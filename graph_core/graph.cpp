@@ -6,6 +6,8 @@
 #include <filesystem>
 
 Graph::Graph(){
+    std::filesystem::create_directories(DB_PATH);
+
     if (!std::filesystem::exists(std::filesystem::path(DB_PATH) / "meta.dat") || std::filesystem::file_size(std::filesystem::path(DB_PATH) / "meta.dat") == 0)
     {
         init_meta();
@@ -27,13 +29,9 @@ Graph::~Graph(){
 
 void Graph::init_meta()
 {
-    // Initialize metadata on disk, such as next available node ID and node count.
-    // This is necessary for maintaining the integrity of the graph across sessions.
-
-    MetaRecord meta;
-    meta.next_id = 0; // Start with ID 0 for the first node
-    meta.node_count = 0; // No nodes initially
-    meta.free_count = 0; // No free offsets initially
+    meta.next_id = 0;
+    meta.node_count = 0;
+    meta.free_count = 0;
 
     write_meta(meta);
 }

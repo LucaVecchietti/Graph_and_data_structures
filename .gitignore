@@ -1,3 +1,5 @@
 .claude/
 .vscode/
 *.exe
+db/*
+build/*
