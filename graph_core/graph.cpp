@@ -1,6 +1,7 @@
 #include "graph.h"
 #include "costants.h"
 #include "struct/pod_struct.h"
+#include "io/graph_io.h"
 #include "io/io_utils.h"
 #include <filesystem>
 
@@ -34,13 +35,7 @@ void Graph::init_meta()
     meta.node_count = 0; // No nodes initially
     meta.free_count = 0; // No free offsets initially
 
-    std::ofstream out(std::filesystem::path(DB_PATH) / "meta.dat", std::ios::binary);
-    if (!out)
-    {
-        throw std::runtime_error("Failed to initialize metadata file.");
-    }
-
-    write_pod(meta, out); // Write the initial metadata to disk
+    write_meta(meta);
 }
 
 void Graph::load_meta()
@@ -48,13 +43,7 @@ void Graph::load_meta()
     // Load metadata from disk, such as next available node ID and node count.
     // This is necessary for maintaining the integrity of the graph across sessions.
 
-    std::ifstream in(std::filesystem::path(DB_PATH) / "meta.dat", std::ios::binary);
-    if (!in)
-    {
-        throw std::runtime_error("Failed to load metadata file.");
-    }
-
-    Graph::meta = read_pod<MetaRecord>(in); // Read the metadata from disk
+    Graph::meta = read_meta();
 }
 
 // ---- Public Methods ----

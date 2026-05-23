@@ -12,7 +12,7 @@
  * Write Node, which consists of a NodeIndex, a NodeRecord, and a RelationNodeList, to the output stream. 
  */
 template <typename T>
-void write_node(const Node<T> &node, std::ofstream &out);
+void write_node(const Node<T> &node, std::ofstream &out, const MetaRecord &meta);
 
 /**
  * Writes a NodeIndex struct to the output stream.
@@ -32,3 +32,9 @@ NodeRecord<T> read_node_record(std::ifstream &in);
 void write_relation_node_list(const RelationNodeList &list, std::ofstream &out);
 
 RelationNodeList read_relation_node_list(std::ifstream &in);
+
+// ---- Meta Data I/O ----
+
+void write_meta(const MetaRecord &meta);
+
+MetaRecord read_meta();

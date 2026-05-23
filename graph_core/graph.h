@@ -46,26 +46,13 @@ public:
 
         nodes[meta.next_id] = newNode; // Add to the base nodes map with the next available ID as the key
 
+        write_node(*newNode, meta); // Write the new node to disk
+
         // Update metadata
         meta.node_count++;
         meta.next_id++; // Increment the next available ID
 
-        // Persist the new node and updated metadata to disk
-        std::ofstream out(std::filesystem::path(DB_PATH) / "nodes.idx", std::ios::binary | std::ios::app); // Open in append mode to add new nodes
-        if (!out)        {
-            throw std::runtime_error("Failed to open nodes index file for writing.");
-        }
-
-        write_node(*newNode, out, meta); // Write the new node to disk
-        out.close();
-
-        std::ofstream metaOut(std::filesystem::path(DB_PATH) / "meta.dat", std::ios::binary | std::ios::trunc); // Open in truncate mode to overwrite metadata
-        if (!metaOut)        {
-            throw std::runtime_error("Failed to open metadata file for writing.");
-        }
-
-        write_pod(meta, metaOut); // Update metadata on disk
-        metaOut.close();
+        write_meta(meta);
     }
 
     /**
