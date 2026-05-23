@@ -1,12 +1,12 @@
 # ninja log v7
 25	335	8012560863962695	CMakeFiles/graph_core.dir/graph_core/odt/edge_odt.cpp.obj	3b9f3862b23ffe42
 25	285	8012561330503407	CMakeFiles/graph_core.dir/graph_core/odt/node_odt.cpp.obj	fbdd16338e996f8b
-15	795	8012561330400998	CMakeFiles/graph_core.dir/graph_core/graph.cpp.obj	598901488ace7179
+15	757	8012570145582089	CMakeFiles/graph_core.dir/graph_core/graph.cpp.obj	598901488ace7179
 29	812	8012561330533375	CMakeFiles/graph.dir/main.cpp.obj	a4f31c6a1db1e2cb
 18	322	8012562018190651	CMakeFiles/graph_core.dir/graph_core/io/io_utils.cpp.obj	f5e87262911bc990
 15	517	8012562018150573	CMakeFiles/graph_core.dir/graph_core/io/graph_io.cpp.obj	1776d0a50f6c82bf
-517	670	8012562023176741	libgraph_core.a	9bd7b9d51e2af632
-671	805	8012562024715153	graph.exe	5b1c0d08442b3da6
-15	757	8012570145582089	CMakeFiles/graph_core.dir/graph_core/graph.cpp.obj	598901488ace7179
 758	892	8012570153023984	libgraph_core.a	9bd7b9d51e2af632
 892	1028	8012570154364373	graph.exe	5b1c0d08442b3da6
+27	153	8012574124691009	libgraph_core.a	24c07fc5ecfef627
+33	1397	8012574124744566	CMakeFiles/graph.dir/main.cpp.obj	a4f31c6a1db1e2cb
+1399	1538	8012574138413677	graph.exe	5b1c0d08442b3da6

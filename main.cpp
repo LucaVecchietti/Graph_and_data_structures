@@ -1,5 +1,6 @@
 #include "graph_core/graph.h"
 #include <iostream>
+#include <windows.h>
 
 int main()
 {
@@ -16,6 +17,8 @@ int main()
         [](int idx)                 { std::cout << "node " << idx << "\n"; },
         [](int from, int to, int w) { std::cout << "edge " << from << "->" << to << " w=" << w << "\n"; }
     );
+
+    system("pause");
 
     return 0;
 }
