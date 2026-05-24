@@ -41,14 +41,33 @@ std::vector<RelationEntry> read_relation_node_list(std::ifstream &in)
     return entries;
 }
 
-BaseNode read_node(const uint64_t &idx)
+NodeIndex read_node_index(std::ifstream &in)
 {
-    
-    NodeIndex node_idx = read_node_index(idx);
-    NodeRecord record = read_node_record(node_idx.offset);
-    std::vector<RelationEntry> rel_list = read_relation_node_list(node_idx.relation_offset);
+    return read_pod<NodeIndex>(in);
+}
 
-    BaseNode node = node_form_pod();
+BaseNode* read_node(uint64_t id)
+{
+    std::ifstream idx_in(std::filesystem::path(DB_PATH) / "nodes.idx", std::ios::binary);
+    if (!idx_in) throw std::runtime_error("Failed to open nodes index file for reading.");
+    idx_in.seekg(static_cast<std::streamoff>(id * sizeof(NodeIndex)));
+    NodeIndex node_idx = read_node_index(idx_in);
+
+    std::ifstream dat_in(std::filesystem::path(DB_PATH) / "nodes.dat", std::ios::binary);
+    if (!dat_in) throw std::runtime_error("Failed to open nodes data file for reading.");
+
+    std::ifstream edges_in(std::filesystem::path(DB_PATH) / "edges.dat", std::ios::binary);
+    if (!edges_in) throw std::runtime_error("Failed to open edges file for reading.");
+
+    switch (node_idx.type_id)
+    {
+        case NodeType::INT:    return read_typed_node<int>   (node_idx, dat_in, edges_in);
+        case NodeType::FLOAT:  return read_typed_node<float> (node_idx, dat_in, edges_in);
+        case NodeType::DOUBLE: return read_typed_node<double>(node_idx, dat_in, edges_in);
+        case NodeType::CHAR:   return read_typed_node<char>  (node_idx, dat_in, edges_in);
+        case NodeType::BOOL:   return read_typed_node<bool>  (node_idx, dat_in, edges_in);
+        default: throw std::runtime_error("Unknown NodeType for node id " + std::to_string(id));
+    }
 }
 
 // ---- Meta Data I/O ----

@@ -102,9 +102,36 @@ void write_node(const Node<T> &node, const MetaRecord &meta)
     write_node_index(record_offset, relation_offset, node_type_of_v<T>, idx_out, meta);
 }
 
-BaseNode read_node(const uint64_t &idx);
+BaseNode* read_node(uint64_t id);
 
 template <typename T>
-NodeRecord<T> read_node_record(std::ifstream &in){
+NodeRecord<T> read_node_record(std::ifstream &in)
+{
+    return read_pod<NodeRecord<T>>(in);
+}
 
+template <typename T>
+BaseNode* read_typed_node(const NodeIndex &node_idx, std::ifstream &dat_in, std::ifstream &edges_in)
+{
+    dat_in.seekg(static_cast<std::streamoff>(node_idx.offset));
+    NodeRecord<T> record = read_node_record<T>(dat_in);
+
+    dat_in.seekg(static_cast<std::streamoff>(node_idx.relation_offset));
+    std::vector<RelationEntry> entries = read_relation_node_list(dat_in);
+
+    Node<T> *node = new Node<T>();
+    node->data = record.data;
+
+    for (const auto &entry : entries)
+    {
+        edges_in.seekg(static_cast<std::streamoff>(entry.edge_offset));
+        for (uint64_t i = 0; i < entry.edge_count; ++i)
+        {
+            Edge edge = read_pod<Edge>(edges_in);
+            // neighbor ptr is nullptr — must be re-linked after all nodes are loaded
+            node->neighborgs[entry.name][static_cast<int>(edge.to_node)] = {static_cast<int>(edge.weight), nullptr};
+        }
+    }
+
+    return node;
 }
