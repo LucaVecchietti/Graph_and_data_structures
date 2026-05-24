@@ -25,6 +25,32 @@ void write_node_index(const uint64_t record_offset, const uint64_t relation_offs
     write_pod(idx, out);
 }
 
+std::vector<RelationEntry> read_relation_node_list(std::ifstream &in)
+{
+    RelationNodeList header = read_pod<RelationNodeList>(in);
+    std::vector<RelationEntry> entries;
+    entries.reserve(header.type_count);
+    for (uint64_t i = 0; i < header.type_count; ++i)
+    {
+        RelationEntry entry;
+        entry.name        = read_string(in);
+        entry.edge_offset = read_offset(in);
+        entry.edge_count  = read_offset(in);
+        entries.push_back(std::move(entry));
+    }
+    return entries;
+}
+
+BaseNode read_node(const uint64_t &idx)
+{
+    
+    NodeIndex node_idx = read_node_index(idx);
+    NodeRecord record = read_node_record(node_idx.offset);
+    std::vector<RelationEntry> rel_list = read_relation_node_list(node_idx.relation_offset);
+
+    BaseNode node = node_form_pod();
+}
+
 // ---- Meta Data I/O ----
 
 void write_meta(const MetaRecord &meta){

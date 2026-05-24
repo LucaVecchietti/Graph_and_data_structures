@@ -4,12 +4,22 @@
 #include "../struct/domain_struct.h"
 #include "../struct/type_registry.h"
 #include "../odt/node_odt.h"
+#include "../odt/edge_odt.h"
 #include "../costants.h"
 #include "io_utils.h"
 #include <fstream>
 #include <filesystem>
+#include <vector>
+#include <string>
 
 // Graph I/O header — defines functions for saving and loading the graph to/from disk in a binary format.
+
+struct RelationEntry
+{
+    std::string name;
+    uint64_t    edge_offset;
+    uint64_t    edge_count;
+};
 
 // ---- Non-template declarations ──────────────────────────────────────
 
@@ -19,8 +29,8 @@
  */
 void write_node_index(uint64_t record_offset, uint64_t relation_offset, NodeType type_id, std::ofstream &out, const MetaRecord &meta);
 
-NodeIndex        read_node_index(std::ifstream &in);
-RelationNodeList read_relation_node_list(std::ifstream &in);
+NodeIndex                    read_node_index(std::ifstream &in);
+std::vector<RelationEntry>   read_relation_node_list(std::ifstream &in);
 void             write_meta(const MetaRecord &meta);
 MetaRecord       read_meta();
 
@@ -43,15 +53,34 @@ uint64_t write_node_record(const Node<T> &node)
 }
 
 /**
- * Writes the adjacency list of a Node to the provided stream.
+ * Writes the adjacency list of a Node to nodes.dat (out) and edges to edges.dat.
+ * For each relation type: writes [name][edge_offset][edge_count] after the POD header.
  * Returns the byte offset where the relation list was written.
  */
 template <typename T>
-uint64_t write_relation_node_list(const Node<T> &node, std::ofstream &out)
+uint64_t write_relation_node_list(const Node<T> &node, uint64_t node_id, std::ofstream &out)
 {
     RelationNodeList list = node_to_relation_list(node);
     uint64_t offset = out.tellp();
     write_pod(list, out);
+
+    std::ofstream edges_out(std::filesystem::path(DB_PATH) / "edges.dat", std::ios::binary | std::ios::app);
+    if (!edges_out) throw std::runtime_error("Failed to open edges file for writing.");
+
+    uint64_t edge_idx = 0;
+    for (const auto &[rel_type, neighbors] : node.neighborgs)
+    {
+        uint64_t edge_offset = edges_out.tellp();
+        for (const auto &[to_id, wp] : neighbors)
+        {
+            Edge edge = edge_to_pod(edge_idx++, node_id, static_cast<uint64_t>(to_id), static_cast<uint64_t>(wp.first));
+            write_pod(edge, edges_out);
+        }
+        uint64_t edge_count = static_cast<uint64_t>(neighbors.size());
+        write_string(rel_type, out);
+        write_offset(edge_offset, out);
+        write_offset(edge_count, out);
+    }
     return offset;
 }
 
@@ -66,12 +95,16 @@ void write_node(const Node<T> &node, const MetaRecord &meta)
 
     std::ofstream rel_out(std::filesystem::path(DB_PATH) / "nodes.dat", std::ios::binary | std::ios::app);
     if (!rel_out) throw std::runtime_error("Failed to open nodes record file for writing.");
-    uint64_t relation_offset = write_relation_node_list<T>(node, rel_out);
+    uint64_t relation_offset = write_relation_node_list<T>(node, meta.next_id, rel_out);
 
     std::ofstream idx_out(std::filesystem::path(DB_PATH) / "nodes.idx", std::ios::binary | std::ios::app);
     if (!idx_out) throw std::runtime_error("Failed to open nodes index file for writing.");
     write_node_index(record_offset, relation_offset, node_type_of_v<T>, idx_out, meta);
 }
 
+BaseNode read_node(const uint64_t &idx);
+
 template <typename T>
-NodeRecord<T> read_node_record(std::ifstream &in);
+NodeRecord<T> read_node_record(std::ifstream &in){
+
+}

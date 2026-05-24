@@ -39,3 +39,15 @@ NodeIndex node_to_node_index(uint64_t id, uint64_t record_offset, uint64_t relat
     idx.relation_offset = relation_offset;
     return idx;
 }
+
+/**
+ * 
+ */
+std::unordered_map<std::string, std::unordered_map<int, std::pair<int, BaseNode *>>> reconstruct_neighbors(const RelationNodeList &rellist)
+{
+    std::unordered_map<std::string, std::unordered_map<int, std::pair<int, BaseNode *>>> neighbors;
+    
+    
+
+    return neighbors;
+}

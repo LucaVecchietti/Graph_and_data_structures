@@ -2,6 +2,7 @@
 
 #include "../struct/domain_struct.h"
 #include "../struct/pod_struct.h"
+#include <unordered_map>
 #include <type_traits>
 
 // ---- Node ODT ----
@@ -40,3 +41,21 @@ RelationNodeList node_to_relation_list(const BaseNode &node);
  */
 
 NodeIndex node_to_node_index(uint64_t id, uint64_t record_offset, uint64_t relation_offset);
+
+/**
+ * 
+ */
+std::unordered_map<std::string, std::unordered_map<int, std::pair<int, BaseNode *>>> reconstruct_neighbors(const RelationNodeList &rellist);
+
+/**
+ * 
+ */
+template <typename T>
+BaseNode node_form_pod(const NodeIndex &idx, const NodeRecord<T> &record, const RelationNodeList &rellist){
+    Node<T> node;
+    node.data = record.data;
+
+    node.neihborgs = reconstruct_neighbors(rellist);
+
+    return node;
+}
