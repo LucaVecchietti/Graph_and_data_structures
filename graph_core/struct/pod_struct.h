@@ -20,6 +20,14 @@ enum class NodeType : uint8_t
     DOUBLE = 2,
     CHAR   = 3,
     BOOL   = 4,
+
+    COMPLEX = 255 // Reserved for Record that require a type label (e.g. std::string type = "Athlete" | "Item" | "Company" etc.) with different attributes.
+    /**
+     * To support different type of record we can use the COMPLEX type and write the type label as a string that rapresent the type of the record .
+     * The the different attributes of the record can be stored as a JSON string after the hader of teh record. 
+     * The complex type is identical to a classical DB Record, but it require a more complex logic to write and read the record on the DISC.
+     * - NOTE: WIP.
+     */
 };
 
 /**
@@ -114,5 +122,19 @@ struct MetaRecord
 struct FreeRecord
 {
     uint64_t offset; // free offset in nodes.dat
+};
+#pragma pack(pop)
+
+/**
+ * ComplexHeader is a POD struct uesd for nodes of type COMPLEX, witch require a type label and a JSON string to store the attributes of the record.
+ * The type_label is a string that rapresent the type of the record (e.g. "Athlete", "Item", "Company" etc.) 
+ * and the json_attributes is a string that contains the attributes of the record in JSON format.
+ */
+#pragma pack(push, 1)
+struct ComplexHeader
+{
+    uint64_t type_label_size; // Size of the type label string
+    uint64_t json_attributes_size; // Size of the JSON attributes string
+    // Followed by [type_label][json_attributes]
 };
 #pragma pack(pop)
