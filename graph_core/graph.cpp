@@ -60,10 +60,44 @@ void Graph::add_edge(int start, int end, std::string type, int weight)
             std::to_string(RELATION_TYPE_MAX_SIZE) + " characters by " + std::to_string(type.length() - RELATION_TYPE_MAX_SIZE) + " characters.");
     }
 
-    if (nodes.find(start) == nodes.end() || nodes.find(end) == nodes.end())
+    if (nodes.find(start) == nodes.end())
+    {   
+        if (static_cast<uint64_t>(start) < meta.next_id)
+        {
+            try{
+                nodes[start] = read_node(static_cast<uint64_t>(start));
+            }
+            catch (const std::exception &e)
+            {
+                Graph::logger.error("Failed to add edge: could not read node " + std::to_string(start) + ": " + e.what());
+                throw std::runtime_error("Failed to read node " + std::to_string(start) + ": " + e.what());
+            }
+        }
+        else
+        {
+            Graph::logger.error("Failed to add edge: node " + std::to_string(start) + " does not exist.");
+            throw std::out_of_range("Node " + std::to_string(start) + " does not exist.");
+        }
+    }
+
+    if (nodes.find(end) == nodes.end())
     {
-        Graph::logger.error("Failed to add edge: start or end node does not exist.");
-        throw std::out_of_range("Start or end node does not exist.");
+        if (static_cast<uint64_t>(end) < meta.next_id)
+        {
+            try{
+                nodes[end] = read_node(static_cast<uint64_t>(end));
+            }
+            catch (const std::exception &e)
+            {
+                Graph::logger.error("Failed to add edge: could not read node " + std::to_string(end) + ": " + e.what());
+                throw std::runtime_error("Failed to read node " + std::to_string(end) + ": " + e.what());
+            }
+        }
+        else
+        {
+            Graph::logger.error("Failed to add edge: node " + std::to_string(end) + " does not exist.");
+            throw std::out_of_range("Node " + std::to_string(end) + " does not exist.");
+        }
     }
 
     BaseNode *node = nodes[start];                              // Get the start node from the base nodes vector

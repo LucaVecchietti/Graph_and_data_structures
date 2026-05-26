@@ -10,8 +10,12 @@ int main()
     g.insert(20);
     g.insert(30);
 
+    system("pause");
+
     g.add_edge(0, 1, "road");
     g.add_edge(1, 2, "road");
+
+    system("pause");
 
     g.bfs(0, "road",
         [](int idx)                 { std::cout << "node " << idx << "\n"; },

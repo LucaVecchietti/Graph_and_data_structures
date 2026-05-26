@@ -56,16 +56,13 @@ BaseNode* read_node(uint64_t id)
     std::ifstream dat_in(std::filesystem::path(DB_PATH) / "nodes.dat", std::ios::binary);
     if (!dat_in) throw std::runtime_error("Failed to open nodes data file for reading.");
 
-    std::ifstream edges_in(std::filesystem::path(DB_PATH) / "edges.dat", std::ios::binary);
-    if (!edges_in) throw std::runtime_error("Failed to open edges file for reading.");
-
     switch (node_idx.type_id)
     {
-        case NodeType::INT:    return read_typed_node<int>   (node_idx, dat_in, edges_in);
-        case NodeType::FLOAT:  return read_typed_node<float> (node_idx, dat_in, edges_in);
-        case NodeType::DOUBLE: return read_typed_node<double>(node_idx, dat_in, edges_in);
-        case NodeType::CHAR:   return read_typed_node<char>  (node_idx, dat_in, edges_in);
-        case NodeType::BOOL:   return read_typed_node<bool>  (node_idx, dat_in, edges_in);
+        case NodeType::INT:    return read_typed_node<int>   (node_idx, dat_in);
+        case NodeType::FLOAT:  return read_typed_node<float> (node_idx, dat_in);
+        case NodeType::DOUBLE: return read_typed_node<double>(node_idx, dat_in);
+        case NodeType::CHAR:   return read_typed_node<char>  (node_idx, dat_in);
+        case NodeType::BOOL:   return read_typed_node<bool>  (node_idx, dat_in);
         default: throw std::runtime_error("Unknown NodeType for node id " + std::to_string(id));
     }
 }

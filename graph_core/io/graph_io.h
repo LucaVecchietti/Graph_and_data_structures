@@ -86,16 +86,22 @@ uint64_t write_relation_node_list(const Node<T> &node, uint64_t node_id, std::of
 
 /**
  * Write Node (NodeIndex + NodeRecord + RelationNodeList) to disk.
- * Opens the necessary files internally.
+ * Uses a single open on nodes.dat so that tellp() returns correct offsets
+ * for both the record and the relation list (double-open in app mode on
+ * Windows returns 0 from tellp() before the first write).
  */
 template <typename T>
 void write_node(const Node<T> &node, const MetaRecord &meta)
 {
-    uint64_t record_offset = write_node_record<T>(node);
+    std::ofstream dat_out(std::filesystem::path(DB_PATH) / "nodes.dat", std::ios::binary | std::ios::app);
+    if (!dat_out) throw std::runtime_error("Failed to open nodes data file for writing.");
 
-    std::ofstream rel_out(std::filesystem::path(DB_PATH) / "nodes.dat", std::ios::binary | std::ios::app);
-    if (!rel_out) throw std::runtime_error("Failed to open nodes record file for writing.");
-    uint64_t relation_offset = write_relation_node_list<T>(node, meta.next_id, rel_out);
+    dat_out.seekp(0, std::ios::end);
+    NodeRecord<T> record = node_to_record(node);
+    uint64_t record_offset = dat_out.tellp();
+    write_pod(record, dat_out);
+
+    uint64_t relation_offset = write_relation_node_list<T>(node, meta.next_id, dat_out);
 
     std::ofstream idx_out(std::filesystem::path(DB_PATH) / "nodes.idx", std::ios::binary | std::ios::app);
     if (!idx_out) throw std::runtime_error("Failed to open nodes index file for writing.");
@@ -111,7 +117,7 @@ NodeRecord<T> read_node_record(std::ifstream &in)
 }
 
 template <typename T>
-BaseNode* read_typed_node(const NodeIndex &node_idx, std::ifstream &dat_in, std::ifstream &edges_in)
+BaseNode* read_typed_node(const NodeIndex &node_idx, std::ifstream &dat_in)
 {
     dat_in.seekg(static_cast<std::streamoff>(node_idx.offset));
     NodeRecord<T> record = read_node_record<T>(dat_in);
@@ -122,14 +128,20 @@ BaseNode* read_typed_node(const NodeIndex &node_idx, std::ifstream &dat_in, std:
     Node<T> *node = new Node<T>();
     node->data = record.data;
 
-    for (const auto &entry : entries)
+    if (!entries.empty())
     {
-        edges_in.seekg(static_cast<std::streamoff>(entry.edge_offset));
-        for (uint64_t i = 0; i < entry.edge_count; ++i)
+        std::ifstream edges_in(std::filesystem::path(DB_PATH) / "edges.dat", std::ios::binary);
+        if (!edges_in) throw std::runtime_error("Failed to open edges file for reading.");
+
+        for (const auto &entry : entries)
         {
-            Edge edge = read_pod<Edge>(edges_in);
-            // neighbor ptr is nullptr — must be re-linked after all nodes are loaded
-            node->neighborgs[entry.name][static_cast<int>(edge.to_node)] = {static_cast<int>(edge.weight), nullptr};
+            edges_in.seekg(static_cast<std::streamoff>(entry.edge_offset));
+            for (uint64_t i = 0; i < entry.edge_count; ++i)
+            {
+                Edge edge = read_pod<Edge>(edges_in);
+                // neighbor ptr is nullptr — must be re-linked after all nodes are loaded
+                node->neighborgs[entry.name][static_cast<int>(edge.to_node)] = {static_cast<int>(edge.weight), nullptr};
+            }
         }
     }
 
