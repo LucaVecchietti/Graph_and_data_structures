@@ -34,7 +34,7 @@ NodeRecord<T> node_to_record(const Node<T> &node)
  * we need to create a specific function to translate the complex node to a ComplexHeader struct that can be written on the disc using the 
  * NodeRecord struct as a container and writing the type label after the Header and the JSON string on a file. 
  */
-NodeRecord<ComplexHeader> complex_node_to_record(const Node<ComplexRecord> &node);
+NodeRecord<ComplexHeader> complex_node_to_record(const Node<ComplexRecord> &node, std::string &json_file_path);
 
 /**
  * Translates a typed Node struct to a RelationNodeList POD struct for serialization.
