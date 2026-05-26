@@ -35,9 +35,11 @@ struct RelationEntry
  * positions already written by write_node_record / write_relation_node_list.
  */
 void write_node_index(uint64_t record_offset, uint64_t relation_offset, NodeType type_id, std::ofstream &out, const MetaRecord &meta);
+void write_complex(const ComplexRecord &complex_record, std::ofstream &out);
 
 NodeIndex                    read_node_index(std::ifstream &in);
 std::vector<RelationEntry>   read_relation_node_list(std::ifstream &in);
+
 void             write_meta(const MetaRecord &meta);
 MetaRecord       read_meta();
 void             write_json_attributes_meta(const JsonMeta &meta);
@@ -106,6 +108,7 @@ void write_node(const Node<T> &node, const MetaRecord &meta)
     if (!dat_out) throw std::runtime_error("Failed to open nodes data file for writing.");
 
     NodeRecord<T> record;   // Convert the Node to a NodeRecord POD struct for serialization. Initialize the record with the data of the node.
+    uint64_t record_offset; // Offset where the NodeRecord is written on the disc.
 
     switch (node_type_of_v<T>)  // Use the type tag to determine how to write the node record and relation list, and to set the type_id in the NodeIndex.
     {
@@ -115,21 +118,22 @@ void write_node(const Node<T> &node, const MetaRecord &meta)
         case NodeType::DOUBLE:
         case NodeType::BOOL:
 
+            // For primitive types, we can directly write the NodeRecord to disk and get the record offset.
             dat_out.seekp(0, std::ios::end);
             record = node_to_record(node);
-            uint64_t record_offset = dat_out.tellp();
+            record_offset = dat_out.tellp();
             write_pod(record, dat_out);
 
             break;
 
         case NodeType::COMPLEX:
             // For complex types, we need to write the ComplexRecord, which includes the type label and the JSON string of attributes.
-            ComplexRecord complex_record; // This should be constructed from the node's data and attributes.
-            write_complex(complex_record, dat_out);
-            uint64_t record_offset = dat_out.tellp(); // This should be set to the correct offset where the complex record was written.
+            record = complex_node_to_record(node);
+            dat_out.seekp(0, std::ios::end);
+            record_offset = dat_out.tellp();
+            write_complex(record, Node<ComplexRecord> node, dat_out);   // This function will handle the writing of the ComplexHeader and the associated JSON attributes to disk.
             break;
 
-        
     }    
 
     uint64_t relation_offset = write_relation_node_list<T>(node, meta.next_id, dat_out);

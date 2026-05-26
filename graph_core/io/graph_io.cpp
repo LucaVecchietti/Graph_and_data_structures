@@ -26,6 +26,33 @@ void write_node_index(const uint64_t record_offset, const uint64_t relation_offs
 }
 
 /**
+ * Write the ComplexHeader struct to the output stream as part of a NodeRecord for a complex type node.
+ * This function should handle the serialization of the ComplexHeader, including the type label and the JSON
+ * string of attributes, to the output stream in a way that it can be correctly read back when loading the node from disk.
+ */
+void write_complex(const ComplexRecord &complex_record, std::ofstream &out)
+{
+    //Write the CmplexHeader struct to the oautput stream.
+    write_pod(complex_record, out);
+
+    // Write the type label and the JSON string of attributes after the complexHeader 
+    write_string(complex_record.type_label, out);
+    write_string(complex_record.json_attributes, out);
+
+    // Open the file to store the JSON attributes of the complex node and write the JSON string to it.
+
+    // The JSON file path is constructed based on the metadata and the type label of the node, and is used to store the JSON attributes of the complex node.
+    std::ofstream json_out(std::filesystem::path(JSON_ATTR_PATH) / complex_record.type_label, std::ios::binary | std::ios::trunc);
+    if (!json_out) {    // Check if the file was opened successfully before attempting to write to it.
+        logger.error("Failed to open JSON attributes file for writing: " + complex_record.type_label);
+        throw std::runtime_error("Failed to open JSON attributes file for writing: " + complex_record.type_label);
+    }
+
+    json_out << complex_record.json_attributes; // Write the JSON string of attributes to the file. 
+    json_out.close(); // Close the file after writing
+}
+
+/**
  * Write ComplexHeader struct on the disk. 
  * This function is used to write the header of a complex type node and the type label 
  * and the json string that contains the attributes of the record in JSON format.

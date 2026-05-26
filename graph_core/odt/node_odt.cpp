@@ -52,7 +52,7 @@ NodeIndex node_to_node_index(uint64_t id, uint64_t record_offset, uint64_t relat
  * we need to create a specific function to translate the complex node to a ComplexHeader struct that can be written on the disc using the 
  * NodeRecord struct as a container and writing the type label after the Header and the JSON string on a file. 
  */
-NodeRecord<ComplexHeader> complex_node_to_record(const Node<ComplexRecord> &node)
+NodeRecord<ComplexHeader> complex_node_to_record(const Node<ComplexRecord> &node, std::string &json_file_path)
 {
     JsonMeta meta_json; 
 
@@ -67,7 +67,7 @@ NodeRecord<ComplexHeader> complex_node_to_record(const Node<ComplexRecord> &node
 
     // Construct the ComplexHeader.json_file_path based on the metadata and the type label of the node
     // the base path for JSON attributes files is defined in costants.h as JSON_ATTR_PATH and is used by the graph_io functions to write and read the JSON attributes of the complex nodes.
-    std::string json_file_path = meta_json.prog_number + "_" + node.data.type_label + ".json";
+    json_file_path = meta_json.prog_number + "_" + node.data.type_label + ".json";
 
     // Construct the ComplexHeader with the type label and JSON attributes
     ComplexHeader header;
