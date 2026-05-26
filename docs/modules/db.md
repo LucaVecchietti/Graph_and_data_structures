@@ -7,7 +7,7 @@
 | Tipo | module |
 | Lingua | en |
 | Ultimo aggiornamento | 2026-05-26 |
-| Commit di riferimento | b6e7304-dirty |
+| Commit di riferimento | 326920c |
 | Mirror | — |
 
 ---
@@ -22,23 +22,29 @@
 
 ```
 db/
-├── meta.dat       MetaRecord (truncated + rewritten on every insert)
-├── nodes.idx      array of NodeIndex records (appended on insert)
-├── nodes.dat      NodeRecord<T> + RelationNodeList (appended on insert)
-└── edges.dat      Edge records (appended on insert)
+├── meta.dat                              MetaRecord (truncated + rewritten on every insert)
+├── nodes.idx                             array of NodeIndex records (appended on insert)
+├── nodes.dat                             NodeRecord<T> | ComplexHeader+strings + RelationNodeList (appended on insert)
+├── edges.dat                             Edge records (appended on insert)
+└── attributes/                           COMPLEX sidecars (created on first COMPLEX node)
+    ├── attributes_meta.dat               JsonMeta (truncated + rewritten on every COMPLEX write)
+    └── {prog_number}_{type_label}.json   JSON attributes payload per COMPLEX node
 ```
 
 There is no header magic, no version field, no checksum. Reading a `db/` produced by a build with a different `NodeType` enum or different POD layout will silently misinterpret data.
 
+The `attributes/` subtree only exists once at least one COMPLEX node has been written (or once `read_json_attributes_meta` is called and lazy-creates `attributes_meta.dat`). The COMPLEX write path is **not yet compilable** — the layout described below is the intended on-disk format, not something the current binary produces. See the [sidecar JSON design decision](../legacy/design_decisions.md#2026-05-26--storage-sidecar-json-per-nodi-complex) and [BUG-009..BUG-014](../legacy/known_bugs.md).
+
 ## Design
 
 - **Append-only data files** (`nodes.dat`, `nodes.idx`, `edges.dat`) — opened with `std::ios::binary | std::ios::app`. Cheap inserts, no in-place updates.
-- **Truncated meta** — `meta.dat` is opened with `std::ios::binary | std::ios::trunc` and fully rewritten on every change. It's tiny (24 bytes) so the cost is irrelevant.
+- **Truncated meta** — `meta.dat` (and `attributes/attributes_meta.dat`) are opened with `std::ios::binary | std::ios::trunc` and fully rewritten on every change. They're tiny (24 bytes / 8 bytes) so the cost is irrelevant.
 - **Fixed-width `NodeIndex`** — allows O(1) lookup by id via `seekg(id * sizeof(NodeIndex))` in `nodes.idx`.
 - **Type tag inside `NodeIndex`** — lets `read_node` dispatch to the right `read_typed_node<T>` without touching `nodes.dat`.
 - **Edges stored separately** — `edges.dat` holds the flat list of all edges; each `RelationNodeList` tail entry stores `(name, edge_offset, edge_count)` pointing into it.
+- **COMPLEX payload stored out-of-line** — for `NodeType::COMPLEX`, the record in `nodes.dat` carries only the header + the labels; the actual JSON attributes live in `attributes/{prog_number}_{type_label}.json`, named via the `JsonMeta.prog_number` counter.
 
-See [Append-only data files, truncated meta](../legacy/design_decisions.md#2026-05-26--append-only-data-files-truncated-meta).
+See [Append-only data files, truncated meta](../legacy/design_decisions.md#2026-05-26--append-only-data-files-truncated-meta) and [Storage sidecar JSON per nodi COMPLEX](../legacy/design_decisions.md#2026-05-26--storage-sidecar-json-per-nodi-complex).
 
 ## File formats
 
@@ -69,7 +75,7 @@ offset  size  field
 
 Random access by id: `seekg(id * 25)`.
 
-`type_id == 255` (`NodeType::COMPLEX`) marks a record whose payload at `offset` is a `ComplexHeader` followed by two raw strings (`type_label`, `json_attributes`) — see below. The on-disk path for COMPLEX is WIP and no record of this kind is produced by the current code; the value `255` is reserved.
+`type_id == 255` (`NodeType::COMPLEX`) marks a record whose payload at `offset` is a `ComplexHeader` followed by two raw strings (`type_label`, `json_file_path`) — see below. The actual JSON payload lives in a separate file under `attributes/`. The on-disk write path for COMPLEX exists in source but does not compile yet (see [BUG-009..BUG-014](../legacy/known_bugs.md)); no record of this kind is produced by the current binary. The value `255` is reserved.
 
 ### `nodes.dat`
 
@@ -77,7 +83,7 @@ For each inserted node, the file contains two regions in this order (but not con
 
 1. **Payload** — depends on `NodeIndex.type_id`:
    - **Primitive types** (`INT, FLOAT, DOUBLE, CHAR, BOOL`): a `NodeRecord<T>` — `sizeof(T)` bytes of raw payload. 4, 4, 8, 1, 1 bytes respectively.
-   - **`COMPLEX` (255)**: a `ComplexHeader` (16 bytes: `type_label_size` + `json_attributes_size`, both `uint64_t`) followed by `type_label_size` raw bytes of the label, then `json_attributes_size` raw bytes of the JSON. Format reserved but **not yet written** by any current code path — WIP.
+   - **`COMPLEX` (255)**: a `ComplexHeader` (16 bytes: `type_label_size` + `json_file_path_size`, both `uint64_t`) followed by two length-prefixed strings written via `write_string` — `type_label` then `json_file_path`. The JSON attributes themselves are **not** stored in `nodes.dat`: they live in the sidecar file at `attributes/{json_file_path}` (path relative to `JSON_ATTR_PATH`). Format reserved but **not yet produced** by the current binary — the write path is uncompilable, see [BUG-009..BUG-014](../legacy/known_bugs.md).
 2. **`RelationNodeList` header + tail**:
    ```
    offset  size  field
@@ -106,6 +112,26 @@ offset  size  field
 ```
 
 Edges for a given `(node, relation)` are stored consecutively starting at `RelationNodeList.tail.edge_offset` for `edge_count` entries.
+
+### `attributes/attributes_meta.dat`
+
+A single `JsonMeta` POD, 8 bytes:
+
+```
+offset  size  field
+  0      8    prog_number   (uint64_t) — monotonic counter for unique sidecar names
+```
+
+Truncated and rewritten in full via `write_json_attributes_meta`. Lazy-created on first call to `read_json_attributes_meta` (with `prog_number = 0`).
+
+### `attributes/{prog_number}_{type_label}.json`
+
+The actual JSON attributes of a COMPLEX node, written as raw UTF-8 text (no length prefix, no framing). Filename composition:
+
+- `prog_number` comes from `JsonMeta.prog_number` at write time.
+- `type_label` is the COMPLEX node's runtime label (e.g. `Athlete`, `Item`).
+
+The exact filename **must** match the `json_file_path` string stored in the on-disk `ComplexHeader` so that the read path can reopen the file. The current code does not satisfy this constraint — `complex_node_to_record` composes `{prog}_{label}.json` for the header while `write_complex` actually opens `attributes/{label}` (no prog, no extension). See [BUG-013](../legacy/known_bugs.md).
 
 ## Diagrammi
 
@@ -146,20 +172,29 @@ Edges for a given `(node, relation)` are stored consecutively starting at `Relat
 
 ## Voci legacy collegate
 
+- [Storage sidecar JSON per nodi COMPLEX](../legacy/design_decisions.md#2026-05-26--storage-sidecar-json-per-nodi-complex)
 - [Introduzione tag NodeType::COMPLEX + ComplexRecord (WIP)](../legacy/design_decisions.md#2026-05-26--introduzione-tag-nodetypecomplex--complexrecord-wip)
 - [Append-only data files, truncated meta](../legacy/design_decisions.md#2026-05-26--append-only-data-files-truncated-meta)
 - [Single-open append su nodes.dat](../legacy/design_decisions.md#2026-05-26--single-open-append-su-nodesdat)
 - [POD packed e fragilità ABI](../legacy/design_decisions.md#2026-05-26--pod-packed-e-fragilità-abi)
+- [API — ComplexHeader rinominato](../legacy/api_changes.md#2026-05-26--complexheaderjson_attributes_size--json_file_path_size)
 - [BUG-001 — add_edge non persiste](../legacy/known_bugs.md#2026-05-26--bug-001-add_edge-non-persiste-su-disco)
 - [BUG-002 — edge_idx non globale](../legacy/known_bugs.md#2026-05-26--bug-002-edgeid-non-globale-tra-nodi)
+- [BUG-013 — path sidecar incoerente](../legacy/known_bugs.md#2026-05-26--bug-013-path-del-file-json-sidecar-incoerente-tra-complex_node_to_record-e-write_complex)
+- [BUG-014 — prog_number non incrementato](../legacy/known_bugs.md#2026-05-26--bug-014-prog_number-mai-incrementatopersistito-dopo-write-complex)
 
 ## Riferimenti
 
 - `graph_core/struct/pod_struct.h:16` — `NodeType` enum (incl. `COMPLEX = 255`).
 - `graph_core/struct/pod_struct.h:40-126` — POD layouts for `NodeIndex`, `NodeRecord`, `RelationNodeList`, `Edge`, `MetaRecord`, `FreeRecord`.
-- `graph_core/struct/pod_struct.h:134` — `ComplexHeader`.
-- `graph_core/io/graph_io.h:43-109` — write templates.
+- `graph_core/struct/pod_struct.h:134` — `ComplexHeader` (field renamed to `json_file_path_size`).
+- `graph_core/struct/pod_struct.h:148` — `JsonMeta`.
+- `graph_core/costants.h:9-11` — `META_FILE_PATH`, `JSON_ATTR_META_PATH`, `JSON_ATTR_PATH`.
+- `graph_core/io/graph_io.h:38-46` — `write_complex`, `write_json_attributes_meta`, `read_json_attributes_meta` declarations.
+- `graph_core/io/graph_io.h:104-144` — `write_node` template (switch on `NodeType`).
 - `graph_core/io/graph_io.cpp:13` — `write_node_index`.
-- `graph_core/io/graph_io.cpp:49` — `read_node` (dispatch on `type_id` — `COMPLEX` case TBD).
-- `graph_core/io/graph_io.cpp:72` — `write_meta` (truncating).
+- `graph_core/io/graph_io.cpp:33,60` — `write_complex` (duplicate definitions).
+- `graph_core/io/graph_io.cpp:86` — `read_node` (dispatch on `type_id` — `COMPLEX` case TBD).
+- `graph_core/io/graph_io.cpp:109` — `write_meta` (truncating).
+- `graph_core/io/graph_io.cpp:136,154` — `write_json_attributes_meta`, `read_json_attributes_meta`.
 - `graph_core/io/io_utils.cpp:4` — `write_string` (length-prefixed).

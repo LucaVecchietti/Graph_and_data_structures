@@ -7,7 +7,7 @@
 | Tipo | architecture |
 | Lingua | en |
 | Ultimo aggiornamento | 2026-05-26 |
-| Commit di riferimento | 9e8b589 |
+| Commit di riferimento | 326920c |
 | Mirror | — |
 
 ---
@@ -45,13 +45,16 @@ A standalone C subtree (`data_tructures/`, `node_n_pointers.c`) holds the origin
                   └───────┼───────────────────────┘
                           │
                           ▼
-                  ┌───────────────┐
-                  │   db/ (disk)  │
-                  │  nodes.dat    │
-                  │  nodes.idx    │
-                  │  edges.dat    │
-                  │  meta.dat     │
-                  └───────────────┘
+                  ┌──────────────────────────────────┐
+                  │   db/ (disk)                     │
+                  │  nodes.dat                       │
+                  │  nodes.idx                       │
+                  │  edges.dat                       │
+                  │  meta.dat                        │
+                  │  attributes/                     │
+                  │   ├── attributes_meta.dat        │
+                  │   └── {prog}_{label}.json (×N)   │
+                  └──────────────────────────────────┘
 
        ┌────────────────────────────┐
        │  data_tructures/  (C)      │  not linked — legacy prototype
@@ -91,10 +94,17 @@ Graph::insert<T>      (graph_core/graph.h)
    │ write_node(*node, meta)
    ▼
 write_node<T>          (graph_core/io/graph_io.h)
-   │ NodeRecord<T>           → nodes.dat
-   │ RelationNodeList header → nodes.dat
-   │ NodeIndex               → nodes.idx
-   │ (per-relation edges)    → edges.dat
+   │ switch (node_type_of_v<T>)
+   │ ├── primitives (INT/FLOAT/DOUBLE/CHAR/BOOL):
+   │ │     NodeRecord<T>                   → nodes.dat
+   │ └── COMPLEX:                          (currently uncompilable — BUG-010)
+   │       read_json_attributes_meta()     ← attributes/attributes_meta.dat
+   │       complex_node_to_record(node)    → ComplexHeader + json_file_path
+   │       write_complex(...)              → ComplexHeader + 2 strings → nodes.dat
+   │                                       → JSON payload              → attributes/{prog}_{label}.json
+   │ RelationNodeList header              → nodes.dat
+   │ NodeIndex                            → nodes.idx
+   │ (per-relation edges)                 → edges.dat
    ▼
 write_meta(meta)       → meta.dat
 ```
@@ -154,3 +164,4 @@ main.cpp
 - [Policy-based traversal](../legacy/design_decisions.md#2026-05-26--policy-based-traversal-bfsdfs) — why BFS/DFS share one `traverse` template.
 - [Type-erased BaseNode + Node&lt;T&gt;](../legacy/design_decisions.md#2026-05-26--type-erased-basenode--nodet) — why nodes of different payload types can coexist.
 - [Append-only data files, truncated meta](../legacy/design_decisions.md#2026-05-26--append-only-data-files-truncated-meta) — file open modes.
+- [Storage sidecar JSON per nodi COMPLEX](../legacy/design_decisions.md#2026-05-26--storage-sidecar-json-per-nodi-complex) — why COMPLEX records put their JSON payload in `attributes/` rather than inline.

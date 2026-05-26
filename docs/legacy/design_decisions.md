@@ -7,13 +7,14 @@
 | Tipo | legacy-decisions |
 | Lingua | en |
 | Ultimo aggiornamento | 2026-05-26 |
-| Commit di riferimento | b6e7304-dirty |
+| Commit di riferimento | 326920c |
 | Mirror | — |
 
 ---
 
 ## Indice
 
+- [2026-05-26 — Storage sidecar JSON per nodi COMPLEX](#2026-05-26--storage-sidecar-json-per-nodi-complex)
 - [2026-05-26 — Introduzione tag NodeType::COMPLEX + ComplexRecord (WIP)](#2026-05-26--introduzione-tag-nodetypecomplex--complexrecord-wip)
 - [2026-05-26 — Separazione POD vs Domain struct](#2026-05-26--separazione-pod-vs-domain-struct)
 - [2026-05-26 — Type-erased BaseNode + Node\<T\>](#2026-05-26--type-erased-basenode--nodet)
@@ -22,6 +23,27 @@
 - [2026-05-26 — Single-open append su nodes.dat](#2026-05-26--single-open-append-su-nodesdat)
 - [2026-05-26 — POD packed e fragilità ABI](#2026-05-26--pod-packed-e-fragilità-abi)
 - [2026-05-26 — Hash table standalone in C (non linkata)](#2026-05-26--hash-table-standalone-in-c-non-linkata)
+
+---
+
+### 2026-05-26 — Storage sidecar JSON per nodi COMPLEX
+
+- **Stato:** active (path di scrittura presente ma non ancora compilabile — vedi [BUG-009..BUG-014](known_bugs.md))
+- **Contesto:** L'entry precedente ([Introduzione tag NodeType::COMPLEX](#2026-05-26--introduzione-tag-nodetypecomplex--complexrecord-wip)) aveva lasciato aperta la domanda di *dove* mettere gli attributi JSON di un nodo COMPLEX: inline come blob length-prefixed in `nodes.dat`, oppure su file separato? Mettere JSON di lunghezza arbitraria in `nodes.dat` significherebbe gonfiare il file primario con dati che nella pratica vengono letti raramente (sono attributi di record), e rende meno utile l'append-only di lunghezza prevedibile.
+- **Decisione:** Spostare gli attributi JSON in **file sidecar** dedicati sotto `db/attributes/`. L'header on-disk `ComplexHeader` ora porta `(type_label_size, json_file_path_size)` — il secondo campo era `json_attributes_size`, rinominato (vedi [API change](api_changes.md#2026-05-26--complexheaderjson_attributes_size--json_file_path_size)). Subito dopo l'header in `nodes.dat` si scrivono i due blob raw: prima `type_label`, poi `json_file_path`. Il payload JSON vero e proprio vive in un file separato `db/attributes/{prog_number}_{type_label}.json`.
+  Per generare nomi univoci viene introdotta una nuova POD `JsonMeta { uint64_t prog_number; }` persistita in `db/attributes/attributes_meta.dat`, con due funzioni dedicate (`write_json_attributes_meta`, `read_json_attributes_meta`). La lettura è lazy-init: se il file manca, viene creato con `prog_number = 0`.
+  Le costanti di path sono concentrate in `graph_core/costants.h`: `JSON_ATTR_PATH = "../db/attributes/"`, `JSON_ATTR_META_PATH = "../db/attributes/attributes_meta.dat"`, più una `META_FILE_PATH` per simmetria con `meta.dat`.
+- **Alternative considerate:**
+  - *JSON inline in `nodes.dat`*: scartata — gonfia il file primario con dati di lunghezza molto variabile (alcuni record COMPLEX possono avere KB di attributi), peggiora la località degli `seek` per la lettura dei `NodeRecord` semplici, e rende difficile aggiornare il JSON senza riscrivere la coda del file.
+  - *Un singolo `attributes.dat` flat con offset/length*: avrebbe risolto la frammentazione ma reintrodotto la necessità di un freelist quando i JSON cambiano dimensione. Rimandata.
+  - *Tutti i JSON dentro `db/`, senza sottocartella*: scartata — la sottocartella `attributes/` separa logicamente i sidecar dai file di formato primario e permette di pulirla a parte se serve.
+- **Conseguenze:**
+  - Il "formato on-disk" di un nodo COMPLEX non è più contenuto in `nodes.dat` da solo: serve un secondo lettore per `db/attributes/{name}` per ricostruire l'oggetto in RAM.
+  - `read_node` (`graph_core/io/graph_io.cpp:86`) deve aggiungere un `case NodeType::COMPLEX:` che (a) legge `ComplexHeader` + due `read_string`, (b) apre il file JSON al path letto, (c) costruisce un `Node<ComplexRecord>` con il JSON come `json_attributes`. **Non ancora implementato.**
+  - `prog_number` va incrementato dopo ogni write di un nodo COMPLEX e riflushato via `write_json_attributes_meta` — il path di write attuale non lo fa (vedi [BUG-014](known_bugs.md)).
+  - Il path del file JSON costruito da `complex_node_to_record` (`{prog}_{label}.json`) **diverge** dal path che `write_complex` effettivamente usa (`JSON_ATTR_PATH / type_label`) — vedi [BUG-013](known_bugs.md). Va riconciliato prima che il flusso funzioni end-to-end.
+  - Le costanti di path sono ancora **relative** al working directory del binario (lo stesso vincolo di `DB_PATH`: launch da `build/`).
+- **Riferimenti:** `graph_core/struct/pod_struct.h:134` (ComplexHeader rinominato), `graph_core/struct/pod_struct.h:148` (JsonMeta), `graph_core/costants.h:9-11`, `graph_core/odt/node_odt.cpp:55` (complex_node_to_record), `graph_core/io/graph_io.cpp:33` (write_complex), `graph_core/io/graph_io.cpp:136-181` (write/read json meta).
 
 ---
 
