@@ -40,6 +40,8 @@ NodeIndex                    read_node_index(std::ifstream &in);
 std::vector<RelationEntry>   read_relation_node_list(std::ifstream &in);
 void             write_meta(const MetaRecord &meta);
 MetaRecord       read_meta();
+void             write_json_attributes_meta(const JsonMeta &meta);
+JsonMeta         read_json_attributes_meta();
 
 // ---- Template definitions ───────────────────────────────────────────
 

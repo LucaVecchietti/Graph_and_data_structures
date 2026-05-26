@@ -102,3 +102,54 @@ MetaRecord read_meta(){
 
     return read_pod<MetaRecord>(in);
 }
+
+/**
+ * 
+ */
+void write_json_attributes_meta(const JsonMeta &meta)
+{
+    std::ofstream out(std::filesystem::path(DB_PATH) / "attributes/attributes_meta.dat", std::ios::binary | std::ios::trunc);
+    if (!out)
+    {
+        logger.error("Failed to open JSON attributes meta file for writing.");
+        throw std::runtime_error("Failed to open JSON attributes meta file for writing.");
+    }
+
+    write_pod<JsonMeta>(meta, out);
+}
+
+/**
+ * tHis function reads the JSON attributes metadata from the disk, which contains information 
+ * such as the progressive number to generate unique JSON file names for complex nodes.
+ * The JSON attributes metadata is essential for managing the JSON files that store the attributes of complex nodes,
+ * ensuring that each complex node's attributes are stored in a uniquely identifiable JSON file.
+ */
+JsonMeta read_json_attributes_meta()
+{   
+    // Ensure the JSON attributes meta file exists and is not empty before attempting to read it.
+    if (!std::filesystem::exists(std::filesystem::path(DB_PATH) / "attributes/attributes_meta.dat"))
+    {
+        logger.info("Did not find JSON attributes meta file. Creating a new one.");
+        JsonMeta meta;
+        meta.prog_number = 0; // Initialize the progressive number to 0 for the first complex node
+        write_json_attributes_meta(meta);
+    }
+
+    // Now read the JSON attributes meta file, which should exist and contain valid data.
+    std::ifstream in(std::filesystem::path(DB_PATH) / "attributes/attributes_meta.dat", std::ios::binary);
+    //  Check if the file was opened successfully before attempting to read from it.
+    if (!in)
+    {
+        logger.error("Failed to open JSON attributes meta file for reading.");
+        throw std::runtime_error("Failed to open JSON attributes meta file for reading.");
+    }
+
+    // Check if the file is empty before attempting to read the JsonMeta struct.
+    if (in.peek() == std::ifstream::traits_type::eof())
+    {
+        logger.error("JSON attributes meta file is empty.");
+        throw std::runtime_error("JSON attributes meta file is empty.");
+    }
+
+    return read_pod<JsonMeta>(in);
+}

@@ -2,6 +2,9 @@
 #include "../io/graph_io.h"
 #include "../struct/pod_struct.h"
 #include "../logger.h"
+
+Logger logger = Logger("node_odt.log", LogLevel::DEBUG); // Logger instance for debugging and info
+
 // ---- Node ODT ----
 /**
  * This file implement the ODT (Object Data Transfer) functions to translate the domain stract to POD stract and vice versa,
@@ -58,7 +61,6 @@ NodeRecord<ComplexHeader> complex_node_to_record(const Node<ComplexRecord> &node
     }
     catch (const std::exception &e) {
         // Handle the error, e.g., log it and return an empty record or rethrow
-        Logger logger("node_odt.log", LogLevel::ERROR);
         logger.error("Failed to read JSON attributes meta: " + std::string(e.what()));
         throw; // Rethrow the exception after logging
     }
