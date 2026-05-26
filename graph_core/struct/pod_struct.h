@@ -128,13 +128,13 @@ struct FreeRecord
 /**
  * ComplexHeader is a POD struct uesd for nodes of type COMPLEX, witch require a type label and a JSON string to store the attributes of the record.
  * The type_label is a string that rapresent the type of the record (e.g. "Athlete", "Item", "Company" etc.) 
- * and the json_attributes is a string that contains the attributes of the record in JSON format.
+ * and the json_file_path is a string that contains the path to the JSON file that stores the attributes of the record in JSON format.
  */
 #pragma pack(push, 1)
 struct ComplexHeader
 {
     uint64_t type_label_size; // Size of the type label string
-    uint64_t json_attributes_size; // Size of the JSON attributes string
-    // Followed by [type_label][json_attributes]
+    uint64_t json_file_path_size; // Size of the JSON file path string
+    // Followed by [type_label][json_file_path]
 };
 #pragma pack(pop)

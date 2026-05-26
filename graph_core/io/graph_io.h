@@ -103,10 +103,32 @@ void write_node(const Node<T> &node, const MetaRecord &meta)
     std::ofstream dat_out(std::filesystem::path(DB_PATH) / "nodes.dat", std::ios::binary | std::ios::app);
     if (!dat_out) throw std::runtime_error("Failed to open nodes data file for writing.");
 
-    dat_out.seekp(0, std::ios::end);
-    NodeRecord<T> record = node_to_record(node);
-    uint64_t record_offset = dat_out.tellp();
-    write_pod(record, dat_out);
+    NodeRecord<T> record;   // Convert the Node to a NodeRecord POD struct for serialization. Initialize the record with the data of the node.
+
+    switch (node_type_of_v<T>)  // Use the type tag to determine how to write the node record and relation list, and to set the type_id in the NodeIndex.
+    {
+        case NodeType::INT:
+        case NodeType::FLOAT:
+        case NodeType::CHAR:
+        case NodeType::DOUBLE:
+        case NodeType::BOOL:
+
+            dat_out.seekp(0, std::ios::end);
+            record = node_to_record(node);
+            uint64_t record_offset = dat_out.tellp();
+            write_pod(record, dat_out);
+
+            break;
+
+        case NodeType::COMPLEX:
+            // For complex types, we need to write the ComplexRecord, which includes the type label and the JSON string of attributes.
+            ComplexRecord complex_record; // This should be constructed from the node's data and attributes.
+            write_complex(complex_record, dat_out);
+            uint64_t record_offset = dat_out.tellp(); // This should be set to the correct offset where the complex record was written.
+            break;
+
+        
+    }    
 
     uint64_t relation_offset = write_relation_node_list<T>(node, meta.next_id, dat_out);
 

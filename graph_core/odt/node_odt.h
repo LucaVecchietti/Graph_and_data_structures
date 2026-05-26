@@ -28,6 +28,15 @@ NodeRecord<T> node_to_record(const Node<T> &node)
 }
 
 /**
+ * This function is used to translate a complex node to a ComplexRecord struct that can be written on the disc as a complex type node.
+ * The ComplexRecord struct contains the type label and the json string that contains the attributes of the record in JSON format.
+ * The complex type is identical to a classical DB Record, but it require a more complex logic to write and read the record on the DISC, so
+ * we need to create a specific function to translate the complex node to a ComplexHeader struct that can be written on the disc using the 
+ * NodeRecord struct as a container and writing the type label after the Header and the JSON string on a file. 
+ */
+NodeRecord<ComplexHeader> complex_node_to_record(const Node<ComplexRecord> &node);
+
+/**
  * Translates a typed Node struct to a RelationNodeList POD struct for serialization.
  * The RelationNodeList contains the adjacency information (relation types and neighbor offsets),
  * while the data payload is stored separately in the NodeRecord.

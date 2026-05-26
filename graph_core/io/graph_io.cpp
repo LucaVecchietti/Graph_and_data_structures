@@ -25,6 +25,16 @@ void write_node_index(const uint64_t record_offset, const uint64_t relation_offs
     write_pod(idx, out);
 }
 
+/**
+ * Write ComplexHeader struct on the disk. 
+ * This function is used to write the header of a complex type node and the type label 
+ * and the json string that contains the attributes of the record in JSON format.
+ */
+void write_complex(const ComplexRecord &complex_record, std::ofstream &out)
+{
+    return;
+}
+
 std::vector<RelationEntry> read_relation_node_list(std::ifstream &in)
 {
     RelationNodeList header = read_pod<RelationNodeList>(in);
