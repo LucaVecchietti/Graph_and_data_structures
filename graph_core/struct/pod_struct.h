@@ -2,6 +2,17 @@
 
 #include <cstdint>
 
+/**
+ *  NodeType is an enum class that defines the supported data types for node content.
+ *  It is used as a type tag in the NodeIndex struct to indicate how to interpret the data stored in the NodeRecord.
+ *  The current supported types are:
+ * - INT: represents an integer value (NodeRecord<int>)
+ * - FLOAT: represents a floating-point value (NodeRecord<float>)
+ * - DOUBLE: represents a double-precision floating-point value (NodeRecord<double>)
+ * - CHAR: represents a character value (NodeRecord<char>)
+ * - BOOL: represents a boolean value (NodeRecord<bool>)
+ * This enum allows the graph to support nodes with different types of content while maintaining a consistent on-disk format.
+ */
 enum class NodeType : uint8_t
 {
     INT    = 0,
