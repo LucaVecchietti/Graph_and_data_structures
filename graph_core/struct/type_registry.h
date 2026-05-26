@@ -2,6 +2,18 @@
 
 #include "pod_struct.h"
 
+/**
+ * type_registry.h defines the compile-time mapping from C++ types to NodeType tags used for on-disk storage.
+ * This allows the graph to support nodes with different types of content while maintaining a consistent on-disk format.
+ * To add support for a new type, add a new enumerator to the NodeType enum in pod_struct.h and a corresponding specialization of the node_type_of struct template in this file.
+ * For example, to add support for std::string, you would:
+ * 1. Add STRING = 5 to the NodeType enum in pod_struct.h.
+ * 2. Add the following specialization to this file:
+ *    template <> struct node_type_of<std::string> { static constexpr NodeType value = NodeType::STRING; };
+ * This design allows the graph to be easily extended to support new types without modifying the core logic of reading and writing nodes,
+ * as the type information is encapsulated in the NodeType tags and the node_type_of mapping.
+ */
+
 // Compile-time mapping: C++ type → NodeType tag stored on disk.
 // Adding a new type: add a NodeType enumerator and a specialization below.
 
