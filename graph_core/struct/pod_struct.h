@@ -138,3 +138,16 @@ struct ComplexHeader
     // Followed by [type_label][json_file_path]
 };
 #pragma pack(pop)
+
+/**
+ * This struct is used to store the metadata of the JSON attributes of the complex nodes, 
+ * such as a progressive number to generate unique JSON file names for complex nodes.
+ * The JSON attributes of the complex nodes are stored in separate JSON files on the disk, 
+ * and the ComplexHeader struct contains the path to the JSON file that contains the attributes of the record in JSON format.
+ */
+#pragma pack(push, 1)
+struct JsonMeta
+{
+    uint64_t prog_number; // progressive number to generate unique JSON file names for complex nodes
+};
+#pragma pack(pop)
