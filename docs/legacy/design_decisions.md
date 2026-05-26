@@ -7,13 +7,14 @@
 | Tipo | legacy-decisions |
 | Lingua | en |
 | Ultimo aggiornamento | 2026-05-26 |
-| Commit di riferimento | 9e8b589 |
+| Commit di riferimento | b6e7304-dirty |
 | Mirror | — |
 
 ---
 
 ## Indice
 
+- [2026-05-26 — Introduzione tag NodeType::COMPLEX + ComplexRecord (WIP)](#2026-05-26--introduzione-tag-nodetypecomplex--complexrecord-wip)
 - [2026-05-26 — Separazione POD vs Domain struct](#2026-05-26--separazione-pod-vs-domain-struct)
 - [2026-05-26 — Type-erased BaseNode + Node\<T\>](#2026-05-26--type-erased-basenode--nodet)
 - [2026-05-26 — Policy-based traversal (BFS/DFS)](#2026-05-26--policy-based-traversal-bfsdfs)
@@ -21,6 +22,24 @@
 - [2026-05-26 — Single-open append su nodes.dat](#2026-05-26--single-open-append-su-nodesdat)
 - [2026-05-26 — POD packed e fragilità ABI](#2026-05-26--pod-packed-e-fragilità-abi)
 - [2026-05-26 — Hash table standalone in C (non linkata)](#2026-05-26--hash-table-standalone-in-c-non-linkata)
+
+---
+
+### 2026-05-26 — Introduzione tag NodeType::COMPLEX + ComplexRecord (WIP)
+
+- **Stato:** active (path di I/O ancora WIP)
+- **Contesto:** Il modello attuale ammette solo payload POD trivialmente copiabili (`int`, `float`, `double`, `char`, `bool`). Si vogliono però rappresentare nodi "tipo record" che a runtime portano un'etichetta di tipo (`"Athlete"`, `"Item"`, `"Company"`, ecc.) e un insieme variabile di attributi. La closed-set dei POD non basta: serve un tag generico che ammetta payload a forma libera.
+- **Decisione:** Introdotto il tag `NodeType::COMPLEX = 255` in `pod_struct.h` (deliberatamente in fondo allo spazio uint8_t per lasciare 5..254 alle eventuali nuove primitive future). Affiancata la `ComplexHeader` POD (size del type label + size del JSON, seguita dai due blob raw) come header on-disk. Sul lato RAM è stato introdotto `ComplexRecord { std::string type_label; std::string json_attributes; }` in `domain_struct.h`, mappato a `NodeType::COMPLEX` via `node_type_of<ComplexRecord>` in `type_registry.h`. `ComplexRecord` **non è POD** — la separazione [POD vs Domain](#2026-05-26--separazione-pod-vs-domain-struct) è quindi preservata, ma la coppia (`ComplexHeader`, `ComplexRecord`) ha una traduzione D↔P non banale: il payload non si copia raw, va serializzato campo per campo (header POD + due `write_string`).
+- **Alternative considerate:**
+  - *Estendere `node_type_of` a `std::string`*: scartata — uno `std::string` da solo non porta semantica di "che tipo di record è questo", e mappare uno solo dei due campi del payload sarebbe arbitrario.
+  - *Tipo wrapper completamente nuovo che eredita da `BaseNode`* (es. `ComplexNode : BaseNode`): scartata per ora — significherebbe rompere lo schema `Node<T> : BaseNode` con `T` come payload; si è preferito tenere lo schema e introdurre `ComplexRecord` come `T` non-POD, lasciando al path di I/O la responsabilità della serializzazione speciale.
+  - *Solo `ComplexHeader` mappato a COMPLEX, senza ComplexRecord*: scartata — la mappatura `node_type_of<ComplexHeader>` sarebbe semanticamente sbagliata, perché `ComplexHeader` è la parte POD del record on-disk, non il record stesso (manca il payload). Esporlo come `T` confonderebbe il sito chiamante.
+- **Conseguenze:**
+  - `Graph::insert<ComplexRecord>(...)` **non compila al momento**: il path passa per `node_to_record` (`odt/node_odt.h:22`) che ha `static_assert(std::is_trivially_copyable_v<T>)`. Serve un percorso di write parallelo (es. `write_complex_node`) e una variante di `insert` (o un metodo dedicato `insert_complex`) prima di poter usare effettivamente il tag.
+  - `read_node` (`graph_core/io/graph_io.cpp:49`) dovrà acquisire un `case NodeType::COMPLEX:` che istanzia `Node<ComplexRecord>` e legge `ComplexHeader` + due stringhe length-prefixed da `nodes.dat`.
+  - Il formato on-disk per COMPLEX è di fatto **non ancora congelato** — il commit di oggi introduce solo il tag e i POD/struct di RAM. Il vincolo "non rompere il formato esistente" si applicherà a partire dalla prima scrittura reale di un nodo COMPLEX.
+  - Il valore numerico `255` è ora un'occupazione permanente: ridefinirlo significa rompere il formato. Le prossime primitive useranno valori `5..254`.
+- **Riferimenti:** `graph_core/struct/pod_struct.h:16` (enum NodeType), `graph_core/struct/pod_struct.h:134` (ComplexHeader), `graph_core/struct/domain_struct.h:33` (ComplexRecord), `graph_core/struct/type_registry.h:33` (specializzazione). Vedi anche [BUG-001..BUG-005](known_bugs.md) — il path I/O di COMPLEX dovrà essere progettato evitando di replicarli.
 
 ---
 

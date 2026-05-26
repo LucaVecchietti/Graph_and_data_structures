@@ -7,7 +7,7 @@
 | Tipo | module |
 | Lingua | en |
 | Ultimo aggiornamento | 2026-05-26 |
-| Commit di riferimento | 9e8b589 |
+| Commit di riferimento | b6e7304-dirty |
 | Mirror | — |
 
 ---
@@ -81,7 +81,7 @@ Virtual destructor so deleting through `BaseNode*` frees the derived `Node<T>` c
 Adds the typed payload `T data;`. `T` is constrained at use site to be POD (trivially copyable) by `node_to_record`'s `static_assert`.
 
 ### `enum class NodeType : uint8_t` (`struct/pod_struct.h`)
-On-disk tag for `T`. Values: `INT=0, FLOAT=1, DOUBLE=2, CHAR=3, BOOL=4`. The integer values are stable — changing them breaks the on-disk format.
+On-disk tag for `T`. Values: `INT=0, FLOAT=1, DOUBLE=2, CHAR=3, BOOL=4, COMPLEX=255`. The integer values are stable — changing them breaks the on-disk format. `COMPLEX` is reserved for records carrying a runtime `type_label` + JSON attributes (see `ComplexHeader` and `ComplexRecord` below); its on-disk format is WIP. Future primitive types should use values `5..254`.
 
 ### `struct NodeIndex` (POD, packed) (`struct/pod_struct.h`)
 Fixed-width entry stored in `nodes.idx`.
@@ -116,8 +116,26 @@ Header for the adjacency list of a node: a single `uint64_t type_count`. Per-rel
 ### `struct FreeRecord` (POD, packed) (`struct/pod_struct.h`)
 Single `uint64_t offset`. Declared but **not yet used** — placeholder for a future `freelist.dat`.
 
+### `struct ComplexHeader` (POD, packed) (`struct/pod_struct.h`)
+Header for `COMPLEX` nodes on disk.
+| Field | Type | Purpose |
+|---|---|---|
+| `type_label_size` | `uint64_t` | Byte length of the type-label string that follows. |
+| `json_attributes_size` | `uint64_t` | Byte length of the JSON-attributes string that follows. |
+
+The two strings (`type_label` then `json_attributes`) are written **after** the header as raw bytes (no NUL terminator), in this order. The on-disk serialization path for COMPLEX is not implemented yet — see [the legacy entry](../legacy/design_decisions.md#2026-05-26--introduzione-tag-nodetypecomplex--complexrecord-wip).
+
+### `struct ComplexRecord` (`struct/domain_struct.h`)
+RAM-side representation of a `COMPLEX` node payload. Not POD — contains `std::string`.
+| Field | Type | Purpose |
+|---|---|---|
+| `type_label` | `std::string` | Runtime-typed label (e.g. `"Athlete"`, `"Item"`, `"Company"`). |
+| `json_attributes` | `std::string` | JSON-encoded attributes of the record. |
+
+Because `ComplexRecord` is not trivially copyable, it **cannot** flow through the existing `write_pod` / `NodeRecord<T>` path: `Graph::insert<ComplexRecord>(...)` currently fails the `static_assert` in `node_to_record` (`odt/node_odt.h:22`). A dedicated write path is required (see WIP note in the [design decision](../legacy/design_decisions.md#2026-05-26--introduzione-tag-nodetypecomplex--complexrecord-wip)).
+
 ### `template<class T> struct node_type_of` (`struct/type_registry.h`)
-Compile-time `T → NodeType` map. Primary template is intentionally undefined; specializations exist for `int, float, double, char, bool`. Using an unsupported `T` triggers a clear compile error. Convenience: `node_type_of_v<T>`.
+Compile-time `T → NodeType` map. Primary template is intentionally undefined; specializations exist for `int, float, double, char, bool` and `ComplexRecord` (→ `COMPLEX`). Using an unsupported `T` triggers a clear compile error. Convenience: `node_type_of_v<T>`. Note: the `ComplexRecord → COMPLEX` mapping is defined, but the corresponding I/O path is WIP — having the mapping does **not** mean `Graph::insert<ComplexRecord>` works yet.
 
 ### `struct BFSPolicy` / `struct DFSPolicy` (`struct/functions_policies.h`)
 Concept-style policies. Each provides:
@@ -262,6 +280,7 @@ No third-party libraries. No dependency on `data_tructures/`.
 
 ## Voci legacy collegate
 
+- [Introduzione tag NodeType::COMPLEX + ComplexRecord (WIP)](../legacy/design_decisions.md#2026-05-26--introduzione-tag-nodetypecomplex--complexrecord-wip)
 - [Separazione POD vs Domain struct](../legacy/design_decisions.md#2026-05-26--separazione-pod-vs-domain-struct)
 - [Type-erased BaseNode + Node&lt;T&gt;](../legacy/design_decisions.md#2026-05-26--type-erased-basenode--nodet)
 - [Policy-based traversal](../legacy/design_decisions.md#2026-05-26--policy-based-traversal-bfsdfs)
@@ -280,8 +299,11 @@ No third-party libraries. No dependency on `data_tructures/`.
 - `graph_core/graph.h:76` — `traverse<Policy, ...>` template.
 - `graph_core/graph.cpp:53` — `add_edge`.
 - `graph_core/struct/domain_struct.h:15` — `BaseNode`.
-- `graph_core/struct/pod_struct.h:22` — `NodeIndex`.
+- `graph_core/struct/domain_struct.h:33` — `ComplexRecord`.
+- `graph_core/struct/pod_struct.h:16` — `NodeType` (incl. `COMPLEX = 255`).
+- `graph_core/struct/pod_struct.h:41` — `NodeIndex`.
+- `graph_core/struct/pod_struct.h:134` — `ComplexHeader`.
 - `graph_core/struct/functions_policies.h:12` — `BFSPolicy`.
-- `graph_core/struct/type_registry.h:8` — `node_type_of`.
-- `graph_core/io/graph_io.cpp:49` — `read_node` (type dispatch).
+- `graph_core/struct/type_registry.h:20` — `node_type_of` (incl. `ComplexRecord → COMPLEX`).
+- `graph_core/io/graph_io.cpp:49` — `read_node` (type dispatch — `COMPLEX` case TBD).
 - `graph_core/odt/node_odt.cpp:46` — `reconstruct_neighbors` (stub).

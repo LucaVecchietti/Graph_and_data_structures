@@ -7,7 +7,7 @@
 | Tipo | module |
 | Lingua | en |
 | Ultimo aggiornamento | 2026-05-26 |
-| Commit di riferimento | 9e8b589 |
+| Commit di riferimento | b6e7304-dirty |
 | Mirror | — |
 
 ---
@@ -62,18 +62,22 @@ A flat array of `NodeIndex` records, 25 bytes each (packed):
 ```
 offset  size  field
   0      8    id              (uint64_t)
-  8      8    offset          (uint64_t) → into nodes.dat (NodeRecord<T>)
+  8      8    offset          (uint64_t) → into nodes.dat (NodeRecord<T> or ComplexHeader)
  16      8    relation_offset (uint64_t) → into nodes.dat (RelationNodeList)
- 24      1    type_id         (uint8_t)  → NodeType enum
+ 24      1    type_id         (uint8_t)  → NodeType enum  (0..4 primitives, 255 = COMPLEX)
 ```
 
 Random access by id: `seekg(id * 25)`.
+
+`type_id == 255` (`NodeType::COMPLEX`) marks a record whose payload at `offset` is a `ComplexHeader` followed by two raw strings (`type_label`, `json_attributes`) — see below. The on-disk path for COMPLEX is WIP and no record of this kind is produced by the current code; the value `255` is reserved.
 
 ### `nodes.dat`
 
 For each inserted node, the file contains two regions in this order (but not contiguous across nodes — they are interleaved as `write_node` produces them):
 
-1. **`NodeRecord<T>`** — `sizeof(T)` bytes of raw payload (T ∈ {int, float, double, char, bool}). 4, 4, 8, 1, 1 bytes respectively.
+1. **Payload** — depends on `NodeIndex.type_id`:
+   - **Primitive types** (`INT, FLOAT, DOUBLE, CHAR, BOOL`): a `NodeRecord<T>` — `sizeof(T)` bytes of raw payload. 4, 4, 8, 1, 1 bytes respectively.
+   - **`COMPLEX` (255)**: a `ComplexHeader` (16 bytes: `type_label_size` + `json_attributes_size`, both `uint64_t`) followed by `type_label_size` raw bytes of the label, then `json_attributes_size` raw bytes of the JSON. Format reserved but **not yet written** by any current code path — WIP.
 2. **`RelationNodeList` header + tail**:
    ```
    offset  size  field
@@ -142,6 +146,7 @@ Edges for a given `(node, relation)` are stored consecutively starting at `Relat
 
 ## Voci legacy collegate
 
+- [Introduzione tag NodeType::COMPLEX + ComplexRecord (WIP)](../legacy/design_decisions.md#2026-05-26--introduzione-tag-nodetypecomplex--complexrecord-wip)
 - [Append-only data files, truncated meta](../legacy/design_decisions.md#2026-05-26--append-only-data-files-truncated-meta)
 - [Single-open append su nodes.dat](../legacy/design_decisions.md#2026-05-26--single-open-append-su-nodesdat)
 - [POD packed e fragilità ABI](../legacy/design_decisions.md#2026-05-26--pod-packed-e-fragilità-abi)
@@ -150,9 +155,11 @@ Edges for a given `(node, relation)` are stored consecutively starting at `Relat
 
 ## Riferimenti
 
-- `graph_core/struct/pod_struct.h:22-100` — all POD layouts.
+- `graph_core/struct/pod_struct.h:16` — `NodeType` enum (incl. `COMPLEX = 255`).
+- `graph_core/struct/pod_struct.h:40-126` — POD layouts for `NodeIndex`, `NodeRecord`, `RelationNodeList`, `Edge`, `MetaRecord`, `FreeRecord`.
+- `graph_core/struct/pod_struct.h:134` — `ComplexHeader`.
 - `graph_core/io/graph_io.h:43-109` — write templates.
 - `graph_core/io/graph_io.cpp:13` — `write_node_index`.
-- `graph_core/io/graph_io.cpp:49` — `read_node` (dispatch on `type_id`).
+- `graph_core/io/graph_io.cpp:49` — `read_node` (dispatch on `type_id` — `COMPLEX` case TBD).
 - `graph_core/io/graph_io.cpp:72` — `write_meta` (truncating).
 - `graph_core/io/io_utils.cpp:4` — `write_string` (length-prefixed).

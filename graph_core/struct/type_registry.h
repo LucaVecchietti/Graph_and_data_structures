@@ -1,6 +1,7 @@
 #pragma once
 
 #include "pod_struct.h"
+#include "domain_struct.h"
 
 /**
  * type_registry.h defines the compile-time mapping from C++ types to NodeType tags used for on-disk storage.
@@ -25,6 +26,11 @@ template <> struct node_type_of<float>  { static constexpr NodeType value = Node
 template <> struct node_type_of<double> { static constexpr NodeType value = NodeType::DOUBLE; };
 template <> struct node_type_of<char>   { static constexpr NodeType value = NodeType::CHAR;   };
 template <> struct node_type_of<bool>   { static constexpr NodeType value = NodeType::BOOL;   };
+
+// COMPLEX: runtime-typed record (type_label + JSON attributes). ComplexRecord
+// is NOT POD, so the existing write_pod/NodeRecord<T> path does not cover it —
+// the COMPLEX read/write logic must be implemented separately (WIP).
+template <> struct node_type_of<ComplexRecord> { static constexpr NodeType value = NodeType::COMPLEX; };
 
 template <typename T>
 constexpr NodeType node_type_of_v = node_type_of<T>::value;
