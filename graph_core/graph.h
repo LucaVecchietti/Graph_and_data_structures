@@ -55,8 +55,21 @@ public:
         meta.node_count++;
         meta.next_id++; // Increment the next available ID
 
-        // Log the insertion of the new node
-        logger.info("Inserted node with ID " + std::to_string(meta.next_id - 1) + " and value " + std::to_string(newNode->data));
+        // Log the insertion of the new node. std::to_string covers the numeric
+        // primitives (and char/bool, returning the numeric code), but not the
+        // non-POD ComplexRecord payload — for COMPLEX we surface the runtime
+        // type_label instead, which is the most informative tag we have without
+        // dumping the JSON attributes blob.
+        if constexpr (node_type_of_v<ValueType> == NodeType::COMPLEX)
+        {
+            logger.info("Inserted node with ID " + std::to_string(meta.next_id - 1)
+                        + " of complex type \"" + newNode->data.type_label + "\"");
+        }
+        else
+        {
+            logger.info("Inserted node with ID " + std::to_string(meta.next_id - 1)
+                        + " and value " + std::to_string(newNode->data));
+        }
 
         write_meta(meta);
     }

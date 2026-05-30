@@ -51,7 +51,7 @@
   2. `write_complex(record, Node<ComplexRecord> node, dat_out);` — `Node<ComplexRecord> node` in posizione di argomento era una **dichiarazione**, non un'espressione: parse error.
   3. La firma di `write_complex` era `(const ComplexRecord &, std::ofstream &)`: la chiamata passava 3 argomenti e il primo era del tipo sbagliato.
 - **Fix (2026-05-30):** sostituito il `switch (node_type_of_v<T>)` con `if constexpr (node_type_of_v<T> == NodeType::COMPLEX)` in `graph_core/io/graph_io.h:write_node`. Il ramo COMPLEX ora chiama `complex_node_to_record(node, json_file_path)` con la firma corretta e poi `write_complex(node.data, json_file_path, dat_out)`. Con `if constexpr` solo il ramo applicabile a `T` viene istanziato: il ramo primitivi non vede mai `ComplexRecord` e viceversa, eliminando le condizioni che richiedevano i `reinterpret_cast` prefigurati nel pseudo-codice originale. Stessa pattern usata in [`read_typed_node`](../modules/graph_core.md) per simmetria. La firma di `write_complex` è stata ampliata a `(const ComplexRecord&, const std::string &json_file_path, std::ofstream&)` — vedi [API change correlato](api_changes.md). Bloccanti correlati [BUG-011](#2026-05-26--bug-011-complex_node_to_record-concatena-uint64_t--const-char) e [BUG-013](#2026-05-26--bug-013-path-del-file-json-sidecar-incoerente-tra-complex_node_to_record-e-write_complex) chiusi nella stessa sweep perché inseparabili a compile-time.
-- **Regression guard:** un `(void)&write_node<ComplexRecord>;` in un test farebbe emergere subito una futura rottura del ramo COMPLEX. Una volta chiuso [BUG-015](#2026-05-30--bug-015-graphinsert-chiama-stdto_string-su-newnode-data-incompatibile-con-complexrecord) anche un round-trip `Graph::insert(ComplexRecord{...}) + read_node` sarà sufficiente.
+- **Regression guard:** un `(void)&write_node<ComplexRecord>;` in un test farebbe emergere subito una futura rottura del ramo COMPLEX. Dal 2026-05-30, con [BUG-015](#2026-05-30--bug-015-graphinsert-chiama-stdto_string-su-newnode-data-incompatibile-con-complexrecord) chiuso, anche un round-trip `Graph::insert(ComplexRecord{...}) + read_node` è sufficiente (purché [BUG-014](#2026-05-26--bug-014-prog_number-mai-incrementatopersistito-dopo-write-complex) non lo renda flaky sul secondo nodo).
 
 ---
 
@@ -86,7 +86,7 @@
   La lettura del nodo COMPLEX non avrebbe mai trovato il file scritto.
 - **Root cause:** I due lati del flusso (ODT che costruisce il path, I/O che lo usa per aprire il file) non condividevano la stessa stringa: il path veniva ricomputato in modo diverso nei due punti.
 - **Fix (2026-05-30):** la nuova firma `write_complex(const ComplexRecord&, const std::string &json_file_path, std::ofstream&)` accetta esplicitamente la stringa `json_file_path` come parametro — la stessa che `complex_node_to_record` ha appena scritto nel `ComplexHeader`. `write_complex` la usa sia per la `write_string` su `nodes.dat` sia per aprire `JSON_ATTR_PATH / json_file_path`. Un unico valore attraversa il flusso: niente possibilità di divergenza. L'helper `complex_attr_path` suggerito nel pseudo-fix originale non è più necessario.
-- **Regression guard:** un round-trip insert→read di un nodo COMPLEX (bloccato comunque da [BUG-015](#2026-05-30--bug-015-graphinsert-chiama-stdto_string-su-newnode-data-incompatibile-con-complexrecord) e [BUG-014](#2026-05-26--bug-014-prog_number-mai-incrementatopersistito-dopo-write-complex) prima di poterlo eseguire end-to-end).
+- **Regression guard:** un round-trip insert→read di un singolo nodo COMPLEX (compila e gira dal 2026-05-30 con [BUG-015](#2026-05-30--bug-015-graphinsert-chiama-stdto_string-su-newnode-data-incompatibile-con-complexrecord) chiuso; due nodi COMPLEX con lo stesso `type_label` restano problematici finché [BUG-014](#2026-05-26--bug-014-prog_number-mai-incrementatopersistito-dopo-write-complex) è aperto).
 
 ---
 
@@ -102,14 +102,11 @@
 
 ### 2026-05-30 — BUG-015: `Graph::insert` chiama `std::to_string` su `newNode->data`, incompatibile con `ComplexRecord`
 
-- **Stato:** open
-- **Sintomo:** `Graph::insert<ComplexRecord>(...)` non compila. L'errore arriva da `graph_core/graph.h:59` — `logger.info("... and value " + std::to_string(newNode->data))` — perché `std::to_string` non ha overload per `ComplexRecord`. Per i tipi primitivi (`int, float, double, char, bool`) il template compila come prima.
-- **Root cause:** Il log per costruzione include il valore del nodo via `std::to_string(data)`. Funziona per primitivi numerici/`char`/`bool`, ma il template `insert<T>` ora è teoricamente istanziabile anche per tipi non-aritmetici (vedi `ComplexRecord` dopo la chiusura di [BUG-010](#2026-05-26--bug-010-ramo-case-nodetypecomplex-di-write_node-non-compila)) e in quei casi il log fallisce a compile-time.
-- **Fix:** n/a (open). Tre soluzioni in ordine di invasività crescente:
-  1. **Rimuovere** la porzione `+ " and value " + std::to_string(...)` dal log — il valore non è probabilmente l'informazione più utile in un log di inserimento; basta l'ID.
-  2. **Stringificare condizionalmente** con `if constexpr`: per tipi `is_arithmetic_v<T>` (più `char`, `bool`) usare `std::to_string`, altrimenti un placeholder come `"<complex>"` o `node.data.type_label` per `ComplexRecord`.
-  3. **Astrarre via funzione libera** `to_log_string<T>` con specializzazioni — overkill per ora.
-- **Regression guard:** istanziare esplicitamente `Graph::insert<ComplexRecord>` (anche solo dichiarare un puntatore alla funzione membro) farebbe emergere il problema a compile-time.
+- **Stato:** fixed (2026-05-30)
+- **Sintomo:** `Graph::insert<ComplexRecord>(...)` non compilava. L'errore arrivava da `graph_core/graph.h:59` — `logger.info("... and value " + std::to_string(newNode->data))` — perché `std::to_string` non ha overload per `ComplexRecord`. Per i tipi primitivi (`int, float, double, char, bool`) il template compilava come prima.
+- **Root cause:** Il log per costruzione includeva il valore del nodo via `std::to_string(data)`. Funziona per primitivi numerici/`char`/`bool`, ma il template `insert<T>` è ora istanziabile anche per tipi non-aritmetici (vedi `ComplexRecord` dopo la chiusura di [BUG-010](#2026-05-26--bug-010-ramo-case-nodetypecomplex-di-write_node-non-compila)) e in quei casi il log falliva a compile-time.
+- **Fix (2026-05-30):** sostituita la singola `logger.info(...)` con un `if constexpr (node_type_of_v<ValueType> == NodeType::COMPLEX)`. Il ramo primitivi mantiene il log preesistente (`"... and value " + std::to_string(newNode->data)`). Il ramo COMPLEX logga invece `"of complex type \"<type_label>\""`, che è l'informazione più utile disponibile senza dumpare il JSON. Solo il ramo applicabile a `ValueType` viene istanziato, quindi `std::to_string` non viene mai cercato per `ComplexRecord`.
+- **Regression guard:** istanziare `Graph::insert<ComplexRecord>` (anche solo `(void)&Graph::insert<ComplexRecord>;`) ora compila ed esercita il ramo COMPLEX. Una build pulita di una TU che includa `graph.h` e prenda quel puntatore-a-funzione-membro è sufficiente.
 
 ---
 
