@@ -128,10 +128,11 @@ void write_node(const Node<T> &node, const MetaRecord &meta)
 
         case NodeType::COMPLEX:
             // For complex types, we need to write the ComplexRecord, which includes the type label and the JSON string of attributes.
-            record = complex_node_to_record(node);
+            std::string json_file_path; // The file path where the JSON attributes of the complex node will be stored. This path is constructed based on the metadata and the type label of the node.
+            record = complex_node_to_record(node, jso_file_path);
             dat_out.seekp(0, std::ios::end);
             record_offset = dat_out.tellp();
-            write_complex(record, Node<ComplexRecord> node, dat_out);   // This function will handle the writing of the ComplexHeader and the associated JSON attributes to disk.
+            write_complex(record, Node<ComplexRecord> node, json_file_path, dat_out);   // This function will handle the writing of the ComplexHeader and the associated JSON attributes to disk.
             break;
 
     }    
