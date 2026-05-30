@@ -21,7 +21,21 @@
  * positions already written by write_node_record / write_relation_node_list.
  */
 void write_node_index(uint64_t record_offset, uint64_t relation_offset, NodeType type_id, std::ofstream &out, const MetaRecord &meta);
-void write_complex(const ComplexRecord &complex_record, std::ofstream &out);
+
+/**
+ * Writes the on-disk payload of a COMPLEX node and its JSON sidecar file.
+ * Mirror image of read_complex. Caller is responsible for positioning dat_out
+ * at the desired offset (typically end-of-file in append mode).
+ * Writes, in order:
+ *   1. ComplexHeader        (POD, 16 bytes — built from record.type_label.size()
+ *                            and json_file_path.size())
+ *   2. type_label           (length-prefixed string via write_string)
+ *   3. json_file_path       (length-prefixed string via write_string)
+ * Then opens the sidecar file at JSON_ATTR_PATH / json_file_path (trunc) and
+ * writes record.json_attributes into it as raw UTF-8.
+ * Throws std::runtime_error if the sidecar file cannot be opened.
+ */
+void write_complex(const ComplexRecord &record, const std::string &json_file_path, std::ofstream &dat_out);
 
 /**
  * Reads the on-disk payload of a COMPLEX node into a ComplexRecord.
@@ -109,35 +123,33 @@ void write_node(const Node<T> &node, const MetaRecord &meta)
     std::ofstream dat_out(std::filesystem::path(DB_PATH) / "nodes.dat", std::ios::binary | std::ios::app);
     if (!dat_out) throw std::runtime_error("Failed to open nodes data file for writing.");
 
-    NodeRecord<T> record;   // Convert the Node to a NodeRecord POD struct for serialization. Initialize the record with the data of the node.
-    uint64_t record_offset; // Offset where the NodeRecord is written on the disc.
+    // Always append: position the stream at end-of-file and capture that as the
+    // record offset, regardless of node type.
+    dat_out.seekp(0, std::ios::end);
+    uint64_t record_offset = dat_out.tellp();
 
-    switch (node_type_of_v<T>)  // Use the type tag to determine how to write the node record and relation list, and to set the type_id in the NodeIndex.
+    // Compile-time dispatch on the node type. Using if constexpr instead of a
+    // runtime switch ensures that the COMPLEX branch (which expects a non-POD
+    // ComplexRecord payload and would fail static_assert in write_pod / node_to_record)
+    // is never instantiated for primitive T, and vice versa.
+    if constexpr (node_type_of_v<T> == NodeType::COMPLEX)
     {
-        case NodeType::INT:
-        case NodeType::FLOAT:
-        case NodeType::CHAR:
-        case NodeType::DOUBLE:
-        case NodeType::BOOL:
-
-            // For primitive types, we can directly write the NodeRecord to disk and get the record offset.
-            dat_out.seekp(0, std::ios::end);
-            record = node_to_record(node);
-            record_offset = dat_out.tellp();
-            write_pod(record, dat_out);
-
-            break;
-
-        case NodeType::COMPLEX:
-            // For complex types, we need to write the ComplexRecord, which includes the type label and the JSON string of attributes.
-            std::string json_file_path; // The file path where the JSON attributes of the complex node will be stored. This path is constructed based on the metadata and the type label of the node.
-            record = complex_node_to_record(node, jso_file_path);
-            dat_out.seekp(0, std::ios::end);
-            record_offset = dat_out.tellp();
-            write_complex(record, Node<ComplexRecord> node, json_file_path, dat_out);   // This function will handle the writing of the ComplexHeader and the associated JSON attributes to disk.
-            break;
-
-    }    
+        // COMPLEX: out-of-line JSON payload. complex_node_to_record reads
+        // JsonMeta to compose the sidecar filename and stores it in
+        // json_file_path; we then hand both to write_complex which writes the
+        // header + two length-prefixed strings here and the JSON contents to
+        // the sidecar file under JSON_ATTR_PATH.
+        std::string json_file_path;
+        complex_node_to_record(node, json_file_path);
+        write_complex(node.data, json_file_path, dat_out);
+    }
+    else
+    {
+        // Primitive types (INT/FLOAT/DOUBLE/CHAR/BOOL): NodeRecord<T> is
+        // trivially copyable, so we write it straight as a POD.
+        NodeRecord<T> record = node_to_record(node);
+        write_pod(record, dat_out);
+    }
 
     uint64_t relation_offset = write_relation_node_list<T>(node, meta.next_id, dat_out);
 

@@ -95,13 +95,13 @@
   Comportamento atteso:
   - `write_complex`: scrive `ComplexHeader` (a partire da `ComplexRecord`), poi due `write_string` (`type_label`, `json_attributes`), poi apre un file JSON sidecar e scrive il payload JSON al suo interno.
   - `write_json_attributes_meta` / `read_json_attributes_meta`: persistono / leggono la POD `JsonMeta` in `db/attributes/attributes_meta.dat`. `read` lazy-crea il file con `prog_number = 0` se non esiste.
-- **Note di migrazione:** L'implementazione corrente **non compila**:
-  - `write_complex` è **definita due volte** in `graph_io.cpp` (linee 33 e 60) → vedi [BUG-009](known_bugs.md);
-  - chiama `write_pod(complex_record, out)` su un `ComplexRecord` non POD → vedi [BUG-011](known_bugs.md);
-  - il path del file sidecar è incoerente con quello scritto dentro `ComplexHeader` → vedi [BUG-013](known_bugs.md);
-  - `prog_number` non viene mai incrementato dal write path → vedi [BUG-014](known_bugs.md).
-  Le firme sopra restano comunque il contratto di riferimento.
-- **Riferimenti:** commit `36152ba`, `dfcfcb1`, `326920c`. `graph_core/io/graph_io.h:38-46`, `graph_core/io/graph_io.cpp:33,60,136,154`.
+- **Note di migrazione:** Storia dell'implementazione:
+  - `write_complex` era **definita due volte** in `graph_io.cpp` (linee 33 e 60) → la duplicazione è stata risolta il 2026-05-30, vedi [BUG-009](known_bugs.md);
+  - chiamava `write_pod(complex_record, out)` su un `ComplexRecord` non POD → risolto il 2026-05-30: `write_complex` ora costruisce internamente un `ComplexHeader` POD da scrivere, vedi [BUG-011](known_bugs.md);
+  - il path del file sidecar era incoerente con quello scritto dentro `ComplexHeader` → risolto il 2026-05-30: la nuova firma di `write_complex` accetta `json_file_path` come parametro e lo usa sia per la `write_string` che per aprire il file, vedi [BUG-013](known_bugs.md);
+  - `prog_number` non viene mai incrementato dal write path → ancora aperto, vedi [BUG-014](known_bugs.md).
+  Firma di `write_complex` aggiornata al 2026-05-30 (vedi voce dedicata sotto). Le firme sopra restano comunque il contratto di riferimento.
+- **Riferimenti:** commit `36152ba`, `dfcfcb1`, `326920c`. `graph_core/io/graph_io.h:24,45-46`, `graph_core/io/graph_io.cpp:34,172,190`.
 
 ---
 
@@ -116,7 +116,7 @@
       std::string &json_file_path);
   ```
   Comportamento atteso: legge `JsonMeta`, compone `json_file_path` da `prog_number` + `type_label`, costruisce `ComplexHeader { type_label_size, json_file_path_size }`, lo impacchetta in `NodeRecord<ComplexHeader>` e lo ritorna.
-- **Note di migrazione:** L'implementazione corrente non compila — la composizione del path usa `uint64_t + const char*` senza `std::to_string` (vedi [BUG-011](known_bugs.md)). Inoltre `write_json_attributes_meta(meta_json)` non viene mai chiamata per persistere il `prog_number` incrementato (vedi [BUG-014](known_bugs.md)).
+- **Note di migrazione:** Risolto il 2026-05-30: la composizione del path usa ora `std::to_string(meta_json.prog_number)` (vedi [BUG-011](known_bugs.md)). Ancora aperto: `write_json_attributes_meta(meta_json)` non viene chiamata per persistere il `prog_number` incrementato (vedi [BUG-014](known_bugs.md)).
 - **Riferimenti:** commit `dfcfcb1`. `graph_core/odt/node_odt.h:37`, `graph_core/odt/node_odt.cpp:55`.
 
 ---

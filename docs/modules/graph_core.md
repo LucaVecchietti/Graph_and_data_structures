@@ -143,10 +143,10 @@ RAM-side representation of a `COMPLEX` node payload. Not POD — contains `std::
 | `type_label` | `std::string` | Runtime-typed label (e.g. `"Athlete"`, `"Item"`, `"Company"`). |
 | `json_attributes` | `std::string` | JSON-encoded attributes of the record (lives in RAM; on disk it is written to a sidecar file, not inline). |
 
-Because `ComplexRecord` is not trivially copyable, it **cannot** flow through the existing `node_to_record` / `write_pod` path: that template would fail the `static_assert` in `odt/node_odt.h:22`. The COMPLEX branch of `write_node` instead routes through `complex_node_to_record` (header) + `write_complex` (sidecar) — the dedicated path exists in source but currently does not compile (see [BUG-010](../legacy/known_bugs.md)).
+Because `ComplexRecord` is not trivially copyable, it **cannot** flow through the existing `node_to_record` / `write_pod` path: that template would fail the `static_assert` in `odt/node_odt.h:22`. The COMPLEX branch of `write_node` routes through `complex_node_to_record` (computes the sidecar path) + `write_complex` (writes the header, the two length-prefixed strings, and the sidecar JSON file). The branch compiles since 2026-05-30 ([BUG-010](../legacy/known_bugs.md) fixed); reaching it from `Graph::insert<ComplexRecord>` is still blocked by [BUG-015](../legacy/known_bugs.md).
 
 ### `template<class T> struct node_type_of` (`struct/type_registry.h`)
-Compile-time `T → NodeType` map. Primary template is intentionally undefined; specializations exist for `int, float, double, char, bool` and `ComplexRecord` (→ `COMPLEX`). Using an unsupported `T` triggers a clear compile error. Convenience: `node_type_of_v<T>`. Note: the `ComplexRecord → COMPLEX` mapping is defined and `write_node` dispatches on it, but the COMPLEX branch currently does not compile (see [BUG-010](../legacy/known_bugs.md)) — `Graph::insert<ComplexRecord>` will fail to build.
+Compile-time `T → NodeType` map. Primary template is intentionally undefined; specializations exist for `int, float, double, char, bool` and `ComplexRecord` (→ `COMPLEX`). Using an unsupported `T` triggers a clear compile error. Convenience: `node_type_of_v<T>`. The `ComplexRecord → COMPLEX` mapping is defined and `write_node` / `read_typed_node` dispatch on it via `if constexpr`. The write/read I/O branches compile since 2026-05-30; `Graph::insert<ComplexRecord>` itself is still blocked by [BUG-015](../legacy/known_bugs.md) (`std::to_string` on `newNode->data` in the log line).
 
 ### `struct BFSPolicy` / `struct DFSPolicy` (`struct/functions_policies.h`)
 Concept-style policies. Each provides:
@@ -204,7 +204,8 @@ Thin wrappers selecting `BFSPolicy` / `DFSPolicy`.
 | Function | Purpose |
 |---|---|
 | `void write_node_index(uint64_t record_offset, uint64_t relation_offset, NodeType, std::ofstream&, const MetaRecord&)` | Builds and writes a `NodeIndex` to `nodes.idx`. `idx.id = meta.next_id`. |
-| `void write_complex(const ComplexRecord&, std::ofstream&)` | Writes the COMPLEX payload to `nodes.dat` (header + two length-prefixed strings) and opens the sidecar JSON file under `JSON_ATTR_PATH`. Currently defined twice in `graph_io.cpp` and not compilable — see [BUG-009](../legacy/known_bugs.md), [BUG-011](../legacy/known_bugs.md), [BUG-013](../legacy/known_bugs.md). |
+| `void write_complex(const ComplexRecord&, std::ofstream&)` | Writes the COMPLEX payload to `nodes.dat` (header + two length-prefixed strings) and opens the sidecar JSON file under `JSON_ATTR_PATH`. Still not compilable as-is: calls `write_pod` on a non-POD `ComplexRecord` and uses a sidecar path inconsistent with the one stored in the header — see [BUG-011](../legacy/known_bugs.md), [BUG-013](../legacy/known_bugs.md). (Previously also had a duplicate stub, see [BUG-009](../legacy/known_bugs.md) — fixed 2026-05-30.) |
+| `void read_complex(ComplexRecord&, std::ifstream&)` | Reads the COMPLEX payload (header + two length-prefixed strings) from `nodes.dat` and slurps the sidecar JSON file under `JSON_ATTR_PATH` into `out.json_attributes`. Throws `runtime_error` if the sidecar is missing. Called by the `if constexpr` COMPLEX branch of `read_typed_node<T>`. |
 | `NodeIndex read_node_index(std::ifstream&)` | Reads one `NodeIndex` from the current stream position. |
 | `std::vector<RelationEntry> read_relation_node_list(std::ifstream&)` | Reads the `RelationNodeList` header and its variable-width tail. |
 | `void write_meta(const MetaRecord&)` | Truncates and rewrites `meta.dat`. |
@@ -213,7 +214,7 @@ Thin wrappers selecting `BFSPolicy` / `DFSPolicy`.
 | `JsonMeta read_json_attributes_meta()` | Reads the `JsonMeta` POD; lazy-creates the file with `prog_number = 0` if missing. Throws on empty/unreadable file. |
 | `template<T> uint64_t write_node_record(const Node<T>&)` | Appends a `NodeRecord<T>` to `nodes.dat`. Returns the offset. |
 | `template<T> uint64_t write_relation_node_list(const Node<T>&, uint64_t node_id, std::ofstream& out)` | Appends `RelationNodeList` header + tail to `out` (already-open `nodes.dat`), and appends each edge to `edges.dat`. |
-| `template<T> void write_node(const Node<T>&, const MetaRecord&)` | Composes the three writes for a full node persist (record + relations + index). Dispatches the record write via `switch(node_type_of_v<T>)`: primitives go through `write_pod`, `COMPLEX` goes through `complex_node_to_record` + `write_complex`. The COMPLEX branch is currently uncompilable — see [BUG-010](../legacy/known_bugs.md). |
+| `template<T> void write_node(const Node<T>&, const MetaRecord&)` | Composes the three writes for a full node persist (record + relations + index). Dispatches the record write via `if constexpr (node_type_of_v<T> == NodeType::COMPLEX)`: primitives go through `node_to_record` + `write_pod`, `COMPLEX` goes through `complex_node_to_record` + `write_complex`. Compiles since 2026-05-30 ([BUG-010](../legacy/known_bugs.md) fixed). |
 | `BaseNode* read_node(uint64_t id)` | Reads `NodeIndex` at `id * sizeof(NodeIndex)` in `nodes.idx`, dispatches on `type_id` to the right `read_typed_node<T>`. No `case NodeType::COMPLEX:` yet — reading a COMPLEX index throws `"Unknown NodeType"`. |
 | `template<T> NodeRecord<T> read_node_record(std::ifstream&)` | Reads one `NodeRecord<T>`. |
 | `template<T> BaseNode* read_typed_node(const NodeIndex&, std::ifstream& dat_in)` | Builds a fresh `Node<T>` on the heap with data + neighbors (neighbor pointers left `nullptr`). |
@@ -234,7 +235,7 @@ Thin wrappers selecting `BFSPolicy` / `DFSPolicy`.
 | Function | Purpose |
 |---|---|
 | `template<T> NodeRecord<T> node_to_record(const Node<T>&)` (`node_odt.h:22`) | Copies `node.data` into a `NodeRecord<T>`. Asserts POD. |
-| `NodeRecord<ComplexHeader> complex_node_to_record(const Node<ComplexRecord>&, std::string &json_file_path)` (`node_odt.cpp:55`) | COMPLEX-specific ODT bridge: reads `JsonMeta`, composes the sidecar path into the out-param `json_file_path`, builds a `ComplexHeader` from `type_label.size()` and `json_file_path.size()`, and returns it wrapped in `NodeRecord<ComplexHeader>`. Currently does not compile — see [BUG-011](../legacy/known_bugs.md). Does not persist the incremented `prog_number` — see [BUG-014](../legacy/known_bugs.md). |
+| `NodeRecord<ComplexHeader> complex_node_to_record(const Node<ComplexRecord>&, std::string &json_file_path)` (`node_odt.cpp:55`) | COMPLEX-specific ODT bridge: reads `JsonMeta`, composes the sidecar path into the out-param `json_file_path` as `{prog_number}_{type_label}.json` (uses `std::to_string`, see [BUG-011](../legacy/known_bugs.md) fix), builds a `ComplexHeader` from `type_label.size()` and `json_file_path.size()`, and returns it wrapped in `NodeRecord<ComplexHeader>`. The returned `NodeRecord` is currently unused by `write_node` (the header is rebuilt inside `write_complex` from the same inputs). Still does not persist the incremented `prog_number` — see [BUG-014](../legacy/known_bugs.md). |
 | `RelationNodeList node_to_relation_list(const BaseNode&)` (`node_odt.cpp:27`) | Fills only `type_count`. The variable-width tail is written separately by `write_relation_node_list`. |
 | `NodeIndex node_to_node_index(uint64_t id, uint64_t record_offset, uint64_t relation_offset)` (`node_odt.cpp:39`) | Builder for `NodeIndex` (currently unused — `write_node_index` builds the struct inline). |
 | `std::unordered_map<...> reconstruct_neighbors(const RelationNodeList&)` (`node_odt.cpp:86`) | **Stub — returns an empty map.** See [BUG-003](../legacy/known_bugs.md). |
@@ -331,10 +332,12 @@ No third-party libraries. No dependency on `data_tructures/`.
 - `graph_core/struct/functions_policies.h:12` — `BFSPolicy`.
 - `graph_core/struct/type_registry.h:33` — `node_type_of<ComplexRecord> → COMPLEX`.
 - `graph_core/costants.h:7-11` — `DB_PATH`, `META_FILE_PATH`, `JSON_ATTR_META_PATH`, `JSON_ATTR_PATH`.
-- `graph_core/io/graph_io.h:38` — `write_complex` declaration.
-- `graph_core/io/graph_io.h:104` — `write_node` template (switch on `NodeType`).
-- `graph_core/io/graph_io.cpp:33,60` — `write_complex` (duplicate definition).
-- `graph_core/io/graph_io.cpp:86` — `read_node` (type dispatch — `COMPLEX` case TBD).
-- `graph_core/io/graph_io.cpp:136,154` — `write_json_attributes_meta`, `read_json_attributes_meta`.
+- `graph_core/io/graph_io.h:24` — `write_complex` declaration.
+- `graph_core/io/graph_io.h:38` — `read_complex` declaration.
+- `graph_core/io/graph_io.h:107` — `write_node` template (switch on `NodeType`).
+- `graph_core/io/graph_io.cpp:34` — `write_complex` (single definition since 2026-05-30, see [BUG-009](../legacy/known_bugs.md)).
+- `graph_core/io/graph_io.cpp:65` — `read_complex`.
+- `graph_core/io/graph_io.cpp:120` — `read_node` (type dispatch — COMPLEX case routes to `read_typed_node<ComplexRecord>`).
+- `graph_core/io/graph_io.cpp:172,190` — `write_json_attributes_meta`, `read_json_attributes_meta`.
 - `graph_core/odt/node_odt.cpp:55` — `complex_node_to_record`.
 - `graph_core/odt/node_odt.cpp:86` — `reconstruct_neighbors` (stub).

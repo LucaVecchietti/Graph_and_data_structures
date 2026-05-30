@@ -6,7 +6,7 @@
 |---|---|
 | Tipo | legacy-bugs |
 | Lingua | en |
-| Ultimo aggiornamento | 2026-05-26 |
+| Ultimo aggiornamento | 2026-05-30 |
 | Commit di riferimento | 326920c |
 | Mirror | — |
 
@@ -14,6 +14,7 @@
 
 ## Indice
 
+- [2026-05-30 — BUG-015: `Graph::insert` chiama `std::to_string` su `newNode->data`, incompatibile con `ComplexRecord`](#2026-05-30--bug-015-graphinsert-chiama-stdto_string-su-newnode-data-incompatibile-con-complexrecord)
 - [2026-05-26 — BUG-014: `prog_number` mai incrementato/persistito dopo write COMPLEX](#2026-05-26--bug-014-prog_number-mai-incrementatopersistito-dopo-write-complex)
 - [2026-05-26 — BUG-013: path del file JSON sidecar incoerente tra `complex_node_to_record` e `write_complex`](#2026-05-26--bug-013-path-del-file-json-sidecar-incoerente-tra-complex_node_to_record-e-write_complex)
 - [2026-05-26 — BUG-012: logger globale duplicato in `node_odt.cpp`](#2026-05-26--bug-012-logger-globale-duplicato-in-node_odtcpp)
@@ -33,54 +34,36 @@
 
 ### 2026-05-26 — BUG-009: `write_complex` definita due volte in `graph_io.cpp`
 
-- **Stato:** open
+- **Stato:** fixed (2026-05-30)
 - **Sintomo:** Build error `redefinition of 'write_complex'` (o equivalente `multiple definition` in fase di link) appena il file `graph_io.cpp` viene compilato.
-- **Root cause:** `graph_core/io/graph_io.cpp` contiene **due definizioni** della stessa funzione: una "vera" a riga 33 che scrive l'header, le due stringhe e il file sidecar; una stub vuota a riga 60 che fa solo `return;`. La doc-comment a riga 56 sembra un placeholder di un secondo overload che non è mai diventato tale.
-- **Fix:** n/a (open). Eliminare la stub a riga 60 (è la versione più recente in coda alla funzione vera) — la build attualmente fallisce, quindi non c'è il rischio di rompere comportamenti già esercitati. Verificare anche che la doc-comment "Write ComplexHeader struct on the disk" venga unita o eliminata.
-- **Regression guard:** compilare `graph_core` come libreria singola con `-Werror=duplicate-decl-specifier` o equivalente — la build pulita è il test.
+- **Root cause:** `graph_core/io/graph_io.cpp` conteneva **due definizioni** della stessa funzione: una "vera" a riga 33 che scrive l'header, le due stringhe e il file sidecar; una stub vuota a riga 60 che faceva solo `return;`. La doc-comment a riga 56 era un placeholder di un secondo overload che non è mai diventato tale.
+- **Fix (2026-05-30):** rimossa la stub e la sua doc-comment in `graph_core/io/graph_io.cpp`. La definizione "vera" precedente resta in piedi — soffre ancora di altri problemi semantici tracciati separatamente come [BUG-011](#2026-05-26--bug-011-complex_node_to_record-concatena-uint64_t--const-char) (`write_pod` su un tipo non POD) e [BUG-013](#2026-05-26--bug-013-path-del-file-json-sidecar-incoerente-tra-complex_node_to_record-e-write_complex) (path sidecar incoerente), ma il file ora ha una sola definizione e linka.
+- **Regression guard:** la build pulita di `graph_core` (Ninja, no opt-in flags) è il test.
 
 ---
 
 ### 2026-05-26 — BUG-010: ramo `case NodeType::COMPLEX:` di `write_node` non compila
 
-- **Stato:** open
-- **Sintomo:** Istanziare il template `write_node<T>` per un `T` che mappa su `NodeType::COMPLEX` (oggi solo `ComplexRecord`) produce errori di compilazione. Finché nessun chiamante istanzia il ramo, la build sopravvive — `main.cpp` usa solo `int`, quindi non si nota.
-- **Root cause:** `graph_core/io/graph_io.h:131-134` (ramo COMPLEX) contiene tre errori:
-  1. `record = complex_node_to_record(node);` — la firma reale è `complex_node_to_record(const Node<ComplexRecord>&, std::string &json_file_path)` e richiede l'out-param. Inoltre `record` è di tipo `NodeRecord<T>` (parametro template) mentre `complex_node_to_record` ritorna `NodeRecord<ComplexHeader>`: assegnazione invalida per `T != ComplexHeader`.
-  2. `write_complex(record, Node<ComplexRecord> node, dat_out);` — `Node<ComplexRecord> node` in posizione di argomento è una **dichiarazione**, non un'espressione: parse error.
-  3. La firma di `write_complex` è `(const ComplexRecord &, std::ofstream &)`: la chiamata passa 3 argomenti e il primo è del tipo sbagliato.
-- **Fix:** n/a (open). Pseudo-codice del fix:
-  ```cpp
-  case NodeType::COMPLEX: {
-      std::string json_file_path;
-      NodeRecord<ComplexHeader> hdr = complex_node_to_record(
-          reinterpret_cast<const Node<ComplexRecord>&>(node), json_file_path);
-      dat_out.seekp(0, std::ios::end);
-      record_offset = dat_out.tellp();
-      write_pod(hdr, dat_out);
-      write_string(node.data.type_label,   dat_out);  // serve un Node<ComplexRecord>
-      write_string(json_file_path,         dat_out);
-      // scrittura del file sidecar al path json_file_path con node.data.json_attributes
-      break;
-  }
-  ```
-  Il `reinterpret_cast` è la spia che il design del template non è adatto a un payload non POD: probabilmente la soluzione più pulita è una **specializzazione esplicita** `template<> void write_node<ComplexRecord>(...)` accanto al template generico, rimuovendo il `switch`.
-- **Regression guard:** un `static_assert` o una build con un test che istanzia esplicitamente `write_node<ComplexRecord>` (anche solo un `(void)&write_node<ComplexRecord>;`) farebbe emergere subito la mancata compilazione.
+- **Stato:** fixed (2026-05-30)
+- **Sintomo:** Istanziare il template `write_node<T>` per un `T` che mappava su `NodeType::COMPLEX` (oggi solo `ComplexRecord`) produceva errori di compilazione. Finché nessun chiamante istanziava il ramo, la build sopravviveva — `main.cpp` usa solo `int`, quindi non si notava.
+- **Root cause:** `graph_core/io/graph_io.h` (ramo COMPLEX) conteneva tre errori:
+  1. `record = complex_node_to_record(node);` — la firma reale è `complex_node_to_record(const Node<ComplexRecord>&, std::string &json_file_path)` e richiede l'out-param. Inoltre `record` era di tipo `NodeRecord<T>` (parametro template) mentre `complex_node_to_record` ritorna `NodeRecord<ComplexHeader>`: assegnazione invalida per `T != ComplexHeader`.
+  2. `write_complex(record, Node<ComplexRecord> node, dat_out);` — `Node<ComplexRecord> node` in posizione di argomento era una **dichiarazione**, non un'espressione: parse error.
+  3. La firma di `write_complex` era `(const ComplexRecord &, std::ofstream &)`: la chiamata passava 3 argomenti e il primo era del tipo sbagliato.
+- **Fix (2026-05-30):** sostituito il `switch (node_type_of_v<T>)` con `if constexpr (node_type_of_v<T> == NodeType::COMPLEX)` in `graph_core/io/graph_io.h:write_node`. Il ramo COMPLEX ora chiama `complex_node_to_record(node, json_file_path)` con la firma corretta e poi `write_complex(node.data, json_file_path, dat_out)`. Con `if constexpr` solo il ramo applicabile a `T` viene istanziato: il ramo primitivi non vede mai `ComplexRecord` e viceversa, eliminando le condizioni che richiedevano i `reinterpret_cast` prefigurati nel pseudo-codice originale. Stessa pattern usata in [`read_typed_node`](../modules/graph_core.md) per simmetria. La firma di `write_complex` è stata ampliata a `(const ComplexRecord&, const std::string &json_file_path, std::ofstream&)` — vedi [API change correlato](api_changes.md). Bloccanti correlati [BUG-011](#2026-05-26--bug-011-complex_node_to_record-concatena-uint64_t--const-char) e [BUG-013](#2026-05-26--bug-013-path-del-file-json-sidecar-incoerente-tra-complex_node_to_record-e-write_complex) chiusi nella stessa sweep perché inseparabili a compile-time.
+- **Regression guard:** un `(void)&write_node<ComplexRecord>;` in un test farebbe emergere subito una futura rottura del ramo COMPLEX. Una volta chiuso [BUG-015](#2026-05-30--bug-015-graphinsert-chiama-stdto_string-su-newnode-data-incompatibile-con-complexrecord) anche un round-trip `Graph::insert(ComplexRecord{...}) + read_node` sarà sufficiente.
 
 ---
 
 ### 2026-05-26 — BUG-011: `complex_node_to_record` concatena `uint64_t + const char*`
 
-- **Stato:** open
-- **Sintomo:** Compile error sull'espressione `meta_json.prog_number + "_" + node.data.type_label + ".json"` in `node_odt.cpp:70`. L'operatore `+` con `uint64_t` e `const char*` non costruisce una stringa: viene interpretato come aritmetica su puntatore. Inoltre la `write_complex` chiama `write_pod(complex_record, out)` su un `ComplexRecord` non trivialmente copiabile — fallisce lo `static_assert` in `write_pod`.
-- **Root cause:** Manca `std::to_string` attorno a `prog_number`. In più la `write_complex` riusa `write_pod` con un tipo non POD per "scrivere l'header": è un'operazione semanticamente sbagliata — l'header da scrivere è il `ComplexHeader` ritornato da `complex_node_to_record`, non il `ComplexRecord` di dominio.
-- **Fix:** n/a (open). Versione corretta della costruzione del path:
-  ```cpp
-  json_file_path = std::to_string(meta_json.prog_number)
-                   + "_" + node.data.type_label + ".json";
-  ```
-  In `write_complex` sostituire `write_pod(complex_record, out)` con la scrittura dell'header POD (`ComplexHeader`) — quindi rivedere la firma per ricevere `ComplexHeader` e `ComplexRecord` separatamente, oppure costruire l'header internamente.
-- **Regression guard:** una build con il ramo COMPLEX istanziato (vedi [BUG-010](#2026-05-26--bug-010-ramo-case-nodetypecomplex-di-write_node-non-compila)) lo farebbe emergere.
+- **Stato:** fixed (2026-05-30)
+- **Sintomo:** Compile error sull'espressione `meta_json.prog_number + "_" + node.data.type_label + ".json"` in `node_odt.cpp:70`. L'operatore `+` con `uint64_t` e `const char*` non costruisce una stringa: veniva interpretato come aritmetica su puntatore. Inoltre la `write_complex` chiamava `write_pod(complex_record, out)` su un `ComplexRecord` non trivialmente copiabile — fallisce lo `static_assert` in `write_pod`.
+- **Root cause:** Mancava `std::to_string` attorno a `prog_number`. In più la `write_complex` riusava `write_pod` con un tipo non POD per "scrivere l'header": operazione semanticamente sbagliata — l'header da scrivere è il `ComplexHeader`, non il `ComplexRecord` di dominio.
+- **Fix (2026-05-30):**
+  1. In `graph_core/odt/node_odt.cpp:complex_node_to_record` la costruzione del path passa ora per `std::to_string(meta_json.prog_number) + "_" + node.data.type_label + ".json"`.
+  2. La nuova `write_complex(const ComplexRecord&, const std::string &json_file_path, std::ofstream&)` in `graph_core/io/graph_io.cpp` costruisce internamente un `ComplexHeader` da `record.type_label.size()` e `json_file_path.size()` e lo scrive via `write_pod<ComplexHeader>` — il tipo è POD, lo `static_assert` passa. Successivamente scrive le due stringhe length-prefixed (`type_label`, `json_file_path`) e il file sidecar JSON.
+- **Regression guard:** istanziare `write_node<ComplexRecord>` è ora sufficiente a verificare entrambi i punti del fix.
 
 ---
 
@@ -96,21 +79,14 @@
 
 ### 2026-05-26 — BUG-013: path del file JSON sidecar incoerente tra `complex_node_to_record` e `write_complex`
 
-- **Stato:** open
-- **Sintomo:** Il path del file sidecar **scritto dentro `ComplexHeader`** non coincide con il path **usato per aprire il file**.
-  - `complex_node_to_record` costruisce `json_file_path = {prog_number}_{type_label}.json` (vedi [BUG-011](#2026-05-26--bug-011-complex_node_to_record-concatena-uint64_t--const-char), anche se non compila la *forma* del path è chiara).
-  - `write_complex` (`graph_io.cpp:45`) apre `std::filesystem::path(JSON_ATTR_PATH) / complex_record.type_label` — solo il `type_label`, senza `prog_number` e senza estensione `.json`.
-  Se entrambi venissero corretti per compilare, scriveremmo nel file `db/attributes/{type_label}` ma in `nodes.dat` registreremmo come path `{prog_number}_{type_label}.json` — la lettura del nodo COMPLEX non troverebbe mai il file.
-- **Root cause:** I due lati del flusso (ODT che costruisce il path, I/O che lo usa per aprire il file) non condividono la stessa funzione di costruzione del path.
-- **Fix:** n/a (open). Estrarre la costruzione del path in una funzione singola, ad esempio in `costants.h` o in un piccolo helper:
-  ```cpp
-  inline std::filesystem::path complex_attr_path(uint64_t prog_number, const std::string &type_label) {
-      return std::filesystem::path(JSON_ATTR_PATH)
-          / (std::to_string(prog_number) + "_" + type_label + ".json");
-  }
-  ```
-  Sia `complex_node_to_record` (per il valore stored in `ComplexHeader`) sia `write_complex` (per aprire il file) devono usarla.
-- **Regression guard:** un round-trip insert→read di un nodo COMPLEX.
+- **Stato:** fixed (2026-05-30)
+- **Sintomo:** Il path del file sidecar **scritto dentro `ComplexHeader`** non coincideva con il path **usato per aprire il file**.
+  - `complex_node_to_record` costruiva `json_file_path = {prog_number}_{type_label}.json`.
+  - `write_complex` apriva `std::filesystem::path(JSON_ATTR_PATH) / complex_record.type_label` — solo il `type_label`, senza `prog_number` e senza estensione `.json`.
+  La lettura del nodo COMPLEX non avrebbe mai trovato il file scritto.
+- **Root cause:** I due lati del flusso (ODT che costruisce il path, I/O che lo usa per aprire il file) non condividevano la stessa stringa: il path veniva ricomputato in modo diverso nei due punti.
+- **Fix (2026-05-30):** la nuova firma `write_complex(const ComplexRecord&, const std::string &json_file_path, std::ofstream&)` accetta esplicitamente la stringa `json_file_path` come parametro — la stessa che `complex_node_to_record` ha appena scritto nel `ComplexHeader`. `write_complex` la usa sia per la `write_string` su `nodes.dat` sia per aprire `JSON_ATTR_PATH / json_file_path`. Un unico valore attraversa il flusso: niente possibilità di divergenza. L'helper `complex_attr_path` suggerito nel pseudo-fix originale non è più necessario.
+- **Regression guard:** un round-trip insert→read di un nodo COMPLEX (bloccato comunque da [BUG-015](#2026-05-30--bug-015-graphinsert-chiama-stdto_string-su-newnode-data-incompatibile-con-complexrecord) e [BUG-014](#2026-05-26--bug-014-prog_number-mai-incrementatopersistito-dopo-write-complex) prima di poterlo eseguire end-to-end).
 
 ---
 
@@ -121,6 +97,19 @@
 - **Root cause:** Il design del [Storage sidecar JSON](design_decisions.md#2026-05-26--storage-sidecar-json-per-nodi-complex) prevede `prog_number` come contatore monotonico per garantire nomi univoci, ma la mutazione non è stata implementata.
 - **Fix:** n/a (open). Dopo aver costruito `json_file_path` in `complex_node_to_record` (o nel chiamante, a seconda di dove si decide debba stare l'effetto collaterale), incrementare `meta_json.prog_number` e chiamare `write_json_attributes_meta(meta_json)`. Decidere se l'incremento avviene prima o dopo (riserva del numero) — meglio prima, così se la write fallisce il numero resta "consumato" ma non si rischiano collisioni.
 - **Regression guard:** un test che inserisce due nodi COMPLEX con lo stesso `type_label` e verifica che producano due file distinti in `db/attributes/`.
+
+---
+
+### 2026-05-30 — BUG-015: `Graph::insert` chiama `std::to_string` su `newNode->data`, incompatibile con `ComplexRecord`
+
+- **Stato:** open
+- **Sintomo:** `Graph::insert<ComplexRecord>(...)` non compila. L'errore arriva da `graph_core/graph.h:59` — `logger.info("... and value " + std::to_string(newNode->data))` — perché `std::to_string` non ha overload per `ComplexRecord`. Per i tipi primitivi (`int, float, double, char, bool`) il template compila come prima.
+- **Root cause:** Il log per costruzione include il valore del nodo via `std::to_string(data)`. Funziona per primitivi numerici/`char`/`bool`, ma il template `insert<T>` ora è teoricamente istanziabile anche per tipi non-aritmetici (vedi `ComplexRecord` dopo la chiusura di [BUG-010](#2026-05-26--bug-010-ramo-case-nodetypecomplex-di-write_node-non-compila)) e in quei casi il log fallisce a compile-time.
+- **Fix:** n/a (open). Tre soluzioni in ordine di invasività crescente:
+  1. **Rimuovere** la porzione `+ " and value " + std::to_string(...)` dal log — il valore non è probabilmente l'informazione più utile in un log di inserimento; basta l'ID.
+  2. **Stringificare condizionalmente** con `if constexpr`: per tipi `is_arithmetic_v<T>` (più `char`, `bool`) usare `std::to_string`, altrimenti un placeholder come `"<complex>"` o `node.data.type_label` per `ComplexRecord`.
+  3. **Astrarre via funzione libera** `to_log_string<T>` con specializzazioni — overkill per ora.
+- **Regression guard:** istanziare esplicitamente `Graph::insert<ComplexRecord>` (anche solo dichiarare un puntatore alla funzione membro) farebbe emergere il problema a compile-time.
 
 ---
 

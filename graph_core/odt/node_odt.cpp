@@ -65,9 +65,10 @@ NodeRecord<ComplexHeader> complex_node_to_record(const Node<ComplexRecord> &node
         throw; // Rethrow the exception after logging
     }
 
-    // Construct the ComplexHeader.json_file_path based on the metadata and the type label of the node
-    // the base path for JSON attributes files is defined in costants.h as JSON_ATTR_PATH and is used by the graph_io functions to write and read the JSON attributes of the complex nodes.
-    json_file_path = meta_json.prog_number + "_" + node.data.type_label + ".json";
+    // Construct the ComplexHeader.json_file_path based on the metadata and the type label of the node.
+    // The base path for JSON attributes files is defined in costants.h as JSON_ATTR_PATH and is used by the graph_io functions to write and read the JSON attributes of the complex nodes.
+    // std::to_string on prog_number is required: without it, "uint64_t + const char*" is pointer arithmetic, not string concatenation.
+    json_file_path = std::to_string(meta_json.prog_number) + "_" + node.data.type_label + ".json";
 
     // Construct the ComplexHeader with the type label and JSON attributes
     ComplexHeader header;

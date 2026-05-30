@@ -131,7 +131,7 @@ The actual JSON attributes of a COMPLEX node, written as raw UTF-8 text (no leng
 - `prog_number` comes from `JsonMeta.prog_number` at write time.
 - `type_label` is the COMPLEX node's runtime label (e.g. `Athlete`, `Item`).
 
-The exact filename **must** match the `json_file_path` string stored in the on-disk `ComplexHeader` so that the read path can reopen the file. The current code does not satisfy this constraint — `complex_node_to_record` composes `{prog}_{label}.json` for the header while `write_complex` actually opens `attributes/{label}` (no prog, no extension). See [BUG-013](../legacy/known_bugs.md).
+The exact filename **must** match the `json_file_path` string stored in the on-disk `ComplexHeader` so that the read path can reopen the file. Since 2026-05-30 (fix of [BUG-013](../legacy/known_bugs.md)) the same `json_file_path` string is threaded through `complex_node_to_record` → `write_complex` → both `write_string` on `nodes.dat` and the sidecar `std::ofstream` open, so the two sides cannot diverge anymore.
 
 ## Diagrammi
 
@@ -190,11 +190,12 @@ The exact filename **must** match the `json_file_path` string stored in the on-d
 - `graph_core/struct/pod_struct.h:134` — `ComplexHeader` (field renamed to `json_file_path_size`).
 - `graph_core/struct/pod_struct.h:148` — `JsonMeta`.
 - `graph_core/costants.h:9-11` — `META_FILE_PATH`, `JSON_ATTR_META_PATH`, `JSON_ATTR_PATH`.
-- `graph_core/io/graph_io.h:38-46` — `write_complex`, `write_json_attributes_meta`, `read_json_attributes_meta` declarations.
-- `graph_core/io/graph_io.h:104-144` — `write_node` template (switch on `NodeType`).
-- `graph_core/io/graph_io.cpp:13` — `write_node_index`.
-- `graph_core/io/graph_io.cpp:33,60` — `write_complex` (duplicate definitions).
-- `graph_core/io/graph_io.cpp:86` — `read_node` (dispatch on `type_id` — `COMPLEX` case TBD).
-- `graph_core/io/graph_io.cpp:109` — `write_meta` (truncating).
-- `graph_core/io/graph_io.cpp:136,154` — `write_json_attributes_meta`, `read_json_attributes_meta`.
+- `graph_core/io/graph_io.h:24,38,45-46` — `write_complex`, `read_complex`, `write_json_attributes_meta`, `read_json_attributes_meta` declarations.
+- `graph_core/io/graph_io.h:107` — `write_node` template (switch on `NodeType`).
+- `graph_core/io/graph_io.cpp:14` — `write_node_index`.
+- `graph_core/io/graph_io.cpp:34` — `write_complex` (single definition since 2026-05-30, see [BUG-009](../legacy/known_bugs.md)).
+- `graph_core/io/graph_io.cpp:65` — `read_complex` (reads ComplexHeader + 2 strings + sidecar JSON; throws if sidecar missing).
+- `graph_core/io/graph_io.cpp:120` — `read_node` (dispatch on `type_id` — COMPLEX case routes to `read_typed_node<ComplexRecord>` which uses `read_complex`).
+- `graph_core/io/graph_io.cpp:144` — `write_meta` (truncating).
+- `graph_core/io/graph_io.cpp:172,190` — `write_json_attributes_meta`, `read_json_attributes_meta`.
 - `graph_core/io/io_utils.cpp:4` — `write_string` (length-prefixed).

@@ -27,40 +27,43 @@ void write_node_index(const uint64_t record_offset, const uint64_t relation_offs
 }
 
 /**
- * Write the ComplexHeader struct to the output stream as part of a NodeRecord for a complex type node.
- * This function should handle the serialization of the ComplexHeader, including the type label and the JSON
- * string of attributes, to the output stream in a way that it can be correctly read back when loading the node from disk.
+ * Writes a COMPLEX node payload (ComplexHeader + 2 length-prefixed strings)
+ * to nodes.dat and the associated JSON attributes to the sidecar file under
+ * JSON_ATTR_PATH. Mirror image of read_complex. See graph_io.h for the layout.
+ *
+ * The ComplexHeader is built locally from the current sizes of type_label and
+ * json_file_path so the on-disk header is always self-consistent with the two
+ * strings that follow it.
  */
-void write_complex(const ComplexRecord &complex_record, std::ofstream &out)
+void write_complex(const ComplexRecord &record, const std::string &json_file_path, std::ofstream &dat_out)
 {
-    //Write the CmplexHeader struct to the oautput stream.
-    write_pod(complex_record, out);
+    // 1. Build the POD header from the current string sizes and write it.
+    //    These two uint64_t fields are technically redundant with the length
+    //    prefixes emitted by write_string just below, but the layout is what
+    //    read_complex / the docs assume — keep it in sync.
+    ComplexHeader header;
+    header.type_label_size = record.type_label.size();
+    header.json_file_path_size = json_file_path.size();
+    write_pod(header, dat_out);
 
-    // Write the type label and the JSON string of attributes after the complexHeader 
-    write_string(complex_record.type_label, out);
-    write_string(complex_record.json_attributes, out);
+    // 2. type_label and json_file_path as length-prefixed strings on the main
+    //    stream. Note: it is json_file_path that goes on disk here, not
+    //    json_attributes — the JSON payload itself lives in the sidecar file.
+    write_string(record.type_label, dat_out);
+    write_string(json_file_path, dat_out);
 
-    // Open the file to store the JSON attributes of the complex node and write the JSON string to it.
-
-    // The JSON file path is constructed based on the metadata and the type label of the node, and is used to store the JSON attributes of the complex node.
-    std::ofstream json_out(std::filesystem::path(JSON_ATTR_PATH) / complex_record.type_label, std::ios::binary | std::ios::trunc);
-    if (!json_out) {    // Check if the file was opened successfully before attempting to write to it.
-        logger.error("Failed to open JSON attributes file for writing: " + complex_record.type_label);
-        throw std::runtime_error("Failed to open JSON attributes file for writing: " + complex_record.type_label);
+    // 3. Open the sidecar JSON file at the SAME path that was just written
+    //    inside the header, and dump the JSON payload into it.
+    std::filesystem::path json_path = std::filesystem::path(JSON_ATTR_PATH) / json_file_path;
+    std::ofstream json_out(json_path, std::ios::binary | std::ios::trunc);
+    if (!json_out)
+    {
+        logger.error("Failed to open JSON attributes file for writing: " + json_path.string());
+        throw std::runtime_error("Failed to open JSON attributes file for writing: " + json_path.string());
     }
 
-    json_out << complex_record.json_attributes; // Write the JSON string of attributes to the file. 
-    json_out.close(); // Close the file after writing
-}
-
-/**
- * Write ComplexHeader struct on the disk.
- * This function is used to write the header of a complex type node and the type label
- * and the json string that contains the attributes of the record in JSON format.
- */
-void write_complex(const ComplexRecord &complex_record, std::ofstream &out)
-{
-    return;
+    json_out << record.json_attributes;
+    json_out.close();
 }
 
 /**

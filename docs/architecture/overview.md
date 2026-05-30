@@ -94,13 +94,14 @@ Graph::insert<T>      (graph_core/graph.h)
    │ write_node(*node, meta)
    ▼
 write_node<T>          (graph_core/io/graph_io.h)
-   │ switch (node_type_of_v<T>)
-   │ ├── primitives (INT/FLOAT/DOUBLE/CHAR/BOOL):
+   │ if constexpr (node_type_of_v<T> == NodeType::COMPLEX)
+   │ ├── primitives (INT/FLOAT/DOUBLE/CHAR/BOOL):  (else branch)
    │ │     NodeRecord<T>                   → nodes.dat
-   │ └── COMPLEX:                          (currently uncompilable — BUG-010)
+   │ └── COMPLEX:                          (compiles since 2026-05-30 — BUG-010/011/013 fixed)
    │       read_json_attributes_meta()     ← attributes/attributes_meta.dat
-   │       complex_node_to_record(node)    → ComplexHeader + json_file_path
-   │       write_complex(...)              → ComplexHeader + 2 strings → nodes.dat
+   │       complex_node_to_record(node, json_file_path)
+   │       write_complex(node.data, json_file_path, dat_out)
+   │                                       → ComplexHeader + 2 strings → nodes.dat
    │                                       → JSON payload              → attributes/{prog}_{label}.json
    │ RelationNodeList header              → nodes.dat
    │ NodeIndex                            → nodes.idx
