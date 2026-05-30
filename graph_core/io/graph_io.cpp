@@ -1,4 +1,5 @@
 #include <filesystem>
+#include <sstream>
 #include "../logger.h"
 #include "../costants.h"
 #include "graph_io.h"
@@ -53,13 +54,51 @@ void write_complex(const ComplexRecord &complex_record, std::ofstream &out)
 }
 
 /**
- * Write ComplexHeader struct on the disk. 
- * This function is used to write the header of a complex type node and the type label 
+ * Write ComplexHeader struct on the disk.
+ * This function is used to write the header of a complex type node and the type label
  * and the json string that contains the attributes of the record in JSON format.
  */
 void write_complex(const ComplexRecord &complex_record, std::ofstream &out)
 {
     return;
+}
+
+/**
+ * Reads a COMPLEX node payload (ComplexHeader + 2 length-prefixed strings) from
+ * nodes.dat and the associated JSON attributes from the sidecar file under
+ * JSON_ATTR_PATH. See the header declaration in graph_io.h for the on-disk
+ * layout assumed by this function.
+ *
+ * Mirrors the symmetry of write_complex: header + type_label + json_file_path
+ * on the main stream, then the JSON payload from the sidecar file.
+ */
+void read_complex(ComplexRecord &out, std::ifstream &dat_in)
+{
+    // 1. ComplexHeader. The two size fields are redundant with the length
+    //    prefixes written by write_string, so we read the header to advance
+    //    the stream but rely on read_string for the actual lengths.
+    ComplexHeader header = read_pod<ComplexHeader>(dat_in);
+    (void)header;
+
+    // 2. type_label and json_file_path — both written via write_string, so they
+    //    carry their own uint64_t length prefix.
+    out.type_label = read_string(dat_in);
+    std::string json_file_path = read_string(dat_in);
+
+    // 3. Open the sidecar JSON file and slurp its contents into json_attributes.
+    //    A COMPLEX node whose sidecar is missing is a corrupted database, not
+    //    a recoverable state — fail loudly.
+    std::filesystem::path json_path = std::filesystem::path(JSON_ATTR_PATH) / json_file_path;
+    std::ifstream json_in(json_path, std::ios::binary);
+    if (!json_in)
+    {
+        logger.error("Failed to open JSON attributes file for reading: " + json_path.string());
+        throw std::runtime_error("Failed to open JSON attributes file for reading: " + json_path.string());
+    }
+
+    std::ostringstream buf;
+    buf << json_in.rdbuf();
+    out.json_attributes = buf.str();
 }
 
 std::vector<RelationEntry> read_relation_node_list(std::ifstream &in)
@@ -83,6 +122,11 @@ NodeIndex read_node_index(std::ifstream &in)
     return read_pod<NodeIndex>(in);
 }
 
+/**
+ * Reads a node from disk based on its ID.
+ * @param id The ID of the node to read.
+ * @return A pointer to the reconstructed node.
+ */
 BaseNode* read_node(uint64_t id)
 {
     std::ifstream idx_in(std::filesystem::path(DB_PATH) / "nodes.idx", std::ios::binary);
@@ -93,13 +137,14 @@ BaseNode* read_node(uint64_t id)
     std::ifstream dat_in(std::filesystem::path(DB_PATH) / "nodes.dat", std::ios::binary);
     if (!dat_in) throw std::runtime_error("Failed to open nodes data file for reading.");
 
-    switch (node_idx.type_id)
+    switch (node_idx.type_id)   // Dispatch based on the NodeType to read the correct type of node
     {
         case NodeType::INT:    return read_typed_node<int>   (node_idx, dat_in);
         case NodeType::FLOAT:  return read_typed_node<float> (node_idx, dat_in);
         case NodeType::DOUBLE: return read_typed_node<double>(node_idx, dat_in);
         case NodeType::CHAR:   return read_typed_node<char>  (node_idx, dat_in);
         case NodeType::BOOL:   return read_typed_node<bool>  (node_idx, dat_in);
+        case NodeType::COMPLEX: return read_typed_node<ComplexRecord>(node_idx, dat_in);
         default: throw std::runtime_error("Unknown NodeType for node id " + std::to_string(id));
     }
 }
@@ -131,7 +176,8 @@ MetaRecord read_meta(){
 }
 
 /**
- * 
+ * Writes the JSON attributes metadata to the disk.
+ * @param meta The JSON attributes metadata to write. This metadata contains information such as the progressive number to generate unique JSON file names for complex nodes.
  */
 void write_json_attributes_meta(const JsonMeta &meta)
 {
