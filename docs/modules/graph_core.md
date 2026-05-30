@@ -6,8 +6,8 @@
 |---|---|
 | Tipo | module |
 | Lingua | en |
-| Ultimo aggiornamento | 2026-05-26 |
-| Commit di riferimento | 326920c |
+| Ultimo aggiornamento | 2026-05-30 |
+| Commit di riferimento | d7ba798 |
 | Mirror | — |
 
 ---
@@ -99,7 +99,13 @@ Fixed-width entry stored in `nodes.idx`.
 Just `T data;`. `T` must be trivially copyable (asserted at use site).
 
 ### `struct RelationNodeList` (POD, packed) (`struct/pod_struct.h`)
-Header for the adjacency list of a node: a single `uint64_t type_count`. Per-relation entries `[uint64_t name_length][bytes...][uint64_t edge_offset][uint64_t edge_count]` are written **immediately after** the POD by `write_relation_node_list`. The variable-width tail is not part of the struct itself.
+Header for the adjacency list of a node. 16 bytes since 2026-05-30 (was 8 — see [API change](../legacy/api_changes.md#2026-05-30--relationnodelist-aggiunto-il-campo-batch_size)).
+| Field | Type | Purpose |
+|---|---|---|
+| `type_count` | `uint64_t` | Number of distinct relation types this node has. |
+| `batch_size` | `uint64_t` | Size in bytes of the variable-width tail that follows the POD (does NOT include the 16 bytes of the POD itself). Two uses: read the tail in one shot, and record the reclaimable size when the region is orphaned by `update_node_edges`. |
+
+Per-relation entries `[uint64_t name_length][name bytes][uint64_t edge_offset][uint64_t edge_count]` are written **immediately after** the POD by `write_relation_node_list` (on insert) or `update_node_edges` (on edge update). The variable-width tail is not part of the struct itself; its total size equals `batch_size`.
 
 ### `struct Edge` (POD, packed) (`struct/pod_struct.h`)
 | Field | Type | Purpose |
@@ -189,9 +195,10 @@ Allocates a `Node<ValueType>` (with `T` stripped of reference), forwards `value`
 ### `void Graph::add_edge(int start, int end, std::string type = "", int weight = 1)` (`graph.cpp:53`)
 1. Rejects `type` longer than `RELATION_TYPE_MAX_SIZE` (throws `std::invalid_argument`).
 2. For each endpoint not in RAM: if id `< meta.next_id`, `read_node` from disk and cache; else throw `std::out_of_range`.
-3. Inserts `(weight, end_ptr)` into `start->neighborgs[type][end]`.
+3. Inserts `(weight, end_ptr)` into `start->neighborgs[type][end]` (RAM-first).
+4. Calls `update_node_edges(*start_node, meta, start)` to persist the new state.
 
-**Side effects on disk: none.** The mutation is RAM-only — see [BUG-001](../legacy/known_bugs.md).
+**Side effects on disk (since 2026-05-30):** appends a new `RelationNodeList` to `nodes.dat`, appends a fresh contiguous chunk per relation to `edges.dat`, patches `NodeIndex.relation_offset` in `nodes.idx` in place. The previously persisted `RelationNodeList` region and the previously persisted edge chunks become orphaned bytes (no freelist persistence yet). See [BUG-001 fixed](../legacy/known_bugs.md#2026-05-26--bug-001-add_edge-non-persiste-su-disco) and the [Edge persistence design decision](../legacy/design_decisions.md#2026-05-30--edge-persistence-append--obsolete--in-place-index-patch).
 
 ### `template<class Policy, class NodeFn, class EdgeFn> void Graph::traverse(int start, const std::string& type, NodeFn on_node, EdgeFn on_edge)` (`graph.h:76`)
 Generic graph traversal. Maintains `visited` and a `Policy::Frontier`. On visit, calls `on_node(idx)` and pushes to the frontier. On each pop, iterates the node's neighbors for the requested `type`, calls `on_edge(from, to, weight)` for every edge, and visits unvisited targets. Missing node or missing relation → silently skipped.
@@ -204,8 +211,9 @@ Thin wrappers selecting `BFSPolicy` / `DFSPolicy`.
 | Function | Purpose |
 |---|---|
 | `void write_node_index(uint64_t record_offset, uint64_t relation_offset, NodeType, std::ofstream&, const MetaRecord&)` | Builds and writes a `NodeIndex` to `nodes.idx`. `idx.id = meta.next_id`. |
-| `void write_complex(const ComplexRecord&, std::ofstream&)` | Writes the COMPLEX payload to `nodes.dat` (header + two length-prefixed strings) and opens the sidecar JSON file under `JSON_ATTR_PATH`. Still not compilable as-is: calls `write_pod` on a non-POD `ComplexRecord` and uses a sidecar path inconsistent with the one stored in the header — see [BUG-011](../legacy/known_bugs.md), [BUG-013](../legacy/known_bugs.md). (Previously also had a duplicate stub, see [BUG-009](../legacy/known_bugs.md) — fixed 2026-05-30.) |
+| `void write_complex(const ComplexRecord&, const std::string &json_file_path, std::ofstream&)` | Writes the COMPLEX payload to `nodes.dat` (`ComplexHeader` built from current string sizes + two length-prefixed strings: `type_label` and `json_file_path`) and writes `record.json_attributes` to the sidecar file at `JSON_ATTR_PATH / json_file_path`. Throws `runtime_error` if the sidecar cannot be opened. Functional since 2026-05-30 ([BUG-009](../legacy/known_bugs.md), [BUG-011](../legacy/known_bugs.md), [BUG-013](../legacy/known_bugs.md) all fixed). |
 | `void read_complex(ComplexRecord&, std::ifstream&)` | Reads the COMPLEX payload (header + two length-prefixed strings) from `nodes.dat` and slurps the sidecar JSON file under `JSON_ATTR_PATH` into `out.json_attributes`. Throws `runtime_error` if the sidecar is missing. Called by the `if constexpr` COMPLEX branch of `read_typed_node<T>`. |
+| `void update_node_edges(BaseNode&, const MetaRecord&, uint64_t node_id)` | Persists the current `neighborgs` of an already-on-disk node to `nodes.dat` / `edges.dat` and patches `NodeIndex.relation_offset` in `nodes.idx` in place. Reads the OLD relation list to compute the orphaned regions and logs them on `graph_io.log` (placeholder for the future freelist). Single source of in-place mutation in the system; called by `Graph::add_edge` since 2026-05-30. The `MetaRecord&` parameter is currently unused — reserved for when the freelist becomes persistent. |
 | `NodeIndex read_node_index(std::ifstream&)` | Reads one `NodeIndex` from the current stream position. |
 | `std::vector<RelationEntry> read_relation_node_list(std::ifstream&)` | Reads the `RelationNodeList` header and its variable-width tail. |
 | `void write_meta(const MetaRecord&)` | Truncates and rewrites `meta.dat`. |
@@ -213,7 +221,7 @@ Thin wrappers selecting `BFSPolicy` / `DFSPolicy`.
 | `void write_json_attributes_meta(const JsonMeta&)` | Truncates and rewrites `db/attributes/attributes_meta.dat`. |
 | `JsonMeta read_json_attributes_meta()` | Reads the `JsonMeta` POD; lazy-creates the file with `prog_number = 0` if missing. Throws on empty/unreadable file. |
 | `template<T> uint64_t write_node_record(const Node<T>&)` | Appends a `NodeRecord<T>` to `nodes.dat`. Returns the offset. |
-| `template<T> uint64_t write_relation_node_list(const Node<T>&, uint64_t node_id, std::ofstream& out)` | Appends `RelationNodeList` header + tail to `out` (already-open `nodes.dat`), and appends each edge to `edges.dat`. |
+| `template<T> uint64_t write_relation_node_list(const Node<T>&, uint64_t node_id, std::ofstream& out)` | Appends `RelationNodeList` header (with `batch_size` populated via `node_to_relation_list`) + tail to `out` (already-open `nodes.dat`), and appends each edge to `edges.dat`. Returns the byte offset where the relation list was written. |
 | `template<T> void write_node(const Node<T>&, const MetaRecord&)` | Composes the three writes for a full node persist (record + relations + index). Dispatches the record write via `if constexpr (node_type_of_v<T> == NodeType::COMPLEX)`: primitives go through `node_to_record` + `write_pod`, `COMPLEX` goes through `complex_node_to_record` + `write_complex`. Compiles since 2026-05-30 ([BUG-010](../legacy/known_bugs.md) fixed). |
 | `BaseNode* read_node(uint64_t id)` | Reads `NodeIndex` at `id * sizeof(NodeIndex)` in `nodes.idx`, dispatches on `type_id` to the right `read_typed_node<T>`. No `case NodeType::COMPLEX:` yet — reading a COMPLEX index throws `"Unknown NodeType"`. |
 | `template<T> NodeRecord<T> read_node_record(std::ifstream&)` | Reads one `NodeRecord<T>`. |
@@ -236,7 +244,7 @@ Thin wrappers selecting `BFSPolicy` / `DFSPolicy`.
 |---|---|
 | `template<T> NodeRecord<T> node_to_record(const Node<T>&)` (`node_odt.h:22`) | Copies `node.data` into a `NodeRecord<T>`. Asserts POD. |
 | `NodeRecord<ComplexHeader> complex_node_to_record(const Node<ComplexRecord>&, std::string &json_file_path)` (`node_odt.cpp:55`) | COMPLEX-specific ODT bridge: reads `JsonMeta`, composes the sidecar path into the out-param `json_file_path` as `{prog_number}_{type_label}.json` (uses `std::to_string`, see [BUG-011](../legacy/known_bugs.md) fix), builds a `ComplexHeader` from `type_label.size()` and `json_file_path.size()`, and returns it wrapped in `NodeRecord<ComplexHeader>`. The returned `NodeRecord` is currently unused by `write_node` (the header is rebuilt inside `write_complex` from the same inputs). Still does not persist the incremented `prog_number` — see [BUG-014](../legacy/known_bugs.md). |
-| `RelationNodeList node_to_relation_list(const BaseNode&)` (`node_odt.cpp:27`) | Fills only `type_count`. The variable-width tail is written separately by `write_relation_node_list`. |
+| `RelationNodeList node_to_relation_list(const BaseNode&)` (`node_odt.cpp:27`) | Fills `type_count` and `batch_size`. `batch_size` is computed as `Σ (3 * sizeof(uint64_t) + name.size())` over all relations in `node.neighborgs` — see [API change](../legacy/api_changes.md#2026-05-30--relationnodelist-aggiunto-il-campo-batch_size). The variable-width tail itself is written separately by `write_relation_node_list` (on insert) or by `update_node_edges` (on edge update). |
 | `NodeIndex node_to_node_index(uint64_t id, uint64_t record_offset, uint64_t relation_offset)` (`node_odt.cpp:39`) | Builder for `NodeIndex` (currently unused — `write_node_index` builds the struct inline). |
 | `std::unordered_map<...> reconstruct_neighbors(const RelationNodeList&)` (`node_odt.cpp:86`) | **Stub — returns an empty map.** See [BUG-003](../legacy/known_bugs.md). |
 | `template<T> BaseNode node_form_pod(const NodeIndex&, const NodeRecord<T>&, const RelationNodeList&)` (`node_odt.h:63`) | **Currently broken** — references `node.neihborgs` (typo, missing `b`). See [BUG-004](../legacy/known_bugs.md). |
@@ -296,6 +304,7 @@ No third-party libraries. No dependency on `data_tructures/`.
 
 ## Voci legacy collegate
 
+- [Edge persistence: append + obsolete + in-place index patch](../legacy/design_decisions.md#2026-05-30--edge-persistence-append--obsolete--in-place-index-patch)
 - [Storage sidecar JSON per nodi COMPLEX](../legacy/design_decisions.md#2026-05-26--storage-sidecar-json-per-nodi-complex)
 - [Introduzione tag NodeType::COMPLEX + ComplexRecord (WIP)](../legacy/design_decisions.md#2026-05-26--introduzione-tag-nodetypecomplex--complexrecord-wip)
 - [Separazione POD vs Domain struct](../legacy/design_decisions.md#2026-05-26--separazione-pod-vs-domain-struct)
@@ -303,9 +312,12 @@ No third-party libraries. No dependency on `data_tructures/`.
 - [Policy-based traversal](../legacy/design_decisions.md#2026-05-26--policy-based-traversal-bfsdfs)
 - [Append-only data files, truncated meta](../legacy/design_decisions.md#2026-05-26--append-only-data-files-truncated-meta)
 - [Single-open append su nodes.dat](../legacy/design_decisions.md#2026-05-26--single-open-append-su-nodesdat)
+- [API — RelationNodeList con batch_size](../legacy/api_changes.md#2026-05-30--relationnodelist-aggiunto-il-campo-batch_size)
+- [API — update_node_edges nuova funzione](../legacy/api_changes.md#2026-05-30--nuova-funzione-update_node_edges)
+- [API — Graph::add_edge persiste](../legacy/api_changes.md#2026-05-30--graphadd_edge-persistenza-su-disco-via-update_node_edges)
 - [API — ComplexHeader rinominato](../legacy/api_changes.md#2026-05-26--complexheaderjson_attributes_size--json_file_path_size)
 - [API — write_node switch su NodeType](../legacy/api_changes.md#2026-05-26--write_nodet-switch-su-nodetype-per-ramo-complex)
-- [BUG-001 — add_edge non persiste](../legacy/known_bugs.md#2026-05-26--bug-001-add_edge-non-persiste-su-disco)
+- [BUG-001 — add_edge non persiste (fixed)](../legacy/known_bugs.md#2026-05-26--bug-001-add_edge-non-persiste-su-disco)
 - [BUG-002 — edge_idx non globale](../legacy/known_bugs.md#2026-05-26--bug-002-edgeid-non-globale-tra-nodi)
 - [BUG-003 — reconstruct_neighbors stub](../legacy/known_bugs.md#2026-05-26--bug-003-reconstruct_neighbors-non-implementata)
 - [BUG-004 — typo neihborgs](../legacy/known_bugs.md#2026-05-26--bug-004-typo-neihborgs-in-node_form_pod)
@@ -327,6 +339,7 @@ No third-party libraries. No dependency on `data_tructures/`.
 - `graph_core/struct/domain_struct.h:38` — `ComplexRecord`.
 - `graph_core/struct/pod_struct.h:16` — `NodeType` (incl. `COMPLEX = 255`).
 - `graph_core/struct/pod_struct.h:41` — `NodeIndex`.
+- `graph_core/struct/pod_struct.h:78` — `RelationNodeList` (now 16 bytes: `type_count` + `batch_size`).
 - `graph_core/struct/pod_struct.h:134` — `ComplexHeader` (field `json_file_path_size`).
 - `graph_core/struct/pod_struct.h:148` — `JsonMeta`.
 - `graph_core/struct/functions_policies.h:12` — `BFSPolicy`.
@@ -334,10 +347,13 @@ No third-party libraries. No dependency on `data_tructures/`.
 - `graph_core/costants.h:7-11` — `DB_PATH`, `META_FILE_PATH`, `JSON_ATTR_META_PATH`, `JSON_ATTR_PATH`.
 - `graph_core/io/graph_io.h:24` — `write_complex` declaration.
 - `graph_core/io/graph_io.h:38` — `read_complex` declaration.
-- `graph_core/io/graph_io.h:107` — `write_node` template (switch on `NodeType`).
-- `graph_core/io/graph_io.cpp:34` — `write_complex` (single definition since 2026-05-30, see [BUG-009](../legacy/known_bugs.md)).
+- `graph_core/io/graph_io.h:62` — `update_node_edges` declaration.
+- `graph_core/io/graph_io.h:107` — `write_node` template (`if constexpr` dispatch on `NodeType`).
+- `graph_core/io/graph_io.cpp:34` — `write_complex`.
 - `graph_core/io/graph_io.cpp:65` — `read_complex`.
 - `graph_core/io/graph_io.cpp:120` — `read_node` (type dispatch — COMPLEX case routes to `read_typed_node<ComplexRecord>`).
 - `graph_core/io/graph_io.cpp:172,190` — `write_json_attributes_meta`, `read_json_attributes_meta`.
+- `graph_core/io/graph_io.cpp:247` — `update_node_edges`.
+- `graph_core/odt/node_odt.cpp:27` — `node_to_relation_list` (computes `batch_size`).
 - `graph_core/odt/node_odt.cpp:55` — `complex_node_to_record`.
 - `graph_core/odt/node_odt.cpp:86` — `reconstruct_neighbors` (stub).

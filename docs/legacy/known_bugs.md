@@ -7,7 +7,7 @@
 | Tipo | legacy-bugs |
 | Lingua | en |
 | Ultimo aggiornamento | 2026-05-30 |
-| Commit di riferimento | 326920c |
+| Commit di riferimento | d7ba798 |
 | Mirror | — |
 
 ---
@@ -112,11 +112,11 @@
 
 ### 2026-05-26 — BUG-001: `add_edge` non persiste su disco
 
-- **Stato:** open
-- **Sintomo:** Gli archi aggiunti dopo l'`insert` di un nodo vivono solo in RAM. Riavviando il programma e rileggendo i nodi via `read_node`, l'adiacenza ricaricata non li contiene.
-- **Root cause:** `Graph::add_edge` (in `graph_core/graph.cpp:53`) modifica `node->neighborgs[type][end] = edge;` ma non chiama nessuna funzione di scrittura su `nodes.dat`/`edges.dat`. La `RelationNodeList` di un nodo viene scritta una sola volta da `write_node` al momento dell'`insert`, quando ancora non ci sono archi.
-- **Fix:** n/a (open). Possibili strade: (a) rendere la coda della `RelationNodeList` di lunghezza variabile riscrivibile in append + meccanismo di "ultima versione vince" via offset più recente, (b) aggiungere un `flush_node(id)` che riscrive la node entry in coda e aggiorna `nodes.idx`, (c) introdurre un freelist e fare in-place updates (richiede record di dimensione fissa).
-- **Regression guard:** nessuno. Un test minimo sarebbe: inserire 2 nodi, aggiungere un arco, distruggere `Graph`, ricrearlo, `read_node(0)` e verificare che `neighborgs["road"][1]` esista.
+- **Stato:** fixed (2026-05-30)
+- **Sintomo:** Gli archi aggiunti dopo l'`insert` di un nodo vivevano solo in RAM. Riavviando il programma e rileggendo i nodi via `read_node`, l'adiacenza ricaricata non li conteneva.
+- **Root cause:** `Graph::add_edge` (`graph_core/graph.cpp:53`) mutava `node->neighborgs[type][end] = edge;` ma non chiamava nessuna funzione di scrittura su `nodes.dat`/`edges.dat`. La `RelationNodeList` di un nodo veniva scritta una sola volta da `write_node` al momento dell'`insert`, quando ancora non c'erano archi.
+- **Fix (2026-05-30):** scelta la variante (b) del menu originale — introdotta una nuova funzione `update_node_edges(BaseNode &node, const MetaRecord &meta, uint64_t node_id)` in `graph_core/io/graph_io.h:62` / `graph_core/io/graph_io.cpp:247`. Chiamata da `Graph::add_edge` *dopo* la mutazione del `neighborgs` in RAM. Strategia "append + obsolete + in-place index patch": (1) legge `NodeIndex` + `RelationNodeList` correnti per individuare le regioni da orfanizzare; (2) logga le regioni orfane su `graph_io.log` (la freelist persistente è il prossimo step); (3) appende a `nodes.dat` la nuova `RelationNodeList` e a `edges.dat` un nuovo chunk contiguo per ogni relazione; (4) patcha in-place `NodeIndex.relation_offset` in `nodes.idx`. `node_to_relation_list` ora popola anche il nuovo campo `batch_size` (vedi [API change](api_changes.md)). Dettagli architetturali nella [design decision dedicata](design_decisions.md#2026-05-30--edge-persistence-append--obsolete--in-place-index-patch).
+- **Regression guard:** lo smoke test in `main.cpp` (a partire dal commit `d7ba798`) esegue insert + add_edge in fase 1, distrugge `Graph`, lo ricrea, forza il lazy-load via `add_edge` su una relazione fresca, e ri-esegue BFS. Se le BFS pre/post-restart producono lo stesso output, BUG-001 resta chiuso. Limitazione nota: lo smoke test non assert-failsa automaticamente — è un confronto visuale del log.
 
 ---
 

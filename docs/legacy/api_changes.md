@@ -6,14 +6,17 @@
 |---|---|
 | Tipo | legacy-api |
 | Lingua | en |
-| Ultimo aggiornamento | 2026-05-26 |
-| Commit di riferimento | 326920c |
+| Ultimo aggiornamento | 2026-05-30 |
+| Commit di riferimento | d7ba798 |
 | Mirror | — |
 
 ---
 
 ## Indice
 
+- [2026-05-30 — `Graph::add_edge`: persistenza su disco via `update_node_edges`](#2026-05-30--graphadd_edge-persistenza-su-disco-via-update_node_edges)
+- [2026-05-30 — Nuova funzione `update_node_edges`](#2026-05-30--nuova-funzione-update_node_edges)
+- [2026-05-30 — `RelationNodeList`: aggiunto il campo `batch_size`](#2026-05-30--relationnodelist-aggiunto-il-campo-batch_size)
 - [2026-05-26 — `write_node<T>` switch su `NodeType` per ramo COMPLEX](#2026-05-26--write_nodet-switch-su-nodetype-per-ramo-complex)
 - [2026-05-26 — Nuova firma `complex_node_to_record`](#2026-05-26--nuova-firma-complex_node_to_record)
 - [2026-05-26 — Nuove funzioni `write_complex` / `write_json_attributes_meta` / `read_json_attributes_meta`](#2026-05-26--nuove-funzioni-write_complex--write_json_attributes_meta--read_json_attributes_meta)
@@ -25,6 +28,88 @@
 > Nota: il progetto non ha ancora consumatori esterni, quindi "API pubblica" qui significa: classe `Graph`, POD persistiti su disco (`pod_struct.h`), funzioni esposte nei header pubblici (`io/graph_io.h`, `io/io_utils.h`, `odt/*.h`, `struct/*.h`).
 >
 > Le modifiche ai POD persistiti sono particolarmente sensibili perché rompono il formato su disco — andranno tracciate qui anche se prive di consumatori esterni.
+
+---
+
+### 2026-05-30 — `Graph::add_edge`: persistenza su disco via `update_node_edges`
+
+- **Motivazione:** Chiusura di [BUG-001](known_bugs.md#2026-05-26--bug-001-add_edge-non-persiste-su-disco). Prima del 2026-05-30 la funzione mutava solo l'adiacenza in RAM; gli archi erano persi al riavvio. Il nuovo flusso allinea lo stato persistito allo stato in RAM dopo ogni `add_edge`.
+- **Before:**
+  ```cpp
+  void Graph::add_edge(int start, int end, std::string type, int weight)
+  {
+      // ... lazy load di start/end se non in RAM ...
+      BaseNode *node = nodes[start];
+      auto edge = std::pair<int, BaseNode*>(weight, nodes[end]);
+      node->neighborgs[type][end] = edge;
+      // No disk write.
+  }
+  ```
+- **After:**
+  ```cpp
+  void Graph::add_edge(int start, int end, std::string type, int weight)
+  {
+      // ... lazy load di start/end se non in RAM ...
+      BaseNode *node = nodes[start];
+      auto edge = std::pair<int, BaseNode*>(weight, nodes[end]);
+      // RAM-first: la persistenza legge node->neighborgs aggiornato.
+      node->neighborgs[type][end] = edge;
+      // Disk: rewrite della RelationNodeList + chunk edge + patch nodes.idx.
+      update_node_edges(*node, meta, start);
+  }
+  ```
+- **Note di migrazione:** Side effects on disk passano da **none** a **multipli**: append in `nodes.dat`, append in `edges.dat`, scrittura in-place in `nodes.idx`, log su `graph_io.log`. La firma resta invariata. Vedi anche la [design decision](design_decisions.md#2026-05-30--edge-persistence-append--obsolete--in-place-index-patch) per le conseguenze (regioni orfane senza freelist, `nodes.idx` non più append-only).
+- **Riferimenti:** commit `621e356`, `d7ba798`. `graph_core/graph.cpp:53` (callsite), `graph_core/io/graph_io.cpp:247` (impl di `update_node_edges`).
+
+---
+
+### 2026-05-30 — Nuova funzione `update_node_edges`
+
+- **Motivazione:** Implementare la persistenza del cambio di adiacenza per un nodo già scritto su disco, senza riscrivere l'intero `nodes.dat`. Necessaria per chiudere [BUG-001](known_bugs.md#2026-05-26--bug-001-add_edge-non-persiste-su-disco).
+- **Before:** assente.
+- **After:**
+  ```cpp
+  // graph_core/io/graph_io.h:62
+  void update_node_edges(BaseNode &node, const MetaRecord &meta, uint64_t node_id);
+  ```
+  Comportamento: legge `NodeIndex[node_id]` e la `RelationNodeList` corrente, logga le regioni che diventeranno orfane (placeholder per la futura freelist), poi appende a `nodes.dat` la nuova `RelationNodeList` ricostruita da `node.neighborgs` e, per ogni relazione, un chunk fresh contiguo a `edges.dat`. Infine patcha in-place `NodeIndex.relation_offset` in `nodes.idx` con il nuovo offset.
+- **Note di migrazione:** `node_id` è atteso essere l'id di un nodo già inserito (cioè con un'entry valida in `nodes.idx`). Il parametro `const MetaRecord &meta` è oggi inutilizzato (`(void)meta;` nel corpo) — riservato per quando la freelist persistente userà `meta.free_count`. Throw `std::runtime_error` se uno qualunque dei file non si apre. Si appoggia a `node_to_relation_list` per ottenere la POD `RelationNodeList` corretta (con `batch_size` valorizzato — vedi [API change correlato](#2026-05-30--relationnodelist-aggiunto-il-campo-batch_size)). L'unica chiamante attualmente è `Graph::add_edge`.
+- **Riferimenti:** commit `621e356`. `graph_core/io/graph_io.h:62` (decl), `graph_core/io/graph_io.cpp:247` (impl), `graph_core/graph.cpp:53` (callsite).
+
+---
+
+### 2026-05-30 — `RelationNodeList`: aggiunto il campo `batch_size`
+
+- **Motivazione:** Necessario per due motivi: (1) consentire al lettore di acquisire la coda di lunghezza variabile in un solo `read` invece di walkare le entry a runtime; (2) avere a portata di mano la dimensione totale della regione `RelationNodeList` quando va orfanata da `update_node_edges`, in modo da poterla registrare in futuro su una freelist persistente. Il design dietro è descritto in [Edge persistence](design_decisions.md#2026-05-30--edge-persistence-append--obsolete--in-place-index-patch).
+- **Before:**
+  ```c
+  #pragma pack(push, 1)
+  struct RelationNodeList
+  {
+      uint64_t type_count; // Number of relation types the node has
+      // Variable-width tail follows: type_count entries
+  };
+  #pragma pack(pop)
+  // sizeof(RelationNodeList) == 8
+  ```
+- **After:**
+  ```c
+  #pragma pack(push, 1)
+  struct RelationNodeList
+  {
+      uint64_t type_count;  // Number of distinct relation types this node has.
+      uint64_t batch_size;  // Size in bytes of the variable-width tail (NOT including
+                            // the 16 bytes of the POD). Used for one-shot reads and
+                            // for freelist sizing when the region is orphaned.
+      // Variable-width tail follows: type_count entries
+  };
+  #pragma pack(pop)
+  // sizeof(RelationNodeList) == 16
+  ```
+- **Note di migrazione:** **Schema-break del formato on-disk.** Qualunque `db/` pre-esistente non è più leggibile (la `RelationNodeList` POD è cresciuta da 8 a 16 byte, gli offset di tutto ciò che segue si spostano). Va cancellato il `db/` prima del primo run con questo formato — coerente con la linea di `CLAUDE.md`.
+  - `node_to_relation_list` in `graph_core/odt/node_odt.cpp:27` è stata adeguata a calcolare e popolare `batch_size` come somma di `3 * sizeof(uint64_t) + name.size()` per ogni relazione. Tutti i percorsi di write (`write_node` per nuovi nodi, `update_node_edges` per nodi già scritti) ottengono la POD coerente passando per questo helper.
+  - Convenzione: `batch_size` è la dimensione della **coda** soltanto, NON include i 16 byte del POD stesso. La dimensione totale on-disk della regione è quindi `sizeof(RelationNodeList) + batch_size`. Convenzione documentata anche nel block-comment del POD in `pod_struct.h:78`.
+- **Riferimenti:** commit `621e356`, `d7ba798`. `graph_core/struct/pod_struct.h:78` (POD), `graph_core/odt/node_odt.cpp:27` (`node_to_relation_list`), `graph_core/io/graph_io.cpp:112` (`read_relation_node_list`).
 
 ---
 

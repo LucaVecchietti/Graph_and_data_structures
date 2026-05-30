@@ -6,14 +6,15 @@
 |---|---|
 | Tipo | legacy-decisions |
 | Lingua | en |
-| Ultimo aggiornamento | 2026-05-26 |
-| Commit di riferimento | 326920c |
+| Ultimo aggiornamento | 2026-05-30 |
+| Commit di riferimento | d7ba798 |
 | Mirror | — |
 
 ---
 
 ## Indice
 
+- [2026-05-30 — Edge persistence: append + obsolete + in-place index patch](#2026-05-30--edge-persistence-append--obsolete--in-place-index-patch)
 - [2026-05-26 — Storage sidecar JSON per nodi COMPLEX](#2026-05-26--storage-sidecar-json-per-nodi-complex)
 - [2026-05-26 — Introduzione tag NodeType::COMPLEX + ComplexRecord (WIP)](#2026-05-26--introduzione-tag-nodetypecomplex--complexrecord-wip)
 - [2026-05-26 — Separazione POD vs Domain struct](#2026-05-26--separazione-pod-vs-domain-struct)
@@ -23,6 +24,30 @@
 - [2026-05-26 — Single-open append su nodes.dat](#2026-05-26--single-open-append-su-nodesdat)
 - [2026-05-26 — POD packed e fragilità ABI](#2026-05-26--pod-packed-e-fragilità-abi)
 - [2026-05-26 — Hash table standalone in C (non linkata)](#2026-05-26--hash-table-standalone-in-c-non-linkata)
+
+---
+
+### 2026-05-30 — Edge persistence: append + obsolete + in-place index patch
+
+- **Stato:** active
+- **Contesto:** Prima del 2026-05-30, `Graph::add_edge` mutava solo l'adiacenza in RAM. Al riavvio del processo l'arco era perso ([BUG-001](known_bugs.md#2026-05-26--bug-001-add_edge-non-persiste-su-disco)). Il design della `RelationNodeList` ha una **coda di lunghezza variabile** (`type_count` entry, ciascuna con `name` di lunghezza variabile + due offset), e i chunk di edge in `edges.dat` sono memorizzati **contigui per coppia `(node, relation)`**. Aggiungere un edge a una relazione esistente non si può fare in-place: la `RelationNodeList` cambierebbe dimensione e il chunk contiguo perderebbe la contiguità.
+- **Decisione:** Strategia "append + obsolete + in-place index patch" per ogni `add_edge`:
+  1. Mutare prima `node->neighborgs[type][end]` in RAM. La funzione di persistenza opera sullo stato finale.
+  2. Leggere `NodeIndex` corrente + `RelationNodeList` corrente per identificare le regioni che diventeranno orfane (la RelationNodeList stessa in `nodes.dat`, più i chunk per ciascuna relazione in `edges.dat`).
+  3. Loggare le regioni orfane su `graph_io.log` come placeholder. **La freelist persistente non è implementata** — `FreeRecord` e `MetaRecord.free_count` esistono come POD/campo ma non c'è ancora `freelist.dat` né i percorsi di read/write. Lo spazio orfanato resta come byte morti finché la freelist non arriverà.
+  4. Appendere a `nodes.dat` la nuova `RelationNodeList` POD (16 byte: `type_count` + `batch_size`) e poi, per ogni relazione, appendere il chunk di edge in `edges.dat` (fresh contiguous block) seguito dalla entry della tail in `nodes.dat`. Niente edge "vecchio" viene riusato.
+  5. Patcharare in-place `NodeIndex.relation_offset` in `nodes.idx`. È l'**unica scrittura in-place** del sistema: tutti gli altri file restano append-only. `nodes.idx` resta a record fissi da 25 byte, quindi `seekp(node_id * sizeof(NodeIndex) + offsetof(NodeIndex, relation_offset))` è ben definito; aperto con `std::ios::binary | std::ios::in | std::ios::out` (non `app`, perché su Windows `seekp` in app mode viene ignorato).
+- **Alternative considerate:**
+  - *Linked-list di edge*: aggiungere `uint64_t next_offset` a `Edge`, la `RelationNodeList` salva solo `head_offset` e niente `edge_count`. Add è O(1), no write amplification. Costo: cambia il formato di `Edge` (32 → 40 byte), e la lettura diventa una chain-walk. Scartata per non rompere il formato `Edge` e per restare nella tradizione "chunk contigui per `(node, relation)`".
+  - *Pre-allocazione di slot a capacità fissa per `(node, relation)`*: semplice ma spreca spazio e fa esplodere il file primario se la fanout è skewed. Scartata.
+  - *In-place rewrite della `RelationNodeList` originale*: impossibile senza padding fisso o senza spostare il resto del file in coda. La coda è di lunghezza variabile, quindi padding sarebbe sprecato per la maggior parte dei nodi.
+- **Conseguenze:**
+  - `nodes.idx` smette di essere **append-only**. La documentazione di [Append-only data files](#2026-05-26--append-only-data-files-truncated-meta) va letta tenendo conto di questa eccezione.
+  - Ogni `add_edge` produce **regioni orfane** in `nodes.dat` (vecchia `RelationNodeList`) e `edges.dat` (vecchi chunk di edge). Senza freelist, il DB cresce monotonicamente. Per uno smoke test è trascurabile; per un workload reale è un leak che va chiuso prima di poter parlare di "produzione".
+  - Aggiunto il campo `batch_size` a `RelationNodeList` (POD da 8 → 16 byte). **Schema-break del formato on-disk**: qualunque `db/` pre-esistente non è più leggibile e va cancellato. Vedi [API change](api_changes.md#2026-05-30--relationnodelist-aggiunto-il-campo-batch_size).
+  - L'ordine RAM-first/persist-second sacrifica una proprietà transazionale (se la persistenza fallisce, lo stato RAM è davanti al disco), ma allinea il "input della funzione di persistenza" con lo stato di verità che si vuole scrivere. Il processo tipicamente muore sull'eccezione, e un restart rilegge lo stato vecchio dal disco — niente inconsistenza permanente.
+  - Atomicità del passo 5: scrittura non-fsync di 8 byte allineati. In pratica improbabile che si rompa, ma non formalmente garantito. Out of scope per ora.
+- **Riferimenti:** `graph_core/io/graph_io.h:62` (declaration), `graph_core/io/graph_io.cpp:247` (impl), `graph_core/graph.cpp:53` (callsite), `graph_core/struct/pod_struct.h:78` (`RelationNodeList` con `batch_size`), `graph_core/odt/node_odt.cpp:27` (`node_to_relation_list` calcola `batch_size`). Bug correlato: [BUG-001](known_bugs.md#2026-05-26--bug-001-add_edge-non-persiste-su-disco).
 
 ---
 

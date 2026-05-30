@@ -6,8 +6,8 @@
 |---|---|
 | Tipo | architecture |
 | Lingua | en |
-| Ultimo aggiornamento | 2026-05-26 |
-| Commit di riferimento | 326920c |
+| Ultimo aggiornamento | 2026-05-30 |
+| Commit di riferimento | d7ba798 |
 | Mirror | — |
 
 ---
@@ -119,10 +119,20 @@ main.cpp
 Graph::add_edge        (graph_core/graph.cpp)
    │ if start/end not in RAM but id < meta.next_id:
    │     read_node(id)   ← lazy load from disk
-   │ node->neighborgs[type][end] = (weight, ptr)
+   │ node->neighborgs[type][end] = (weight, ptr)   ← RAM-first
+   ▼
+update_node_edges      (graph_core/io/graph_io.cpp)  ← persistence since 2026-05-30
+   │ read OLD NodeIndex + RelationNodeList        ← identify orphaned regions
+   │ log orphaned offsets/sizes to graph_io.log   ← placeholder for the freelist
+   │ append NEW RelationNodeList POD              → nodes.dat
+   │ for each relation in node->neighborgs:
+   │     append edges to edges.dat (fresh chunk)  → captures new edge_offset
+   │     append tail entry [name][off][count]     → nodes.dat
+   │ open nodes.idx (binary | in | out)           ← NOT app: in-place seek
+   │ patch NodeIndex.relation_offset in place     → nodes.idx
 ```
 
-Note: `add_edge` currently mutates RAM only; the edge is NOT re-flushed to `edges.dat` after the initial `write_node`. See [known_bugs.md](../legacy/known_bugs.md).
+Since 2026-05-30, `add_edge` persists. [BUG-001](../legacy/known_bugs.md#2026-05-26--bug-001-add_edge-non-persiste-su-disco) closed. Trade-off: the old `RelationNodeList` and edge chunks become orphaned bytes — the persistent freelist that will reclaim them is not implemented yet. See [Edge persistence design decision](../legacy/design_decisions.md#2026-05-30--edge-persistence-append--obsolete--in-place-index-patch).
 
 ### Read-back flow
 
@@ -165,4 +175,5 @@ main.cpp
 - [Policy-based traversal](../legacy/design_decisions.md#2026-05-26--policy-based-traversal-bfsdfs) — why BFS/DFS share one `traverse` template.
 - [Type-erased BaseNode + Node&lt;T&gt;](../legacy/design_decisions.md#2026-05-26--type-erased-basenode--nodet) — why nodes of different payload types can coexist.
 - [Append-only data files, truncated meta](../legacy/design_decisions.md#2026-05-26--append-only-data-files-truncated-meta) — file open modes.
+- [Edge persistence: append + obsolete + in-place index patch](../legacy/design_decisions.md#2026-05-30--edge-persistence-append--obsolete--in-place-index-patch) — how `add_edge` persists since 2026-05-30, and the exception that `nodes.idx` is no longer purely append-only.
 - [Storage sidecar JSON per nodi COMPLEX](../legacy/design_decisions.md#2026-05-26--storage-sidecar-json-per-nodi-complex) — why COMPLEX records put their JSON payload in `attributes/` rather than inline.
