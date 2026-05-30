@@ -31,8 +31,20 @@ namespace {
 
  RelationNodeList node_to_relation_list(const BaseNode &node)
  {
+     // Pre-compute the size of the variable-width tail that will be written
+     // immediately after this POD by the I/O layer. Per-entry layout is
+     //   [uint64_t name_length][name bytes][uint64_t edge_offset][uint64_t edge_count]
+     // so each entry contributes 24 + name_length bytes.
+     uint64_t batch_size = 0;
+     for (const auto &[rel_type, neighbors] : node.neighborgs)
+     {
+         (void)neighbors;
+         batch_size += 3 * sizeof(uint64_t) + rel_type.size();
+     }
+
      RelationNodeList list;
      list.type_count = node.neighborgs.size(); // Count the number of relation types
+     list.batch_size = batch_size;             // Size in bytes of the tail (see pod_struct.h)
      return list;
  }
 

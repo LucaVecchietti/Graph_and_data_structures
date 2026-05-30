@@ -105,6 +105,17 @@ void Graph::add_edge(int start, int end, std::string type, int weight)
 
     logger.info("Adding edge from node " + std::to_string(start) + " to node " + std::to_string(end) + " with type '" + type + "' and weight " + std::to_string(weight));
 
-    // Add the edge and the near node to the neighborgs based on the type of the relation
+    // Mutate the in-RAM adjacency map FIRST, then persist. update_node_edges
+    // reads node->neighborgs to produce the new on-disk state, so the new edge
+    // must be visible to it. If the persist throws, the in-RAM state is ahead
+    // of disk for the rest of the process lifetime — but the process tipically
+    // dies on the exception anyway, and a restart re-reads the (old) state
+    // from disk so no permanent inconsistency.
     node->neighborgs[type][end] = edge;
+
+    // Edge persistence: rewrite the relation list + edge chunks at fresh
+    // offsets in nodes.dat / edges.dat and patch NodeIndex.relation_offset
+    // in-place. The OLD regions become orphaned bytes (see TODO inside the
+    // function — freelist persistence is the planned reclaim mechanism).
+    update_node_edges(*node, meta, start);
 }

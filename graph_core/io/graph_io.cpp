@@ -234,3 +234,145 @@ JsonMeta read_json_attributes_meta()
 
     return read_pod<JsonMeta>(in);
 }
+
+/**
+ * Updates the edges of a node on the disk when a new edge is added to the node in memory.
+ * This function delete the current edges batch and rewrites it whitch the new edges added to the node
+ * ina  new position on the disk, then it updates the relation list of the node tu poitn to the new position
+ * and finnealy add the free offstet to the nodes freelist to be reused.
+ * @param node The node whose edges need to be updated.
+ * @param meta The metadata containing information about the graph state.
+ * @param node_id The ID of the node whose edges need to be updated.
+ */
+void update_node_edges(BaseNode &node, const MetaRecord &meta, uint64_t node_id)
+{
+    (void)meta; // Reserved for future use (e.g. updating free_count when the
+                // freelist persistence lands; not needed yet).
+
+    namespace fs = std::filesystem;
+
+    // ---- 1. Read the current relation list of the node ---------------------
+    // The OLD relation list region (in nodes.dat) and each OLD per-relation
+    // edge chunk (in edges.dat) will be orphaned by this update — we record
+    // their offsets/sizes here so step 2 can hand them to the freelist.
+    NodeIndex node_idx;
+    {
+        std::ifstream idx_in(fs::path(DB_PATH) / "nodes.idx", std::ios::binary);
+        if (!idx_in)
+        {
+            logger.error("update_node_edges: failed to open nodes.idx for reading.");
+            throw std::runtime_error("update_node_edges: failed to open nodes.idx for reading.");
+        }
+        idx_in.seekg(static_cast<std::streamoff>(node_id * sizeof(NodeIndex)));
+        node_idx = read_node_index(idx_in);
+    }
+
+    std::vector<RelationEntry> old_entries;
+    uint64_t old_relation_total_size = 0; // sizeof(POD) + batch_size of the OLD list
+    {
+        std::ifstream dat_in(fs::path(DB_PATH) / "nodes.dat", std::ios::binary);
+        if (!dat_in)
+        {
+            logger.error("update_node_edges: failed to open nodes.dat for reading.");
+            throw std::runtime_error("update_node_edges: failed to open nodes.dat for reading.");
+        }
+        dat_in.seekg(static_cast<std::streamoff>(node_idx.relation_offset));
+        RelationNodeList old_header = read_pod<RelationNodeList>(dat_in);
+        old_relation_total_size = sizeof(RelationNodeList) + old_header.batch_size;
+
+        // read_relation_node_list expects the stream positioned at the POD
+        // start, so rewind before delegating to it for the tail entries.
+        dat_in.seekg(static_cast<std::streamoff>(node_idx.relation_offset));
+        old_entries = read_relation_node_list(dat_in);
+    }
+
+    // ---- 2. Orphan the OLD regions ----------------------------------------
+    // TODO(BUG-001 follow-up): push these (offset, size) pairs onto a real
+    // freelist (db/freelist.dat) so subsequent writes can reuse the holes.
+    // The FreeRecord POD and MetaRecord.free_count are already defined for
+    // this purpose but the persistence path is not implemented yet. Until
+    // then we just log the orphaning so the leak is observable in graph_io.log
+    // and the regions accumulate as dead bytes in nodes.dat / edges.dat.
+    logger.info("update_node_edges: orphaning RelationNodeList at offset "
+                + std::to_string(node_idx.relation_offset)
+                + " of size " + std::to_string(old_relation_total_size)
+                + " bytes (nodes.dat)");
+    for (const auto &entry : old_entries)
+    {
+        uint64_t chunk_size = entry.edge_count * sizeof(Edge);
+        logger.info("update_node_edges: orphaning edge chunk for relation \""
+                    + entry.name + "\" at offset " + std::to_string(entry.edge_offset)
+                    + " of size " + std::to_string(chunk_size) + " bytes (edges.dat)");
+    }
+
+    // ---- 3. Write the NEW edge chunks and the NEW relation list ------------
+    // Per-relation: append all current edges to edges.dat as one contiguous
+    // chunk, capture its edge_offset, then emit the matching tail entry in
+    // the new relation list region in nodes.dat. The new RelationNodeList
+    // POD is written up-front (batch_size is pre-computed via the ODT bridge
+    // node_to_relation_list, which sums 24 + name.size() over all relations).
+    uint64_t new_relation_offset = 0;
+    {
+        std::ofstream dat_out(fs::path(DB_PATH) / "nodes.dat", std::ios::binary | std::ios::app);
+        if (!dat_out)
+        {
+            logger.error("update_node_edges: failed to open nodes.dat for writing.");
+            throw std::runtime_error("update_node_edges: failed to open nodes.dat for writing.");
+        }
+        dat_out.seekp(0, std::ios::end);
+        new_relation_offset = dat_out.tellp();
+
+        RelationNodeList list = node_to_relation_list(node);
+        write_pod(list, dat_out);
+
+        std::ofstream edges_out(fs::path(DB_PATH) / "edges.dat", std::ios::binary | std::ios::app);
+        if (!edges_out)
+        {
+            logger.error("update_node_edges: failed to open edges.dat for writing.");
+            throw std::runtime_error("update_node_edges: failed to open edges.dat for writing.");
+        }
+
+        // edge_idx is per-node-local (matches the semantics of write_relation_node_list).
+        // Globally unique edge ids are tracked separately as BUG-002 — out of scope here.
+        uint64_t edge_idx = 0;
+        for (const auto &[rel_type, neighbors] : node.neighborgs)
+        {
+            edges_out.seekp(0, std::ios::end);
+            uint64_t edge_offset = edges_out.tellp();
+            for (const auto &[to_id, wp] : neighbors)
+            {
+                Edge edge = edge_to_pod(edge_idx++, node_id,
+                                       static_cast<uint64_t>(to_id),
+                                       static_cast<uint64_t>(wp.first));
+                write_pod(edge, edges_out);
+            }
+            uint64_t edge_count = static_cast<uint64_t>(neighbors.size());
+            write_string(rel_type, dat_out);
+            write_offset(edge_offset, dat_out);
+            write_offset(edge_count, dat_out);
+        }
+    }
+
+    // ---- 4. Patch NodeIndex.relation_offset in-place -----------------------
+    // nodes.idx is fixed-width (25 bytes per entry), so we can seek directly
+    // to the relation_offset field of this node's entry and overwrite the
+    // 8-byte uint64_t. Open in_out (NOT app) so the seek lands inside the
+    // existing file rather than at end-of-file (Windows ignores seekp in app
+    // mode). This is the only place where nodes.idx is mutated in-place;
+    // every other writer uses pure append.
+    {
+        std::fstream idx_inout(fs::path(DB_PATH) / "nodes.idx",
+                               std::ios::binary | std::ios::in | std::ios::out);
+        if (!idx_inout)
+        {
+            logger.error("update_node_edges: failed to open nodes.idx for in-place update.");
+            throw std::runtime_error("update_node_edges: failed to open nodes.idx for in-place update.");
+        }
+        idx_inout.seekp(static_cast<std::streamoff>(
+            node_id * sizeof(NodeIndex) + offsetof(NodeIndex, relation_offset)));
+        write_offset(new_relation_offset, idx_inout);
+    }
+
+    logger.info("update_node_edges: node " + std::to_string(node_id)
+                + " relation_offset patched to " + std::to_string(new_relation_offset));
+}

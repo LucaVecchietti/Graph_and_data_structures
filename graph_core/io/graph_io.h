@@ -59,6 +59,8 @@ MetaRecord       read_meta();
 void             write_json_attributes_meta(const JsonMeta &meta);
 JsonMeta         read_json_attributes_meta();
 
+void             update_node_edges(BaseNode &node, const MetaRecord &meta, uint64_t node_id);
+
 // ---- Template definitions ───────────────────────────────────────────
 
 /**

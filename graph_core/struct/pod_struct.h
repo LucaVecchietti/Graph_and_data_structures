@@ -78,16 +78,40 @@ struct NodeRecord
 #pragma pack(push, 1)
 struct RelationNodeList
 {
-    uint64_t type_count; // Number rlation type the node has
+    uint64_t type_count;  // Number of distinct relation types this node has.
+    uint64_t batch_size;  // Size in bytes of the variable-width tail that follows
+                          // this POD (NOT including the 16 bytes of the POD itself).
+                          // Two uses:
+                          //   1. Read path: after reading the POD, read batch_size
+                          //      more bytes in one shot to grab the whole tail
+                          //      without per-entry seeks.
+                          //   2. Freelist: when this RelationNodeList region is
+                          //      orphaned (e.g. by an in-place update from add_edge),
+                          //      the total reclaimable size at `relation_offset` is
+                          //      sizeof(RelationNodeList) + batch_size.
     /**
-     * After thi POD write every relation type preceded by the dimention of the string, wich is the name of the type,
-     * and followed by the offset, that point tu the position where the edges are stored, and the number of edges.
+     * After this POD, `type_count` entries are laid out contiguously, each:
      *
-     * [After this POD structure wrote relation type as [`uint8_t`][s][t][r][i][n][g][`uint64_t`][`uint64_t`] ] * type_count
-     * E.g.
-     * [4][r][o][a][d][offset][relation_count]
-     * [5][t][r][a][i][n][offset][relation_count]
-     * ...
+     *   [uint64_t name_length][name bytes][uint64_t edge_offset][uint64_t edge_count]
+     *
+     * Fields per entry:
+     *   - name_length   8 bytes, length prefix written by write_string.
+     *   - name          name_length bytes, the relation type name (no NUL terminator).
+     *   - edge_offset   8 bytes, byte offset into edges.dat where the edges of this
+     *                   relation start.
+     *   - edge_count    8 bytes, number of consecutive Edge POD records belonging
+     *                   to this (node, relation) pair starting at edge_offset.
+     *
+     * Per-entry size on disk = 24 + name_length bytes. The whole tail is
+     * `batch_size` bytes, i.e. sum of (24 + name_length) over all entries.
+     *
+     * Example tail with two relations "road" (3 edges) and "train" (5 edges):
+     *   [8: name_length=4][r][o][a][d][8: edge_offset=...][8: edge_count=3]
+     *   [8: name_length=5][t][r][a][i][n][8: edge_offset=...][8: edge_count=5]
+     *
+     * Note: the application-level cap on name_length is RELATION_TYPE_MAX_SIZE
+     * (= 255, enforced by add_edge via costants.h), but the on-disk length prefix
+     * is `uint64_t`, not `uint8_t` — the format itself permits up to 2^64-1.
      */
 };
 #pragma pack(pop)
@@ -108,7 +132,6 @@ struct Edge
 /**
  * Metadata struct POD for the graph, hold the offset of the next free position on the disc and the number of nodes in the graph.
  */
-
 #pragma pack(push, 1)
 struct MetaRecord
 {
