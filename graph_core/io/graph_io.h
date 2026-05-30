@@ -14,20 +14,6 @@
 
 // Graph I/O header — defines functions for saving and loading the graph to/from disk in a binary format.
 
-/**
- * RelationEntry represents a single relation type and its associated edges for a node.
- * It is used when writing and reading the RelationNodeList to/from disk.
- * The name is the relation type (e.g., "road", "train"), edge_offset is the byte offset 
- * in edges.dat where the edges of this relation type are stored, and edge_count
- * is the number of edges of this relation type for the node. 
- */
-struct RelationEntry
-{
-    std::string name;
-    uint64_t    edge_offset;
-    uint64_t    edge_count;
-};
-
 // ---- Non-template declarations ──────────────────────────────────────
 
 /**
