@@ -69,11 +69,11 @@
 
 ### 2026-05-26 — BUG-012: logger globale duplicato in `node_odt.cpp`
 
-- **Stato:** open
-- **Sintomo:** `graph_core/odt/node_odt.cpp:6` introduce `Logger logger = Logger("node_odt.log", LogLevel::DEBUG);` a livello di translation unit. Stessa famiglia di problemi del logger globale di `graph_io.cpp` ([BUG-005](#2026-05-26--bug-005-logger-globale-duplicato-in-graph_iocpp)): nome non incapsulato (`logger`), file di log dedicato, possibile collision in TU che includono più .cpp con la stessa convenzione, output multi-thread potenzialmente interlacciato.
-- **Root cause:** Il pattern del logger globale usato in `graph_io.cpp` è stato copiato qui invece di essere astratto.
-- **Fix:** n/a (open). Stesso menu di [BUG-005](#2026-05-26--bug-005-logger-globale-duplicato-in-graph_iocpp). Se si sceglie il singleton, basta una refactor sola che copre entrambi.
-- **Regression guard:** nessuno.
+- **Stato:** fixed (2026-05-30)
+- **Sintomo:** `graph_core/odt/node_odt.cpp:6` introduceva `Logger logger = Logger("node_odt.log", LogLevel::DEBUG);` a livello di translation unit. Stessa famiglia di problemi del logger globale di `graph_io.cpp` ([BUG-005](#2026-05-26--bug-005-logger-globale-duplicato-in-graph_iocpp)): nome non incapsulato (`logger`), external linkage, **collisione di simbolo** con la definizione gemella in `graph_io.cpp` (entrambe le TU vengono linkate perché `node_to_relation_list` è chiamata da `write_node`). In aggiunta: file di log dedicato, output multi-thread potenzialmente interlacciato.
+- **Root cause:** Il pattern del logger globale usato in `graph_io.cpp` è stato copiato qui invece di essere astratto. Senza `static` né anonymous namespace, entrambi i `logger` finivano nel global namespace con external linkage → multiple definition.
+- **Fix (2026-05-30):** `logger` in `graph_core/odt/node_odt.cpp` è ora dentro un anonymous namespace, che gli dà internal linkage e lo isola alla TU. Stessa sweep ha chiuso anche [BUG-005](#2026-05-26--bug-005-logger-globale-duplicato-in-graph_iocpp) (stesso anti-pattern in `graph_io.cpp`): collision di simbolo eliminata su tutta la coppia. L'API d'uso (`logger.error(...)`) e i file di log dedicati (`node_odt.log` / `graph_io.log`) restano invariati. Le opzioni più strutturali listate nel menu originale (singleton, parametro `Logger&`, membro di `Graph`) restano valide per future iterazioni se servirà condividere stato (es. unico file di log, mutex condiviso).
+- **Regression guard:** una build pulita del target `graph_core` che linki entrambe le TU senza errori `multiple definition of logger` è il test.
 
 ---
 
@@ -152,11 +152,11 @@
 
 ### 2026-05-26 — BUG-005: logger globale duplicato in `graph_io.cpp`
 
-- **Stato:** open
-- **Sintomo:** Il file `graph_io.cpp` (riga 8) dichiara `Logger logger = Logger("graph_io.log", LogLevel::DEBUG);` come variabile globale a livello di translation unit. Se in futuro più TU includono `graph_io.cpp` o se si aggiunge un secondo file che fa lo stesso (per esempio `graph.cpp` ha il suo `Logger` membro), si possono avere `Logger` distinti che scrivono sullo stesso file da thread/handle diversi — output interlacciato e flush non sincronizzato.
-- **Root cause:** Il logger di `graph_io` è creato come globale invece che come membro di una classe o singleton controllato.
-- **Fix:** n/a (open). Soluzioni possibili: (a) singleton accessibile tramite header, (b) passare un `Logger&` come parametro alle funzioni di I/O, (c) usare il logger di `Graph` (richiede di passarlo dentro).
-- **Regression guard:** nessuno. Test possibile: scrivere da due thread e ispezionare `graph_io.log` per linee tagliate.
+- **Stato:** fixed (2026-05-30)
+- **Sintomo:** Il file `graph_io.cpp` dichiarava `Logger logger = Logger("graph_io.log", LogLevel::DEBUG);` come variabile globale a livello di translation unit. Quando `node_odt.cpp` ha replicato lo stesso pattern (vedi [BUG-012](#2026-05-26--bug-012-logger-globale-duplicato-in-node_odtcpp)), le due definizioni di `logger` con external linkage hanno iniziato a collidere a link-time. Sintomo aggiuntivo originario: due `Logger` distinti possono scrivere sullo stesso file da thread/handle diversi → output interlacciato e flush non sincronizzato.
+- **Root cause:** Il logger di `graph_io` era creato come globale con external linkage invece che come membro di una classe / singleton / TU-local.
+- **Fix (2026-05-30):** `logger` in `graph_core/io/graph_io.cpp` è ora dentro un anonymous namespace (internal linkage). Stesso fix applicato in tandem a [BUG-012](#2026-05-26--bug-012-logger-globale-duplicato-in-node_odtcpp). L'aspetto "multi-thread interleaving" non è risolto da questo fix — `Logger` non ha mutex interno — ma diventa rilevante solo se/quando il progetto introdurrà concorrenza, momento in cui la scelta naturale sarà la opzione (a)/(c) del menu originale (singleton o membro di `Graph`).
+- **Regression guard:** la build pulita del target `graph_core` con `node_odt.cpp` + `graph_io.cpp` linkati insieme non emette più `multiple definition of logger`.
 
 ---
 

@@ -6,7 +6,12 @@
 #include "../odt/node_odt.h"
 #include "../struct/pod_struct.h"
 
-Logger logger = Logger("graph_io.log", LogLevel::DEBUG); // Logger instance for debugging and info
+// TU-local logger: wrapped in an anonymous namespace so the symbol has internal
+// linkage and does not collide with the `logger` defined at the same scope in
+// node_odt.cpp (and any other TU that follows this pattern).
+namespace {
+    Logger logger("graph_io.log", LogLevel::DEBUG);
+}
 
 /**
  * Writes a NodeIndex struct to the output stream.
