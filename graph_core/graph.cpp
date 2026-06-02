@@ -155,3 +155,56 @@ void Graph::add_edge(int start, int end, std::string type, int weight)
         write_meta(meta);
     }
 }
+
+/**
+ * Deletes a node and all its associated edges from the graph.
+ * @param node_id The id of the node to delete.
+ */
+void Graph::delete_node(int node_id)
+{
+    // Ensure the node is resident in RAM. If it is not, lazy-load it from disk
+    // (same pattern as add_edge): an id >= meta.next_id was never assigned.
+    if (nodes.find(node_id) == nodes.end())
+    {
+        if (static_cast<uint64_t>(node_id) < meta.next_id)
+        {
+            try
+            {
+                nodes[node_id] = read_node(static_cast<uint64_t>(node_id));
+            }
+            catch (const std::exception &e)
+            {
+                Graph::logger.error("Failed to delete node: could not read node " + std::to_string(node_id) + ": " + e.what());
+                throw std::runtime_error("Failed to read node " + std::to_string(node_id) + ": " + e.what());
+            }
+        }
+        else
+        {
+            Graph::logger.error("Failed to delete node: node " + std::to_string(node_id) + " does not exist.");
+            throw std::out_of_range("Node " + std::to_string(node_id) + " does not exist.");
+        }
+    }
+
+    BaseNode *node = nodes[node_id];
+
+    // Log how many edges are being dropped (sum of the neighbor maps over all relation types).
+    size_t edge_count = 0;
+    for (const auto &[rel_type, neighbors] : node->neighborgs)
+    {
+        edge_count += neighbors.size();
+    }
+    logger.info("Deleting node " + std::to_string(node_id) + " and its " + std::to_string(edge_count) + " edges.");
+
+    // Remove from the in-memory map and free it — whether it was already resident
+    // or was just lazy-loaded above. (The previous version leaked a just-loaded
+    // node and left a dangling entry in `nodes` pointing at a deleted record.)
+    nodes.erase(node_id);
+    delete node;
+
+    // Persist the deletion: orphan the node's regions onto the freelists.
+    delete_node_from_disk(static_cast<uint64_t>(node_id), meta);
+
+    // TODO(next step): once delete_node_from_disk updates the meta counters
+    // (node_count--, free_count++ / free_edge_count++), re-persist meta here with
+    // write_meta(meta), and decide nodes.idx tombstoning + inbound-edge cleanup.
+}

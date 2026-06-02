@@ -10,6 +10,7 @@ add_library(graph_core
     graph_core/io/io_utils.cpp
     graph_core/odt/edge_odt.cpp
     graph_core/odt/node_odt.cpp
+    graph_core/struct/type_registry.cpp
 )
 
 target_include_directories(graph_core PUBLIC graph_core)

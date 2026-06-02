@@ -54,12 +54,18 @@ void read_complex(ComplexRecord &out, std::ifstream &dat_in);
 NodeIndex                    read_node_index(std::ifstream &in);
 std::vector<RelationEntry>   read_relation_node_list(std::ifstream &in);
 
-void             write_meta(const MetaRecord &meta);
-MetaRecord       read_meta();
-void             write_json_attributes_meta(const JsonMeta &meta);
-JsonMeta         read_json_attributes_meta();
+void            write_meta(const MetaRecord &meta);
+MetaRecord      read_meta();
+void            write_json_attributes_meta(const JsonMeta &meta);
+JsonMeta        read_json_attributes_meta();
 
-void             update_node_edges(BaseNode &node, const MetaRecord &meta, uint64_t node_id);
+void            update_node_edges(BaseNode &node, const MetaRecord &meta, uint64_t node_id);
+
+void            delete_node_from_disk(uint64_t node_id, const MetaRecord &meta);
+
+// NOTE: write_free_offset / read_free_offset are templates (see below), so they
+// work uniformly with NodeFreeOffset, RelationNodeListFreeOffset and
+// BatchOfEdgesFreeOffset without a per-type declaration here.
 
 // ---- Template definitions ───────────────────────────────────────────
 
@@ -239,4 +245,66 @@ BaseNode* read_typed_node(const NodeIndex &node_idx, std::ifstream &dat_in)
     }
 
     return node;
+}
+
+// ---- Free Offset list management ----
+
+/**
+ * Writes a free offset record to the specified freelist file. 
+ * This function appends the free offset information to the freelist file, 
+ * which can later be used to reuse freed space in nodes.dat, 
+ * edges.dat, or relation_lists.dat when new nodes or edges are added.
+ * @param free_offset The free offset information to write, containing the offset and size of the freed region.
+ * @param freelist_path The path to the freelist file where the free offset should be
+ * @throws std::runtime_error if the freelist file cannot be opened for writing.
+ */
+template <typename T>
+void write_free_offset(const T &free_offset, const std::filesystem::path &freelist_path)
+{
+    // NOTE: this template is header-defined, so it cannot use the TU-local
+    // `logger` (anonymous-namespace symbol in graph_io.cpp). Like the other
+    // header templates, it signals failure by throwing only.
+    std::ofstream out(freelist_path, std::ios::binary | std::ios::app);
+    if (!out)
+    {
+        throw std::runtime_error("Failed to open freelist file for writing: " + freelist_path.string());
+    }
+
+    write_pod(free_offset, out);
+}
+
+/**
+ * This function reads a free offset record from the bottom of the specified freelist file.
+ * @param freelist_path The path to the freelist file to read from.
+ * @return The free offset record read from the file, containing the offset and size of a freed region that can be reused.
+ * @throws std::runtime_error if the freelist file cannot be opened for reading, or if the file is empty (i.e. no free offsets available).
+ * @throws std::runtime_error if the file is too small to contain a free offset record (i.e. file corruption or invalid format).
+ */
+template <typename T>
+T read_free_offset(const std::filesystem::path &freelist_path)
+{
+    // Header-defined template: throw-only on error (no TU-local `logger` here).
+    std::ifstream in(freelist_path, std::ios::binary | std::ios::ate);
+    if (!in)
+    {
+        throw std::runtime_error("Failed to open freelist file for reading: " + freelist_path.string());
+    }
+
+    if (in.tellg() == 0)
+    {
+        throw std::runtime_error("Freelist file is empty: " + freelist_path.string());
+    }
+
+    if (in.tellg() < static_cast<std::streamoff>(sizeof(T)))
+    {
+        throw std::runtime_error("Freelist file is too small to contain a free offset record: " + freelist_path.string());
+    }
+
+    in.seekg(-static_cast<std::streamoff>(sizeof(T)), std::ios::end);
+    if (!in)
+    {
+        throw std::runtime_error("Failed to seek to the last free offset in freelist file: " + freelist_path.string());
+    }
+
+    return read_pod<T>(in);
 }

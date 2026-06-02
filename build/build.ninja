@@ -84,6 +84,14 @@ build CMakeFiles/graph_core.dir/graph_core/odt/node_odt.cpp.obj: CXX_COMPILER__g
   OBJECT_FILE_DIR = CMakeFiles\graph_core.dir\graph_core\odt
   TARGET_SUPPORT_DIR = CMakeFiles\graph_core.dir
 
+build CMakeFiles/graph_core.dir/graph_core/struct/type_registry.cpp.obj: CXX_COMPILER__graph_core_unscanned_ C$:/Users/lucav/Desktop/graphs/pointer_graphs/graph_core/struct/type_registry.cpp || cmake_object_order_depends_target_graph_core
+  DEP_FILE = CMakeFiles\graph_core.dir\graph_core\struct\type_registry.cpp.obj.d
+  FLAGS = -std=gnu++17
+  INCLUDES = -IC:/Users/lucav/Desktop/graphs/pointer_graphs/graph_core
+  OBJECT_DIR = CMakeFiles\graph_core.dir
+  OBJECT_FILE_DIR = CMakeFiles\graph_core.dir\graph_core\struct
+  TARGET_SUPPORT_DIR = CMakeFiles\graph_core.dir
+
 
 # =============================================================================
 # Link build statements for STATIC_LIBRARY target graph_core
@@ -92,7 +100,7 @@ build CMakeFiles/graph_core.dir/graph_core/odt/node_odt.cpp.obj: CXX_COMPILER__g
 #############################################
 # Link the static library libgraph_core.a
 
-build libgraph_core.a: CXX_STATIC_LIBRARY_LINKER__graph_core_ CMakeFiles/graph_core.dir/graph_core/graph.cpp.obj CMakeFiles/graph_core.dir/graph_core/io/graph_io.cpp.obj CMakeFiles/graph_core.dir/graph_core/io/io_utils.cpp.obj CMakeFiles/graph_core.dir/graph_core/odt/edge_odt.cpp.obj CMakeFiles/graph_core.dir/graph_core/odt/node_odt.cpp.obj
+build libgraph_core.a: CXX_STATIC_LIBRARY_LINKER__graph_core_ CMakeFiles/graph_core.dir/graph_core/graph.cpp.obj CMakeFiles/graph_core.dir/graph_core/io/graph_io.cpp.obj CMakeFiles/graph_core.dir/graph_core/io/io_utils.cpp.obj CMakeFiles/graph_core.dir/graph_core/odt/edge_odt.cpp.obj CMakeFiles/graph_core.dir/graph_core/odt/node_odt.cpp.obj CMakeFiles/graph_core.dir/graph_core/struct/type_registry.cpp.obj
   OBJECT_DIR = CMakeFiles\graph_core.dir
   POST_BUILD = cd .
   PRE_LINK = cd .

@@ -147,13 +147,6 @@ struct MetaRecord
 };
 #pragma pack(pop)
 
-#pragma pack(push, 1)
-struct FreeRecord
-{
-    uint64_t offset; // free offset in nodes.dat
-};
-#pragma pack(pop)
-
 /**
  * ComplexHeader is a POD struct uesd for nodes of type COMPLEX, witch require a type label and a JSON string to store the attributes of the record.
  * The type_label is a string that rapresent the type of the record (e.g. "Athlete", "Item", "Company" etc.) 
@@ -178,5 +171,45 @@ struct ComplexHeader
 struct JsonMeta
 {
     uint64_t prog_number; // progressive number to generate unique JSON file names for complex nodes
+};
+#pragma pack(pop)
+
+/**
+ * Freelist record for a reclaimed NodeRecord region in nodes.dat, plus the
+ * now-reusable id slot in nodes.idx. Persisted (appended) to db/nodes_freelist.dat.
+ */
+#pragma pack(push, 1)
+struct NodeFreeOffset
+{
+    uint64_t idx;    // reusable node id (its fixed-width slot in nodes.idx)
+    uint64_t offset; // free offset in nodes.dat (start of the orphaned NodeRecord)
+    uint64_t size;   // size in bytes of the free region in nodes.dat
+};
+#pragma pack(pop)
+
+/**
+ * Freelist record for a reclaimed RelationNodeList region in nodes.dat (the POD
+ * header + its variable-width tail). Persisted to db/relation_lists_freelist.dat.
+ * No id is tracked: a relation list has no standalone id, only its byte region.
+ */
+#pragma pack(push, 1)
+struct RelationNodeListFreeOffset
+{
+    uint64_t offset; // free offset in nodes.dat (start of the orphaned RelationNodeList)
+    uint64_t size;   // size in bytes of the free region = sizeof(RelationNodeList) + batch_size
+};
+#pragma pack(pop)
+
+/**
+ * Freelist record for a reclaimed contiguous chunk of Edge records in edges.dat
+ * (one chunk = all edges of a single (node, relation) pair). Persisted to
+ * db/edges_freelist.dat. Tracks the whole batch, not a single edge.
+ */
+#pragma pack(push, 1)
+struct BatchOfEdgesFreeOffset
+{
+    uint64_t idx;    // id of the first edge of the batch (reusable edge id starting point)
+    uint64_t offset; // free offset in edges.dat (start of the orphaned chunk)
+    uint64_t size;   // size in bytes of the free region = edge_count * sizeof(Edge)
 };
 #pragma pack(pop)

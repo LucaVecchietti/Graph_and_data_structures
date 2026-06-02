@@ -77,8 +77,20 @@ public:
     /**
      * Adds a directed edge from start to end with an optional type and weight.
      * The edge is stored under the given relation type in the adjacency map.
+     * @param start The ID of the start node.
+     * @param end The ID of the end node.
+     * @param type The relation type of the edge (e.g., "road", "train"). Optional, defaults to an empty string.
+     * @param weight The weight of the edge. Optional, defaults to 1.
+     * @throws std::invalid_argument if the relation type exceeds the maximum allowed size.
+     * @throws std::out_of_range if either the start or end node does not exist
      */
     void add_edge(int start, int end, std::string type = "", int weight = 1);
+
+    /**
+     * Deletes a node and all its associated edges from the graph.
+     * @param node_id The id of the node to delete.
+     */
+    void delete_node(int node_id); 
 
     /**
      * Generic graph traversal — behavior determined by Policy at compile time.

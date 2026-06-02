@@ -287,12 +287,12 @@ void update_node_edges(BaseNode &node, const MetaRecord &meta, uint64_t node_id)
     }
 
     // ---- 2. Orphan the OLD regions ----------------------------------------
-    // TODO(BUG-001 follow-up): push these (offset, size) pairs onto a real
-    // freelist (db/freelist.dat) so subsequent writes can reuse the holes.
-    // The FreeRecord POD and MetaRecord.free_count are already defined for
-    // this purpose but the persistence path is not implemented yet. Until
-    // then we just log the orphaning so the leak is observable in graph_io.log
-    // and the regions accumulate as dead bytes in nodes.dat / edges.dat.
+    // TODO(freelist follow-up): push these (offset, size) pairs onto the real
+    // freelists (db/relation_lists_freelist.dat, db/edges_freelist.dat) via
+    // write_free_offset — the same path delete_node_from_disk now uses — so
+    // subsequent writes can reuse the holes. For now update_node_edges still
+    // only logs the orphaning, so these regions accumulate as dead bytes in
+    // nodes.dat / edges.dat until this is wired in.
     logger.info("update_node_edges: orphaning RelationNodeList at offset "
                 + std::to_string(node_idx.relation_offset)
                 + " of size " + std::to_string(old_relation_total_size)
@@ -375,4 +375,120 @@ void update_node_edges(BaseNode &node, const MetaRecord &meta, uint64_t node_id)
 
     logger.info("update_node_edges: node " + std::to_string(node_id)
                 + " relation_offset patched to " + std::to_string(new_relation_offset));
+}
+
+void delete_node_from_disk(uint64_t node_id, const MetaRecord &meta)
+{
+    (void)meta; // Not used yet — will be needed to update the counters (node_count, free_count)
+                // once the freelist write-back lands. See the TODO at the end of this function.
+
+    // 0. Calculate the node index offset for the given node_id and log it for debugging purposes.
+    uint64_t node_index_offset = node_id * sizeof(NodeIndex);
+    logger.info("delete_node_from_disk: calculated node index offset for node " + std::to_string(node_id) + ": " + std::to_string(node_index_offset));
+
+    // 1. Read the NodeIndex of the node to be deleted to obtain the offsets of its data and relations.
+    NodeIndex node_idx;
+    {
+        std::ifstream idx_in(std::filesystem::path(DB_PATH) / "nodes.idx", std::ios::binary);
+        if (!idx_in)
+        {
+            logger.error("delete_node_from_disk: failed to open nodes.idx for reading.");
+            throw std::runtime_error("delete_node_from_disk: failed to open nodes.idx for reading.");
+        }
+        idx_in.seekg(static_cast<std::streamoff>(node_index_offset));
+        node_idx = read_node_index(idx_in);
+    }
+
+    logger.debug("delete_node_from_disk: read NodeIndex for node " + std::to_string(node_id) + ": "
+                + "record_offset=" + std::to_string(node_idx.offset) + ", "
+                + "relation_offset=" + std::to_string(node_idx.relation_offset) + ", "
+                + "type_id=" + std::to_string(static_cast<uint8_t>(node_idx.type_id)));
+
+    // 2. Read the RelationNodeList of the node to be deleted to obtain the offsets and sizes of its edge chunks.
+    //    We read the POD header first to capture batch_size (the exact on-disk size of the variable-width tail),
+    //    then rewind and parse the per-relation entries. The total reclaimable size of the relation-list region
+    //    is sizeof(RelationNodeList) + batch_size — same accounting used by update_node_edges.
+    std::vector<RelationEntry> relation_entries;
+    uint64_t relation_list_total_size = 0;
+    {
+        std::ifstream dat_in(std::filesystem::path(DB_PATH) / "nodes.dat", std::ios::binary);
+        if (!dat_in)
+        {
+            logger.error("delete_node_from_disk: failed to open nodes.dat for reading.");
+            throw std::runtime_error("delete_node_from_disk: failed to open nodes.dat for reading.");
+        }
+        dat_in.seekg(static_cast<std::streamoff>(node_idx.relation_offset));
+        RelationNodeList header = read_pod<RelationNodeList>(dat_in);
+        relation_list_total_size = sizeof(RelationNodeList) + header.batch_size;
+
+        // read_relation_node_list expects the stream at the POD start, so rewind before delegating.
+        dat_in.seekg(static_cast<std::streamoff>(node_idx.relation_offset));
+        relation_entries = read_relation_node_list(dat_in);
+    }
+
+    logger.debug("delete_node_from_disk: read " + std::to_string(relation_entries.size()) + " relation entries for node " + std::to_string(node_id));
+
+    // 3. Log the offsets and sizes of the regions to be orphaned by this deletion.
+    uint64_t record_size = node_record_payload_size(node_idx.type_id);
+    logger.info("delete_node_from_disk: orphaning NodeRecord at offset "
+                + std::to_string(node_idx.offset)
+                + " of size " + std::to_string(record_size) + " bytes (nodes.dat)");
+
+    logger.info("delete_node_from_disk: orphaning RelationNodeList at offset "
+                + std::to_string(node_idx.relation_offset)
+                + " of size " + std::to_string(relation_list_total_size) + " bytes (nodes.dat)");
+
+    // 4. Build the free-offset records for the orphaned regions.
+    //    All three structs carry { idx?, offset, size } — initialise every field explicitly so the
+    //    aggregate initialisation cannot silently zero-fill a trailing member.
+    //      - NodeFreeOffset.idx       = node_id        (the now-reusable nodes.idx slot)
+    //      - BatchOfEdgesFreeOffset.idx = first edge id of the chunk (read from edges.dat below)
+    NodeFreeOffset record_free_offset{node_id, node_idx.offset, record_size};
+    RelationNodeListFreeOffset relation_list_free_offset{node_idx.relation_offset, relation_list_total_size};
+    std::vector<BatchOfEdgesFreeOffset> edge_chunk_free_offsets;
+    edge_chunk_free_offsets.reserve(relation_entries.size());
+
+    {
+        std::ifstream edges_in(std::filesystem::path(DB_PATH) / "edges.dat", std::ios::binary);
+        if (!edges_in)
+        {
+            logger.error("delete_node_from_disk: failed to open edges.dat for reading.");
+            throw std::runtime_error("delete_node_from_disk: failed to open edges.dat for reading.");
+        }
+        for (const auto &entry : relation_entries)
+        {
+            // The chunk's first edge id is the reusable starting id of the batch. A persisted
+            // relation always has at least one edge, but guard against an empty chunk anyway.
+            uint64_t first_edge_id = 0;
+            if (entry.edge_count > 0)
+            {
+                edges_in.seekg(static_cast<std::streamoff>(entry.edge_offset));
+                Edge first = read_pod<Edge>(edges_in);
+                first_edge_id = first.id;
+            }
+            edge_chunk_free_offsets.push_back(
+                BatchOfEdgesFreeOffset{first_edge_id, entry.edge_offset, entry.edge_count * sizeof(Edge)});
+        }
+    }
+
+    logger.info("delete_node_from_disk: adding NodeRecord free offset to freelist: idx=" + std::to_string(record_free_offset.idx) + ", offset=" + std::to_string(record_free_offset.offset) + ", size=" + std::to_string(record_free_offset.size));
+    logger.info("delete_node_from_disk: adding RelationNodeList free offset to freelist: offset=" + std::to_string(relation_list_free_offset.offset) + ", size=" + std::to_string(relation_list_free_offset.size));
+    for (const auto &edge_free_offset : edge_chunk_free_offsets)
+    {
+        logger.info("delete_node_from_disk: adding edge chunk free offset to freelist: idx=" + std::to_string(edge_free_offset.idx) + ", offset=" + std::to_string(edge_free_offset.offset) + ", size=" + std::to_string(edge_free_offset.size));
+    }
+
+    // 5. Write the free offsets to the free files (db/nodes_freelist.dat, db/relation_lists_freelist.dat, db/edges_freelist.dat).
+    write_free_offset(record_free_offset, std::filesystem::path(DB_PATH) / "nodes_freelist.dat");
+    write_free_offset(relation_list_free_offset, std::filesystem::path(DB_PATH) / "relation_lists_freelist.dat");
+    for (const auto &edge_free_offset : edge_chunk_free_offsets)
+    {
+        write_free_offset(edge_free_offset, std::filesystem::path(DB_PATH) / "edges_freelist.dat");
+    }
+
+    // TODO(freelist integration — next step): this prototype records the orphaned regions but does NOT yet:
+    //   - free / tombstone the node's slot in nodes.idx (the entry still points at now-dead bytes);
+    //   - update meta (node_count--, free_count/free_edge_count++), which is why meta is still taken by const ref;
+    //   - reclaim edge ids, nor remove inbound edges from OTHER nodes that point at node_id (dangling neighbours);
+    //   - account for the variable-width COMPLEX payload (record_size is header-only for COMPLEX).
 }

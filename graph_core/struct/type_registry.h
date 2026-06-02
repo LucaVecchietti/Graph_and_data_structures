@@ -2,6 +2,7 @@
 
 #include "pod_struct.h"
 #include "domain_struct.h"
+#include <cstddef>
 
 /**
  * type_registry.h defines the compile-time mapping from C++ types to NodeType tags used for on-disk storage.
@@ -34,3 +35,17 @@ template <> struct node_type_of<ComplexRecord> { static constexpr NodeType value
 
 template <typename T>
 constexpr NodeType node_type_of_v = node_type_of<T>::value;
+
+// ---- Utility functions ----
+
+/**
+ * Returns the size in bytes of the on-disk data payload (the NodeRecord region
+ * in nodes.dat) for a given NodeType. Defined in type_registry.cpp.
+ *
+ * NOTE: for NodeType::COMPLEX this returns only sizeof(ComplexHeader); the two
+ * length-prefixed strings that follow the header on disk are NOT accounted for
+ * (their size is variable). Callers that need the exact reclaimable size of a
+ * COMPLEX record must compute the string lengths themselves. See the freelist
+ * integration work for the proper handling.
+ */
+size_t node_record_payload_size(NodeType type_id);
