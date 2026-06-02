@@ -81,6 +81,28 @@ int main()
         run_bfs(g, 2, "knows");
     }
 
+    // ===== Phase 3: delete + freelist reuse on insert =====================
+    // Exercises:
+    //   - Graph::delete_node            (pushes the node's region onto the
+    //                                    exact-size bin db/freelist/nodes_4.dat)
+    //   - Graph::insert reuse path      (pops that bin, recycles id 1 and the
+    //                                    freed 4-byte region instead of appending)
+    std::cout << "\n=== Phase 3: delete + reuse ===\n";
+    {
+        Graph g; // load_meta — next_id is 4 after phases 1-2.
+
+        // Delete node 1 (an int). Its 4-byte record region + id slot go on the freelist.
+        g.delete_node(1);
+
+        // Insert a new int. The reuse path should recycle id 1 (next_id stays 4)
+        // and overwrite the freed region rather than appending a fresh record.
+        // Watch graph.log for "Inserted node with ID 1 (reused slot) and value 777".
+        g.insert(777);
+
+        std::cout << "deleted node 1, inserted 777 — see graph.log for id reuse,\n"
+                     "and db/freelist/ for the bin files.\n";
+    }
+
     system("pause");
     return 0;
 }

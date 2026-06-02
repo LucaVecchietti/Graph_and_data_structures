@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <vector>
 #include <string>
+#include <optional>
 
 // Graph I/O header — defines functions for saving and loading the graph to/from disk in a binary format.
 
@@ -169,6 +170,60 @@ void write_node(const Node<T> &node, const MetaRecord &meta)
 }
 
 /**
+ * Writes a freshly-inserted node into a slot reclaimed from the freelist instead
+ * of appending. Counterpart of write_node for the reuse path taken by
+ * Graph::insert when pop_free_offset returns a fitting NodeFreeOffset.
+ *
+ * Differences from write_node (append):
+ *   - the NodeRecord<T> is written IN PLACE at `record_offset` (the freed
+ *     region in nodes.dat) — exact-fit, so it never overruns the hole;
+ *   - the NodeIndex is written IN PLACE at the freed id slot `node_id` in
+ *     nodes.idx (fixed-width records make the slot directly addressable);
+ *   - the (empty, for a fresh node) RelationNodeList is still APPENDED at the
+ *     end of nodes.dat — reusing rel/edge bins is a separate step.
+ *
+ * Never instantiated for COMPLEX: its on-disk size is variable, so Graph::insert
+ * guards the reuse path with `if constexpr (... != NodeType::COMPLEX)` and this
+ * template (which would fail node_to_record's static_assert) is never reached.
+ */
+template <typename T>
+void write_node_in_freed_slot(const Node<T> &node, uint64_t node_id, uint64_t record_offset)
+{
+    namespace fs = std::filesystem;
+
+    // 1. NodeRecord<T> in place, at the freed offset.
+    {
+        std::fstream dat(fs::path(DB_PATH) / "nodes.dat", std::ios::binary | std::ios::in | std::ios::out);
+        if (!dat) throw std::runtime_error("write_node_in_freed_slot: failed to open nodes.dat for in-place write.");
+        dat.seekp(static_cast<std::streamoff>(record_offset));
+        NodeRecord<T> record = node_to_record(node);
+        write_pod(record, dat);
+    }
+
+    // 2. Empty RelationNodeList appended at end-of-file (fresh node has no edges).
+    uint64_t relation_offset = 0;
+    {
+        std::ofstream dat_app(fs::path(DB_PATH) / "nodes.dat", std::ios::binary | std::ios::app);
+        if (!dat_app) throw std::runtime_error("write_node_in_freed_slot: failed to open nodes.dat for append.");
+        dat_app.seekp(0, std::ios::end);
+        relation_offset = write_relation_node_list<T>(node, node_id, dat_app);
+    }
+
+    // 3. NodeIndex in place, at the freed id slot in nodes.idx.
+    {
+        std::fstream idx(fs::path(DB_PATH) / "nodes.idx", std::ios::binary | std::ios::in | std::ios::out);
+        if (!idx) throw std::runtime_error("write_node_in_freed_slot: failed to open nodes.idx for in-place write.");
+        idx.seekp(static_cast<std::streamoff>(node_id * sizeof(NodeIndex)));
+        NodeIndex ni;
+        ni.id              = node_id;
+        ni.offset          = record_offset;
+        ni.relation_offset = relation_offset;
+        ni.type_id         = node_type_of_v<T>;
+        write_pod(ni, idx);
+    }
+}
+
+/**
  * Reads a node from disk based on its ID.
  * @param id The ID of the node to read.
  * @return A pointer to the reconstructed node.
@@ -248,22 +303,37 @@ BaseNode* read_typed_node(const NodeIndex &node_idx, std::ifstream &dat_in)
 }
 
 // ---- Free Offset list management ----
+//
+// Freelists are SEGREGATED BY EXACT SIZE: there is one bin file per distinct
+// free-region size, under db/freelist/. The size is encoded in the filename, so:
+//   - push (on delete/orphan)  = append one record to the right bin   → O(1)
+//   - pop  (on insert/reuse)   = read the last record + truncate it   → O(1)
+// Every record in a bin has the same size, so a pop is always an exact fit:
+// no scanning, no file rewrite, no bytes wasted. See freelist_bin_path below.
+//   prefix "nodes" → NodeFreeOffset           (size ∈ {1,4,8} for primitives)
+//   prefix "rel"   → RelationNodeListFreeOffset
+//   prefix "edges" → BatchOfEdgesFreeOffset    (size = edge_count * sizeof(Edge))
 
 /**
- * Writes a free offset record to the specified freelist file. 
- * This function appends the free offset information to the freelist file, 
- * which can later be used to reuse freed space in nodes.dat, 
- * edges.dat, or relation_lists.dat when new nodes or edges are added.
- * @param free_offset The free offset information to write, containing the offset and size of the freed region.
- * @param freelist_path The path to the freelist file where the free offset should be
- * @throws std::runtime_error if the freelist file cannot be opened for writing.
+ * Builds the path of the freelist bin for a given (prefix, size):
+ *   db/freelist/<prefix>_<size>.dat
+ */
+inline std::filesystem::path freelist_bin_path(const std::string &prefix, uint64_t size)
+{
+    return std::filesystem::path(DB_PATH) / "freelist" / (prefix + "_" + std::to_string(size) + ".dat");
+}
+
+/**
+ * Appends a free-offset record to its size bin (push). Creates db/freelist/ on
+ * first use. Header-defined template, so it throws on failure (no TU-local logger).
+ * @param free_offset The free-offset record (its .size selects the bin via the caller).
+ * @param freelist_path The bin file path, typically from freelist_bin_path(...).
  */
 template <typename T>
 void write_free_offset(const T &free_offset, const std::filesystem::path &freelist_path)
 {
-    // NOTE: this template is header-defined, so it cannot use the TU-local
-    // `logger` (anonymous-namespace symbol in graph_io.cpp). Like the other
-    // header templates, it signals failure by throwing only.
+    std::filesystem::create_directories(freelist_path.parent_path());
+
     std::ofstream out(freelist_path, std::ios::binary | std::ios::app);
     if (!out)
     {
@@ -274,37 +344,37 @@ void write_free_offset(const T &free_offset, const std::filesystem::path &freeli
 }
 
 /**
- * This function reads a free offset record from the bottom of the specified freelist file.
- * @param freelist_path The path to the freelist file to read from.
- * @return The free offset record read from the file, containing the offset and size of a freed region that can be reused.
- * @throws std::runtime_error if the freelist file cannot be opened for reading, or if the file is empty (i.e. no free offsets available).
- * @throws std::runtime_error if the file is too small to contain a free offset record (i.e. file corruption or invalid format).
+ * Pops the last record off a size bin (LIFO): reads it, then shrinks the file by
+ * one record. Because every record in a bin is the same size, the popped record
+ * is always an exact fit for that bin's size class.
+ * @param freelist_path The bin file path, typically from freelist_bin_path(...).
+ * @return The popped record, or std::nullopt if the bin does not exist / is empty.
+ * @throws std::runtime_error if the file exists but cannot be truncated.
  */
 template <typename T>
-T read_free_offset(const std::filesystem::path &freelist_path)
+std::optional<T> pop_free_offset(const std::filesystem::path &freelist_path)
 {
-    // Header-defined template: throw-only on error (no TU-local `logger` here).
-    std::ifstream in(freelist_path, std::ios::binary | std::ios::ate);
-    if (!in)
+    namespace fs = std::filesystem;
+    std::error_code ec;
+
+    if (!fs::exists(freelist_path)) return std::nullopt;
+    uint64_t fsize = static_cast<uint64_t>(fs::file_size(freelist_path, ec));
+    if (ec || fsize < sizeof(T)) return std::nullopt; // empty (or corrupt-small) bin → nothing to reuse
+
+    T record;
     {
-        throw std::runtime_error("Failed to open freelist file for reading: " + freelist_path.string());
+        std::ifstream in(freelist_path, std::ios::binary);
+        if (!in) return std::nullopt;
+        in.seekg(static_cast<std::streamoff>(fsize - sizeof(T)));
+        record = read_pod<T>(in);
     }
 
-    if (in.tellg() == 0)
+    // Pop: drop the last record by shrinking the file by exactly one record.
+    fs::resize_file(freelist_path, fsize - sizeof(T), ec);
+    if (ec)
     {
-        throw std::runtime_error("Freelist file is empty: " + freelist_path.string());
+        throw std::runtime_error("Failed to truncate freelist file on pop: " + freelist_path.string());
     }
 
-    if (in.tellg() < static_cast<std::streamoff>(sizeof(T)))
-    {
-        throw std::runtime_error("Freelist file is too small to contain a free offset record: " + freelist_path.string());
-    }
-
-    in.seekg(-static_cast<std::streamoff>(sizeof(T)), std::ios::end);
-    if (!in)
-    {
-        throw std::runtime_error("Failed to seek to the last free offset in freelist file: " + freelist_path.string());
-    }
-
-    return read_pod<T>(in);
+    return record;
 }

@@ -47,13 +47,37 @@ public:
         Node<ValueType> *newNode = new Node<ValueType>(); // Create a new node
         newNode->data = std::forward<T>(value);                // Assign the input value and mantain lvalue\rvalue
 
-        nodes[meta.next_id] = newNode; // Add to the base nodes map with the next available ID as the key
+        uint64_t node_id;   // the id actually assigned (recycled or freshly minted)
+        bool reused = false;
 
-        write_node(*newNode, meta); // Write the new node to disk
+        // Reuse path: try to pop a freed slot whose record size matches exactly.
+        // Only for fixed-size primitive payloads — COMPLEX has a variable on-disk
+        // size, so it can never exact-fit a bin and always takes the append path.
+        // (The if constexpr also keeps write_node_in_freed_slot<ComplexRecord>
+        // from ever being instantiated, which would fail node_to_record's assert.)
+        if constexpr (node_type_of_v<ValueType> != NodeType::COMPLEX)
+        {
+            uint64_t needed = node_record_payload_size(node_type_of_v<ValueType>);
+            std::optional<NodeFreeOffset> slot = pop_free_offset<NodeFreeOffset>(freelist_bin_path("nodes", needed));
+            if (slot)
+            {
+                node_id = slot->idx;            // recycle the freed id slot
+                nodes[node_id] = newNode;
+                write_node_in_freed_slot(*newNode, node_id, slot->offset);
+                meta.node_count++;              // next_id is NOT bumped — the id was reused
+                reused = true;
+            }
+        }
 
-        // Update metadata
-        meta.node_count++;
-        meta.next_id++; // Increment the next available ID
+        // Append path: no fitting hole (or COMPLEX) → mint a fresh id at the end.
+        if (!reused)
+        {
+            node_id = meta.next_id;
+            nodes[node_id] = newNode;
+            write_node(*newNode, meta);         // append; write_node uses meta.next_id as the id
+            meta.node_count++;
+            meta.next_id++;
+        }
 
         // Log the insertion of the new node. std::to_string covers the numeric
         // primitives (and char/bool, returning the numeric code), but not the
@@ -62,13 +86,13 @@ public:
         // dumping the JSON attributes blob.
         if constexpr (node_type_of_v<ValueType> == NodeType::COMPLEX)
         {
-            logger.info("Inserted node with ID " + std::to_string(meta.next_id - 1)
+            logger.info("Inserted node with ID " + std::to_string(node_id)
                         + " of complex type \"" + newNode->data.type_label + "\"");
         }
         else
         {
-            logger.info("Inserted node with ID " + std::to_string(meta.next_id - 1)
-                        + " and value " + std::to_string(newNode->data));
+            logger.info("Inserted node with ID " + std::to_string(node_id)
+                        + (reused ? " (reused slot)" : "") + " and value " + std::to_string(newNode->data));
         }
 
         write_meta(meta);

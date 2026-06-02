@@ -478,12 +478,14 @@ void delete_node_from_disk(uint64_t node_id, const MetaRecord &meta)
         logger.info("delete_node_from_disk: adding edge chunk free offset to freelist: idx=" + std::to_string(edge_free_offset.idx) + ", offset=" + std::to_string(edge_free_offset.offset) + ", size=" + std::to_string(edge_free_offset.size));
     }
 
-    // 5. Write the free offsets to the free files (db/nodes_freelist.dat, db/relation_lists_freelist.dat, db/edges_freelist.dat).
-    write_free_offset(record_free_offset, std::filesystem::path(DB_PATH) / "nodes_freelist.dat");
-    write_free_offset(relation_list_free_offset, std::filesystem::path(DB_PATH) / "relation_lists_freelist.dat");
+    // 5. Push each free offset onto its EXACT-SIZE bin under db/freelist/.
+    //    The bin is selected by the region size, so a later insert/update of the
+    //    same size pops an exact fit in O(1) (see freelist_bin_path / pop_free_offset).
+    write_free_offset(record_free_offset, freelist_bin_path("nodes", record_free_offset.size));
+    write_free_offset(relation_list_free_offset, freelist_bin_path("rel", relation_list_free_offset.size));
     for (const auto &edge_free_offset : edge_chunk_free_offsets)
     {
-        write_free_offset(edge_free_offset, std::filesystem::path(DB_PATH) / "edges_freelist.dat");
+        write_free_offset(edge_free_offset, freelist_bin_path("edges", edge_free_offset.size));
     }
 
     // TODO(freelist integration — next step): this prototype records the orphaned regions but does NOT yet:
