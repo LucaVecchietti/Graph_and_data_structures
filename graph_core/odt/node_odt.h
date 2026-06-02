@@ -83,7 +83,7 @@ struct RelationEntry
  * @param rellist The relation list containing adjacency information.
  * @return A map of relation types to their associated neighbors.
  */
-std::unordered_map<std::string, std::unordered_map<int, std::pair<int, BaseNode *>>> reconstruct_neighbors(const RelationNodeList &rellist);
+std::unordered_map<std::string, std::unordered_map<int, EdgeRef>> reconstruct_neighbors(const RelationNodeList &rellist);
 
 /**
  * Creates a node from its POD representation.

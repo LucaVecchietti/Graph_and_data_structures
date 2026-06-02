@@ -332,18 +332,18 @@ void update_node_edges(BaseNode &node, const MetaRecord &meta, uint64_t node_id)
             throw std::runtime_error("update_node_edges: failed to open edges.dat for writing.");
         }
 
-        // edge_idx is per-node-local (matches the semantics of write_relation_node_list).
-        // Globally unique edge ids are tracked separately as BUG-002 — out of scope here.
-        uint64_t edge_idx = 0;
+        // Each edge carries its own globally-unique id in EdgeRef.id (assigned
+        // from MetaRecord.next_edge_id by add_edge and preserved across these
+        // full-node rewrites), so we write that id directly into the Edge POD.
         for (const auto &[rel_type, neighbors] : node.neighborgs)
         {
             edges_out.seekp(0, std::ios::end);
             uint64_t edge_offset = edges_out.tellp();
-            for (const auto &[to_id, wp] : neighbors)
+            for (const auto &[to_id, ref] : neighbors)
             {
-                Edge edge = edge_to_pod(edge_idx++, node_id,
+                Edge edge = edge_to_pod(ref.id, node_id,
                                        static_cast<uint64_t>(to_id),
-                                       static_cast<uint64_t>(wp.first));
+                                       static_cast<uint64_t>(ref.weight));
                 write_pod(edge, edges_out);
             }
             uint64_t edge_count = static_cast<uint64_t>(neighbors.size());

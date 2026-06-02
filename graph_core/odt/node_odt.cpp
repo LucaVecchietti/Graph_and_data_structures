@@ -101,9 +101,9 @@ NodeRecord<ComplexHeader> complex_node_to_record(const Node<ComplexRecord> &node
 /**
  * 
  */
-std::unordered_map<std::string, std::unordered_map<int, std::pair<int, BaseNode *>>> reconstruct_neighbors(const RelationNodeList &rellist)
+std::unordered_map<std::string, std::unordered_map<int, EdgeRef>> reconstruct_neighbors(const RelationNodeList &rellist)
 {
-    std::unordered_map<std::string, std::unordered_map<int, std::pair<int, BaseNode *>>> neighbors;
+    std::unordered_map<std::string, std::unordered_map<int, EdgeRef>> neighbors;
     
     
 

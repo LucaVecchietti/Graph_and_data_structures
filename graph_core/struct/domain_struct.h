@@ -3,19 +3,39 @@
 #include <unordered_map>
 #include <string>
 #include <utility>
+#include <cstdint>
 
 /**
  *  RAM optimized struct
  */
 
+struct BaseNode; // forward declaration: EdgeRef points back to a neighbor node.
+
+/**
+ * RAM-side description of a single outgoing edge.
+ *  - id        globally-unique edge id; source of truth is MetaRecord.next_edge_id,
+ *              assigned once when the edge is first added and preserved across the
+ *              full-node rewrites performed by update_node_edges. On the disk side
+ *              it is the Edge POD's `id` field.
+ *  - weight    edge weight.
+ *  - neighbor  pointer to the destination BaseNode (nullptr until re-linked after a
+ *              load from disk; see read_node).
+ */
+struct EdgeRef
+{
+    uint64_t id;
+    int weight;
+    BaseNode *neighbor;
+};
+
 /**
  * Base node struct — type-erased, holds the adjacency map.
- * neighborgs: relation_type -> { neighbor_index -> (weight, neighbor_ptr) }
+ * neighborgs: relation_type -> { neighbor_index -> EdgeRef(id, weight, neighbor_ptr) }
  */
 struct BaseNode
 {
     virtual ~BaseNode() = default;
-    std::unordered_map<std::string, std::unordered_map<int, std::pair<int, BaseNode *>>> neighborgs;
+    std::unordered_map<std::string, std::unordered_map<int, EdgeRef>> neighborgs;
 };
 
 /**

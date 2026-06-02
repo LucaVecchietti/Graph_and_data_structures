@@ -94,13 +94,15 @@ uint64_t write_relation_node_list(const Node<T> &node, uint64_t node_id, std::of
     std::ofstream edges_out(std::filesystem::path(DB_PATH) / "edges.dat", std::ios::binary | std::ios::app);
     if (!edges_out) throw std::runtime_error("Failed to open edges file for writing.");
 
-    uint64_t edge_idx = 0;
+    // Used by the initial node insert, when node.neighborgs is normally empty
+    // (edges are attached later via add_edge). Each edge is written with its own
+    // EdgeRef.id rather than a per-node-local counter.
     for (const auto &[rel_type, neighbors] : node.neighborgs)
     {
         uint64_t edge_offset = edges_out.tellp();
-        for (const auto &[to_id, wp] : neighbors)
+        for (const auto &[to_id, ref] : neighbors)
         {
-            Edge edge = edge_to_pod(edge_idx++, node_id, static_cast<uint64_t>(to_id), static_cast<uint64_t>(wp.first));
+            Edge edge = edge_to_pod(ref.id, node_id, static_cast<uint64_t>(to_id), static_cast<uint64_t>(ref.weight));
             write_pod(edge, edges_out);
         }
         uint64_t edge_count = static_cast<uint64_t>(neighbors.size());
@@ -228,8 +230,10 @@ BaseNode* read_typed_node(const NodeIndex &node_idx, std::ifstream &dat_in)
             for (uint64_t i = 0; i < entry.edge_count; ++i)
             {
                 Edge edge = read_pod<Edge>(edges_in);
-                // neighbor ptr is nullptr — must be re-linked after all nodes are loaded
-                node->neighborgs[entry.name][static_cast<int>(edge.to_node)] = {static_cast<int>(edge.weight), nullptr};
+                // neighbor ptr is nullptr — must be re-linked after all nodes are loaded.
+                // edge.id is preserved so a later add_edge overwrite reuses the same id.
+                node->neighborgs[entry.name][static_cast<int>(edge.to_node)] =
+                    EdgeRef{edge.id, static_cast<int>(edge.weight), nullptr};
             }
         }
     }

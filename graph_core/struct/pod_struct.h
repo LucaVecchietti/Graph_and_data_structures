@@ -135,9 +135,15 @@ struct Edge
 #pragma pack(push, 1)
 struct MetaRecord
 {
-    uint64_t next_id;
-    uint64_t node_count;
-    uint64_t free_count; // How many offsets are available in freelist.dat
+    // --- Node bookkeeping ---
+    uint64_t next_id;    // Next node id to assign on insert.
+    uint64_t node_count; // How many live nodes exist.
+    uint64_t free_count; // How many node offsets are available in the node freelist.
+
+    // --- Edge bookkeeping ---
+    uint64_t edge_count;      // How many live edges exist.
+    uint64_t next_edge_id;    // Next edge id to assign when adding an edge.
+    uint64_t free_edge_count; // How many edge offsets are available in the edge freelist.
 };
 #pragma pack(pop)
 

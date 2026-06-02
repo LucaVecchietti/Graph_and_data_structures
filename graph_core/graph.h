@@ -116,7 +116,7 @@ public:
 
             for (auto &[neighborgIdx, edge] : it->second)
             {
-                on_edge(current, neighborgIdx, edge.first);
+                on_edge(current, neighborgIdx, edge.weight);
                 if (visited.find(neighborgIdx) == visited.end())
                     visit(neighborgIdx);
             }

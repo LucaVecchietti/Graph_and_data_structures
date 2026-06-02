@@ -33,6 +33,10 @@ void Graph::init_meta()
     meta.node_count = 0;
     meta.free_count = 0;
 
+    meta.edge_count = 0;
+    meta.next_edge_id = 0;
+    meta.free_edge_count = 0;
+
     write_meta(meta);
 }
 
@@ -100,10 +104,29 @@ void Graph::add_edge(int start, int end, std::string type, int weight)
         }
     }
 
-    BaseNode *node = nodes[start];                              // Get the start node from the base nodes vector
-    auto edge = std::pair<int, BaseNode *>(weight, nodes[end]); // Create the edge and assign the weight
+    BaseNode *node = nodes[start]; // Get the start node from the base nodes vector
 
     logger.info("Adding edge from node " + std::to_string(start) + " to node " + std::to_string(end) + " with type '" + type + "' and weight " + std::to_string(weight));
+
+    // Decide the edge id and whether this is a brand-new edge or an overwrite of
+    // an existing (start, type, end) triple. A new edge consumes a fresh id from
+    // meta.next_edge_id; an existing one keeps the id it already has — we only
+    // overwrite its weight. Resolved BEFORE the mutation below, which would
+    // otherwise create the entry.
+    bool is_new_edge = true;
+    uint64_t edge_id = meta.next_edge_id;
+    {
+        auto rel_it = node->neighborgs.find(type);
+        if (rel_it != node->neighborgs.end())
+        {
+            auto edge_it = rel_it->second.find(end);
+            if (edge_it != rel_it->second.end())
+            {
+                is_new_edge = false;
+                edge_id = edge_it->second.id; // preserve the existing edge's id
+            }
+        }
+    }
 
     // Mutate the in-RAM adjacency map FIRST, then persist. update_node_edges
     // reads node->neighborgs to produce the new on-disk state, so the new edge
@@ -111,11 +134,24 @@ void Graph::add_edge(int start, int end, std::string type, int weight)
     // of disk for the rest of the process lifetime — but the process tipically
     // dies on the exception anyway, and a restart re-reads the (old) state
     // from disk so no permanent inconsistency.
-    node->neighborgs[type][end] = edge;
+    node->neighborgs[type][end] = EdgeRef{edge_id, weight, nodes[end]};
 
     // Edge persistence: rewrite the relation list + edge chunks at fresh
     // offsets in nodes.dat / edges.dat and patch NodeIndex.relation_offset
-    // in-place. The OLD regions become orphaned bytes (see TODO inside the
-    // function — freelist persistence is the planned reclaim mechanism).
+    // in-place. Each edge is written with its own EdgeRef.id (no longer a
+    // per-node-local counter). The OLD regions become orphaned bytes (see TODO
+    // inside the function — freelist persistence is the planned reclaim mechanism).
     update_node_edges(*node, meta, start);
+
+    // Persistence of the node's edges always happens above (even when the edge
+    // already existed — we just rewrote its save). The meta counters, however,
+    // only advance for a genuinely new edge: next_edge_id is the monotonic id
+    // source (now wired into Edge.id), edge_count tracks live edges. meta.dat is
+    // truncated + rewritten so the counters survive a restart.
+    if (is_new_edge)
+    {
+        meta.next_edge_id++;
+        meta.edge_count++;
+        write_meta(meta);
+    }
 }
