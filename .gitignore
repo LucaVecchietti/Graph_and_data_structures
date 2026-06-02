@@ -1,6 +1,4 @@
-.claude/
 .vscode/
 *.exe
-db/*
-build/*
-CLAUDE.md
+db/
+build/
