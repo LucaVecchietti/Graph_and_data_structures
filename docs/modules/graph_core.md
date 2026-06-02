@@ -6,8 +6,8 @@
 |---|---|
 | Tipo | module |
 | Lingua | en |
-| Ultimo aggiornamento | 2026-05-30 |
-| Commit di riferimento | d7ba798 |
+| Ultimo aggiornamento | 2026-06-02 |
+| Commit di riferimento | 309d3f9 |
 | Mirror | — |
 
 ---
@@ -70,13 +70,21 @@ File + stderr logger. Constructor opens the log file in append mode and throws `
 | `JSON_ATTR_META_PATH` | `constexpr std::string_view` | `"../db/attributes/attributes_meta.dat"` | Path to the `JsonMeta` POD used to track unique JSON sidecar names. |
 | `JSON_ATTR_PATH` | `constexpr std::string_view` | `"../db/attributes/"` | Base directory for JSON sidecar files attached to COMPLEX nodes. |
 
+### `struct EdgeRef` (`struct/domain_struct.h`)
+RAM-side description of one outgoing edge. Inner value type of the adjacency map. Introduced 2026-06-02 to carry the edge id alongside the weight (see [API change](../legacy/api_changes.md#2026-06-02--basenodeneighborgs-da-pairint-basenode-a-edgeref)).
+| Field | Type | Purpose |
+|---|---|---|
+| `id` | `uint64_t` | Globally-unique edge id. Source of truth is `MetaRecord.next_edge_id`; assigned once when the edge is first added, then preserved across the full-node rewrites of `update_node_edges`. On disk it is `Edge.id`. |
+| `weight` | `int` | Edge weight. |
+| `neighbor` | `BaseNode*` | Pointer to the destination node. `nullptr` until re-linked after a load from disk (`read_node` leaves it unset). |
+
 ### `struct BaseNode` (`struct/domain_struct.h`)
 Type-erased base. Holds only the adjacency map:
 ```cpp
 std::unordered_map<std::string,
-    std::unordered_map<int, std::pair<int, BaseNode*>>> neighborgs;
+    std::unordered_map<int, EdgeRef>> neighborgs;
 ```
-Outer key: relation type. Inner key: neighbor id. Inner value: `(weight, pointer-to-neighbor)`.
+Outer key: relation type. Inner key: neighbor id. Inner value: `EdgeRef(id, weight, neighbor-ptr)`.
 
 Virtual destructor so deleting through `BaseNode*` frees the derived `Node<T>` correctly.
 
@@ -110,7 +118,7 @@ Per-relation entries `[uint64_t name_length][name bytes][uint64_t edge_offset][u
 ### `struct Edge` (POD, packed) (`struct/pod_struct.h`)
 | Field | Type | Purpose |
 |---|---|---|
-| `id` | `uint64_t` | Per-node edge index (reset per node, see [BUG-002](../legacy/known_bugs.md)). |
+| `id` | `uint64_t` | Globally-unique edge id, sourced from `MetaRecord.next_edge_id` (since 2026-06-02 — [BUG-002](../legacy/known_bugs.md#2026-05-26--bug-002-edgeid-non-globale-tra-nodi) fixed). Written from `EdgeRef.id`. |
 | `weight` | `int64_t` | Edge weight. |
 | `to_node` | `uint64_t` | Destination node id. |
 | `from_node` | `uint64_t` | Source node id. |
@@ -118,9 +126,14 @@ Per-relation entries `[uint64_t name_length][name bytes][uint64_t edge_offset][u
 ### `struct MetaRecord` (POD, packed) (`struct/pod_struct.h`)
 | Field | Type | Purpose |
 |---|---|---|
-| `next_id` | `uint64_t` | Next id to assign on insert. |
+| `next_id` | `uint64_t` | Next node id to assign on insert. |
 | `node_count` | `uint64_t` | Total nodes ever inserted. |
-| `free_count` | `uint64_t` | Reserved for freelist support — currently never written to except as `0`. |
+| `free_count` | `uint64_t` | Node freelist size. Reserved for freelist support — currently never written to except as `0`. |
+| `edge_count` | `uint64_t` | Number of live edges. Incremented by `add_edge` for each genuinely new edge (since 2026-06-02). |
+| `next_edge_id` | `uint64_t` | Next edge id to assign. Monotonic source for `Edge.id` / `EdgeRef.id` (since 2026-06-02 — [BUG-002](../legacy/known_bugs.md#2026-05-26--bug-002-edgeid-non-globale-tra-nodi) fixed). |
+| `free_edge_count` | `uint64_t` | Edge freelist size. Reserved — currently never written to except as `0`. |
+
+POD layout grew from 24 to 48 bytes on 2026-06-02 (the three edge fields) — see [API change](../legacy/api_changes.md#2026-06-02--metarecord-aggiunti-i-campi-edge_count-next_edge_id-free_edge_count). Any `db/meta.dat` produced before that must be wiped.
 
 ### `struct FreeRecord` (POD, packed) (`struct/pod_struct.h`)
 Single `uint64_t offset`. Declared but **not yet used** — placeholder for a future `freelist.dat`.
@@ -195,10 +208,12 @@ Allocates a `Node<ValueType>` (with `T` stripped of reference), forwards `value`
 ### `void Graph::add_edge(int start, int end, std::string type = "", int weight = 1)` (`graph.cpp:53`)
 1. Rejects `type` longer than `RELATION_TYPE_MAX_SIZE` (throws `std::invalid_argument`).
 2. For each endpoint not in RAM: if id `< meta.next_id`, `read_node` from disk and cache; else throw `std::out_of_range`.
-3. Inserts `(weight, end_ptr)` into `start->neighborgs[type][end]` (RAM-first).
-4. Calls `update_node_edges(*start_node, meta, start)` to persist the new state.
+3. Resolves the edge id and whether it is new: a brand-new `(start, type, end)` triple consumes a fresh id from `meta.next_edge_id`; an existing triple reuses the id already stored in its `EdgeRef` (only the weight is overwritten). Decided **before** the mutation in step 4.
+4. Inserts `EdgeRef{id, weight, end_ptr}` into `start->neighborgs[type][end]` (RAM-first).
+5. Calls `update_node_edges(*start_node, meta, start)` to persist the new state — runs on every call, even for an overwrite.
+6. Only for a genuinely new edge: increments `meta.next_edge_id` and `meta.edge_count`, then `write_meta(meta)`.
 
-**Side effects on disk (since 2026-05-30):** appends a new `RelationNodeList` to `nodes.dat`, appends a fresh contiguous chunk per relation to `edges.dat`, patches `NodeIndex.relation_offset` in `nodes.idx` in place. The previously persisted `RelationNodeList` region and the previously persisted edge chunks become orphaned bytes (no freelist persistence yet). See [BUG-001 fixed](../legacy/known_bugs.md#2026-05-26--bug-001-add_edge-non-persiste-su-disco) and the [Edge persistence design decision](../legacy/design_decisions.md#2026-05-30--edge-persistence-append--obsolete--in-place-index-patch).
+**Side effects on disk (since 2026-05-30):** appends a new `RelationNodeList` to `nodes.dat`, appends a fresh contiguous chunk per relation to `edges.dat`, patches `NodeIndex.relation_offset` in `nodes.idx` in place. Since 2026-06-02 a new edge also truncates+rewrites `meta.dat` (counter bump). The previously persisted `RelationNodeList` region and the previously persisted edge chunks become orphaned bytes (no freelist persistence yet). See [BUG-001 fixed](../legacy/known_bugs.md#2026-05-26--bug-001-add_edge-non-persiste-su-disco), [BUG-002 fixed](../legacy/known_bugs.md#2026-05-26--bug-002-edgeid-non-globale-tra-nodi) and the [Edge persistence design decision](../legacy/design_decisions.md#2026-05-30--edge-persistence-append--obsolete--in-place-index-patch).
 
 ### `template<class Policy, class NodeFn, class EdgeFn> void Graph::traverse(int start, const std::string& type, NodeFn on_node, EdgeFn on_edge)` (`graph.h:76`)
 Generic graph traversal. Maintains `visited` and a `Policy::Frontier`. On visit, calls `on_node(idx)` and pushes to the frontier. On each pop, iterates the node's neighbors for the requested `type`, calls `on_edge(from, to, weight)` for every edge, and visits unvisited targets. Missing node or missing relation → silently skipped.
@@ -315,10 +330,13 @@ No third-party libraries. No dependency on `data_tructures/`.
 - [API — RelationNodeList con batch_size](../legacy/api_changes.md#2026-05-30--relationnodelist-aggiunto-il-campo-batch_size)
 - [API — update_node_edges nuova funzione](../legacy/api_changes.md#2026-05-30--nuova-funzione-update_node_edges)
 - [API — Graph::add_edge persiste](../legacy/api_changes.md#2026-05-30--graphadd_edge-persistenza-su-disco-via-update_node_edges)
+- [API — MetaRecord campi edge](../legacy/api_changes.md#2026-06-02--metarecord-aggiunti-i-campi-edge_count-next_edge_id-free_edge_count)
+- [API — neighborgs: EdgeRef](../legacy/api_changes.md#2026-06-02--basenodeneighborgs-da-pairint-basenode-a-edgeref)
+- [Decisione — id arco in EdgeRef](../legacy/design_decisions.md#2026-06-02--id-arco-globale-sorgente-in-metarecordnext_edge_id-memorizzato-in-edgeref)
 - [API — ComplexHeader rinominato](../legacy/api_changes.md#2026-05-26--complexheaderjson_attributes_size--json_file_path_size)
 - [API — write_node switch su NodeType](../legacy/api_changes.md#2026-05-26--write_nodet-switch-su-nodetype-per-ramo-complex)
 - [BUG-001 — add_edge non persiste (fixed)](../legacy/known_bugs.md#2026-05-26--bug-001-add_edge-non-persiste-su-disco)
-- [BUG-002 — edge_idx non globale](../legacy/known_bugs.md#2026-05-26--bug-002-edgeid-non-globale-tra-nodi)
+- [BUG-002 — Edge.id non globale (fixed)](../legacy/known_bugs.md#2026-05-26--bug-002-edgeid-non-globale-tra-nodi)
 - [BUG-003 — reconstruct_neighbors stub](../legacy/known_bugs.md#2026-05-26--bug-003-reconstruct_neighbors-non-implementata)
 - [BUG-004 — typo neihborgs](../legacy/known_bugs.md#2026-05-26--bug-004-typo-neihborgs-in-node_form_pod)
 - [BUG-005 — logger globale duplicato](../legacy/known_bugs.md#2026-05-26--bug-005-logger-globale-duplicato-in-graph_iocpp)
@@ -334,9 +352,11 @@ No third-party libraries. No dependency on `data_tructures/`.
 - `graph_core/graph.h:19` — `class Graph`.
 - `graph_core/graph.h:43` — `insert<T>` template.
 - `graph_core/graph.h:76` — `traverse<Policy, ...>` template.
-- `graph_core/graph.cpp:53` — `add_edge`.
-- `graph_core/struct/domain_struct.h:15` — `BaseNode`.
-- `graph_core/struct/domain_struct.h:38` — `ComplexRecord`.
+- `graph_core/graph.cpp:57` — `add_edge` (resolves edge id, bumps `next_edge_id`/`edge_count`).
+- `graph_core/struct/domain_struct.h:24` — `EdgeRef` (RAM-side edge: `id`, `weight`, `neighbor`).
+- `graph_core/struct/domain_struct.h:35` — `BaseNode` (`neighborgs` value type now `EdgeRef`).
+- `graph_core/struct/domain_struct.h:58` — `ComplexRecord`.
+- `graph_core/struct/pod_struct.h:136` — `MetaRecord` (48 bytes: 3 node + 3 edge counters).
 - `graph_core/struct/pod_struct.h:16` — `NodeType` (incl. `COMPLEX = 255`).
 - `graph_core/struct/pod_struct.h:41` — `NodeIndex`.
 - `graph_core/struct/pod_struct.h:78` — `RelationNodeList` (now 16 bytes: `type_count` + `batch_size`).

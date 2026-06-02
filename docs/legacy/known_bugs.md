@@ -6,8 +6,8 @@
 |---|---|
 | Tipo | legacy-bugs |
 | Lingua | en |
-| Ultimo aggiornamento | 2026-05-30 |
-| Commit di riferimento | d7ba798 |
+| Ultimo aggiornamento | 2026-06-02 |
+| Commit di riferimento | 309d3f9 |
 | Mirror | — |
 
 ---
@@ -122,11 +122,11 @@
 
 ### 2026-05-26 — BUG-002: `Edge.id` non globale tra nodi
 
-- **Stato:** open
-- **Sintomo:** Il campo `Edge.id` non è univoco. Due archi appartenenti a nodi diversi possono avere lo stesso `id`.
-- **Root cause:** In `write_relation_node_list` (`graph_core/io/graph_io.h:70`), `edge_idx` è una variabile locale inizializzata a 0 ad ogni chiamata (cioè per ogni nodo). Viene incrementata solo all'interno del nodo corrente.
-- **Fix:** n/a (open). Se l'intento è davvero un id globale, va spostato nel `MetaRecord` (aggiungere `next_edge_id`) e persistito. Se l'id è invece pensato come "indice dell'arco dentro la sua lista di vicini per un tipo di relazione", allora il nome `id` è fuorviante e va rinominato (es. `local_idx`) — questa è una scelta di design da prendere prima del fix.
-- **Regression guard:** nessuno.
+- **Stato:** fixed (2026-06-02, commit `309d3f9`)
+- **Sintomo:** Il campo `Edge.id` non era univoco. Due archi appartenenti a nodi diversi potevano avere lo stesso `id` (in pratica, il primo arco di ogni nodo aveva `id = 0`).
+- **Root cause:** In `write_relation_node_list` (`graph_core/io/graph_io.h`) e nel loop di scrittura di `update_node_edges`, `edge_idx` era una variabile locale inizializzata a 0 ad ogni chiamata (cioè per ogni nodo). Veniva incrementata solo all'interno del nodo corrente.
+- **Fix:** Scelta di design "id globale" (vedi [decisione](design_decisions.md#2026-06-02--id-arco-globale-sorgente-in-metarecordnext_edge_id-memorizzato-in-edgeref)). Aggiunto `next_edge_id` a `MetaRecord` (sorgente monotona, persistita). L'id vive ora nella struct di dominio `EdgeRef { id, weight, neighbor }` (`graph_core/struct/domain_struct.h:24`): `add_edge` (`graph_core/graph.cpp:57`) assegna `id = meta.next_edge_id` a un arco nuovo e incrementa `next_edge_id`/`edge_count`; un arco già esistente riusa il suo `id`. I loop di scrittura (`graph_core/io/graph_io.h:105`, `graph_core/io/graph_io.cpp:344`) scrivono `ref.id` invece di un contatore locale; il read path (`graph_core/io/graph_io.h:236`) ricostruisce `EdgeRef` con `edge.id` letto da disco, così l'id sopravvive alle riscritture complete del nodo.
+- **Regression guard:** nessuno (nessuna test suite). Verificato manualmente via lo smoke test di `main.cpp`: dump di `edges.dat` con id `0..5` distinti e id preservati (`road`=0/1, `knows`=2) dopo reload + riscrittura in Phase 2.
 
 ---
 

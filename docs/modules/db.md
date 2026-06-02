@@ -6,8 +6,8 @@
 |---|---|
 | Tipo | module |
 | Lingua | en |
-| Ultimo aggiornamento | 2026-05-30 |
-| Commit di riferimento | d7ba798 |
+| Ultimo aggiornamento | 2026-06-02 |
+| Commit di riferimento | 309d3f9 |
 | Mirror | — |
 
 ---
@@ -31,7 +31,7 @@ db/
     └── {prog_number}_{type_label}.json   JSON attributes payload per COMPLEX node
 ```
 
-There is no header magic, no version field, no checksum. Reading a `db/` produced by a build with a different `NodeType` enum or different POD layout will silently misinterpret data. The most recent schema break (2026-05-30) added the `batch_size` field to `RelationNodeList`, taking the POD from 8 to 16 bytes — any `db/` produced before that commit must be wiped.
+There is no header magic, no version field, no checksum. Reading a `db/` produced by a build with a different `NodeType` enum or different POD layout will silently misinterpret data. The most recent schema break (2026-06-02) added three edge-bookkeeping fields to `MetaRecord`, taking it from 24 to 48 bytes; the prior one (2026-05-30) added `batch_size` to `RelationNodeList` (8 → 16 bytes). Any `db/` produced before the relevant commit must be wiped.
 
 The `attributes/` subtree only exists once at least one COMPLEX node has been written (or once `read_json_attributes_meta` is called and lazy-creates `attributes_meta.dat`). The COMPLEX write+read path compiles and runs end-to-end since 2026-05-30 ([BUG-009..BUG-013](../legacy/known_bugs.md) and [BUG-015](../legacy/known_bugs.md) fixed); the only remaining open item on this path is [BUG-014](../legacy/known_bugs.md) (`prog_number` never persisted, so two COMPLEX nodes with the same `type_label` collide on the same sidecar file). See the [sidecar JSON design decision](../legacy/design_decisions.md#2026-05-26--storage-sidecar-json-per-nodi-complex).
 
@@ -39,7 +39,7 @@ The `attributes/` subtree only exists once at least one COMPLEX node has been wr
 
 - **Append-only data files** (`nodes.dat`, `edges.dat`) — opened with `std::ios::binary | std::ios::app`. Cheap inserts, no in-place updates.
 - **`nodes.idx`: append-only on insert, in-place patch on edge update** — new entries appended by `write_node_index`; `update_node_edges` patches `NodeIndex.relation_offset` in place (8-byte write at a known offset). Single source of in-place mutation in the system. See [Edge persistence](../legacy/design_decisions.md#2026-05-30--edge-persistence-append--obsolete--in-place-index-patch).
-- **Truncated meta** — `meta.dat` (and `attributes/attributes_meta.dat`) are opened with `std::ios::binary | std::ios::trunc` and fully rewritten on every change. They're tiny (24 bytes / 8 bytes) so the cost is irrelevant.
+- **Truncated meta** — `meta.dat` (and `attributes/attributes_meta.dat`) are opened with `std::ios::binary | std::ios::trunc` and fully rewritten on every change. They're tiny (48 bytes / 8 bytes) so the cost is irrelevant.
 - **Fixed-width `NodeIndex`** — allows O(1) lookup by id via `seekg(id * sizeof(NodeIndex))` in `nodes.idx`. Also enables the in-place patch above.
 - **Type tag inside `NodeIndex`** — lets `read_node` dispatch to the right `read_typed_node<T>` without touching `nodes.dat`.
 - **Edges stored separately** — `edges.dat` holds the flat list of all edges; each `RelationNodeList` tail entry stores `(name, edge_offset, edge_count)` pointing into it.
@@ -52,16 +52,19 @@ See [Append-only data files, truncated meta](../legacy/design_decisions.md#2026-
 
 ### `meta.dat`
 
-A single `MetaRecord` POD, 24 bytes:
+A single `MetaRecord` POD, 48 bytes (24 → 48 on 2026-06-02, edge fields added):
 
 ```
 offset  size  field
-  0      8    next_id        (uint64_t)
-  8      8    node_count     (uint64_t)
- 16      8    free_count     (uint64_t, currently unused)
+  0      8    next_id          (uint64_t)  — next node id
+  8      8    node_count       (uint64_t)
+ 16      8    free_count       (uint64_t)  — node freelist size, currently unused
+ 24      8    edge_count       (uint64_t)  — number of live edges
+ 32      8    next_edge_id     (uint64_t)  — next edge id (source of Edge.id)
+ 40      8    free_edge_count  (uint64_t)  — edge freelist size, currently unused
 ```
 
-Rewritten in full on every insert via `write_meta`.
+Rewritten in full on every insert via `write_meta`; also rewritten by `add_edge` whenever a genuinely new edge bumps `edge_count` / `next_edge_id`.
 
 ### `nodes.idx`
 
@@ -111,13 +114,13 @@ A flat array of `Edge` POD records, 32 bytes each (packed):
 
 ```
 offset  size  field
-  0      8    id          (uint64_t) — per-node-relation index (see BUG-002)
+  0      8    id          (uint64_t) — globally-unique edge id from MetaRecord.next_edge_id
   8      8    weight      (int64_t)
  16      8    to_node     (uint64_t) — destination node id
  24      8    from_node   (uint64_t) — source node id
 ```
 
-Edges for a given `(node, relation)` are stored consecutively starting at `RelationNodeList.tail.edge_offset` for `edge_count` entries. When `add_edge` modifies a `(node, relation)`, a fresh contiguous chunk is appended at end-of-file and the new entry in the rewritten `RelationNodeList` points there — the old chunk becomes orphaned. Two consequences: `edges.dat` grows monotonically with every `add_edge`, and edge `id`s are reset per write of a node (still [BUG-002](../legacy/known_bugs.md), independent of edge persistence).
+Edges for a given `(node, relation)` are stored consecutively starting at `RelationNodeList.tail.edge_offset` for `edge_count` entries. When `add_edge` modifies a `(node, relation)`, a fresh contiguous chunk is appended at end-of-file and the new entry in the rewritten `RelationNodeList` points there — the old chunk becomes orphaned, so `edges.dat` grows monotonically with every `add_edge`. Since 2026-06-02 each `Edge.id` is globally unique and stable: it is assigned once from `MetaRecord.next_edge_id` and preserved across the full-node rewrites (an edge read back from disk keeps its id, so re-saving it does not change it). See [BUG-002 fixed](../legacy/known_bugs.md#2026-05-26--bug-002-edgeid-non-globale-tra-nodi).
 
 ### `attributes/attributes_meta.dat`
 
@@ -208,15 +211,21 @@ The exact filename **must** match the `json_file_path` string stored in the on-d
 - [POD packed e fragilità ABI](../legacy/design_decisions.md#2026-05-26--pod-packed-e-fragilità-abi)
 - [API — RelationNodeList con batch_size](../legacy/api_changes.md#2026-05-30--relationnodelist-aggiunto-il-campo-batch_size)
 - [API — Graph::add_edge persiste](../legacy/api_changes.md#2026-05-30--graphadd_edge-persistenza-su-disco-via-update_node_edges)
+- [API — MetaRecord campi edge](../legacy/api_changes.md#2026-06-02--metarecord-aggiunti-i-campi-edge_count-next_edge_id-free_edge_count)
+- [API — neighborgs: EdgeRef](../legacy/api_changes.md#2026-06-02--basenodeneighborgs-da-pairint-basenode-a-edgeref)
+- [Decisione — id arco in EdgeRef](../legacy/design_decisions.md#2026-06-02--id-arco-globale-sorgente-in-metarecordnext_edge_id-memorizzato-in-edgeref)
 - [API — ComplexHeader rinominato](../legacy/api_changes.md#2026-05-26--complexheaderjson_attributes_size--json_file_path_size)
 - [BUG-001 — add_edge non persiste (fixed)](../legacy/known_bugs.md#2026-05-26--bug-001-add_edge-non-persiste-su-disco)
-- [BUG-002 — edge_idx non globale](../legacy/known_bugs.md#2026-05-26--bug-002-edgeid-non-globale-tra-nodi)
+- [BUG-002 — Edge.id non globale (fixed)](../legacy/known_bugs.md#2026-05-26--bug-002-edgeid-non-globale-tra-nodi)
 - [BUG-014 — prog_number non incrementato](../legacy/known_bugs.md#2026-05-26--bug-014-prog_number-mai-incrementatopersistito-dopo-write-complex)
 
 ## Riferimenti
 
 - `graph_core/struct/pod_struct.h:16` — `NodeType` enum (incl. `COMPLEX = 255`).
-- `graph_core/struct/pod_struct.h:40-126` — POD layouts for `NodeIndex`, `NodeRecord`, `RelationNodeList`, `Edge`, `MetaRecord`, `FreeRecord`.
+- `graph_core/struct/pod_struct.h:40-149` — POD layouts for `NodeIndex`, `NodeRecord`, `RelationNodeList`, `Edge`, `MetaRecord`, `FreeRecord`.
+- `graph_core/struct/pod_struct.h:136` — `MetaRecord` (now 48 bytes: 3 node + 3 edge counters).
+- `graph_core/struct/domain_struct.h:24` — `EdgeRef { id, weight, neighbor }` (RAM-side edge, source of `Edge.id`).
+- `graph_core/graph.cpp:57` — `add_edge` (assigns edge id, bumps `next_edge_id`/`edge_count`).
 - `graph_core/struct/pod_struct.h:78` — `RelationNodeList` (now 16 bytes: `type_count` + `batch_size`).
 - `graph_core/struct/pod_struct.h:134` — `ComplexHeader` (field renamed to `json_file_path_size`).
 - `graph_core/struct/pod_struct.h:148` — `JsonMeta`.

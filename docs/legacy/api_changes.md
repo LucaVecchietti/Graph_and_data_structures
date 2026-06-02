@@ -6,14 +6,16 @@
 |---|---|
 | Tipo | legacy-api |
 | Lingua | en |
-| Ultimo aggiornamento | 2026-05-30 |
-| Commit di riferimento | d7ba798 |
+| Ultimo aggiornamento | 2026-06-02 |
+| Commit di riferimento | 309d3f9 |
 | Mirror | — |
 
 ---
 
 ## Indice
 
+- [2026-06-02 — `MetaRecord`: aggiunti i campi `edge_count`, `next_edge_id`, `free_edge_count`](#2026-06-02--metarecord-aggiunti-i-campi-edge_count-next_edge_id-free_edge_count)
+- [2026-06-02 — `BaseNode::neighborgs`: da `pair<int, BaseNode*>` a `EdgeRef`](#2026-06-02--basenodeneighborgs-da-pairint-basenode-a-edgeref)
 - [2026-05-30 — `Graph::add_edge`: persistenza su disco via `update_node_edges`](#2026-05-30--graphadd_edge-persistenza-su-disco-via-update_node_edges)
 - [2026-05-30 — Nuova funzione `update_node_edges`](#2026-05-30--nuova-funzione-update_node_edges)
 - [2026-05-30 — `RelationNodeList`: aggiunto il campo `batch_size`](#2026-05-30--relationnodelist-aggiunto-il-campo-batch_size)
@@ -28,6 +30,60 @@
 > Nota: il progetto non ha ancora consumatori esterni, quindi "API pubblica" qui significa: classe `Graph`, POD persistiti su disco (`pod_struct.h`), funzioni esposte nei header pubblici (`io/graph_io.h`, `io/io_utils.h`, `odt/*.h`, `struct/*.h`).
 >
 > Le modifiche ai POD persistiti sono particolarmente sensibili perché rompono il formato su disco — andranno tracciate qui anche se prive di consumatori esterni.
+
+---
+
+### 2026-06-02 — `MetaRecord`: aggiunti i campi `edge_count`, `next_edge_id`, `free_edge_count`
+
+- **Motivazione:** Dotare il grafo di un bookkeeping degli archi simmetrico a quello dei nodi (`node_count` / `next_id` / `free_count`), propedeutico alla chiusura di [BUG-002](known_bugs.md#2026-05-26--bug-002-edgeid-non-globale-tra-nodi) (id arco globale) e alle future freelist degli offset di archi.
+- **Before:**
+  ```cpp
+  // pod_struct.h — 24 byte
+  struct MetaRecord {
+      uint64_t next_id;
+      uint64_t node_count;
+      uint64_t free_count;
+  };
+  ```
+- **After:**
+  ```cpp
+  // pod_struct.h — 48 byte
+  struct MetaRecord {
+      // Node bookkeeping
+      uint64_t next_id;
+      uint64_t node_count;
+      uint64_t free_count;
+      // Edge bookkeeping
+      uint64_t edge_count;      // archi vivi
+      uint64_t next_edge_id;    // prossimo id arco (sorgente di Edge.id)
+      uint64_t free_edge_count; // freelist archi (riservato)
+  };
+  ```
+- **Note di migrazione:** **Schema break sul formato su disco**: `meta.dat` passa da 24 a 48 byte. Ogni `db/meta.dat` prodotto prima del commit `309d3f9` va cancellato (`read_meta` farebbe una short-read). `init_meta` azzera tutti e sei i campi. `edge_count`/`next_edge_id` sono ora alimentati da `add_edge`; `free_edge_count` resta riservato (mai scritto se non `0`), come `free_count`.
+- **Riferimenti:** commit `309d3f9`. `graph_core/struct/pod_struct.h:136`, `graph_core/graph.cpp:30` (`init_meta`).
+
+---
+
+### 2026-06-02 — `BaseNode::neighborgs`: da `pair<int, BaseNode*>` a `EdgeRef`
+
+- **Motivazione:** Cablare `next_edge_id` come `Edge.id` ([BUG-002](known_bugs.md#2026-05-26--bug-002-edgeid-non-globale-tra-nodi)) richiede che l'id dell'arco sia ricordato in RAM, così che un arco riscritto da `update_node_edges` (che riscrive *tutti* gli archi del nodo) conservi il suo id. Vedi la [decisione](design_decisions.md#2026-06-02--id-arco-globale-sorgente-in-metarecordnext_edge_id-memorizzato-in-edgeref).
+- **Before:**
+  ```cpp
+  // domain_struct.h — valore interno = (weight, neighbor_ptr)
+  std::unordered_map<std::string,
+      std::unordered_map<int, std::pair<int, BaseNode*>>> neighborgs;
+  // accesso: edge.first (weight), edge.second (ptr)
+  ```
+- **After:**
+  ```cpp
+  // domain_struct.h
+  struct EdgeRef { uint64_t id; int weight; BaseNode *neighbor; };
+  std::unordered_map<std::string,
+      std::unordered_map<int, EdgeRef>> neighborgs;
+  // accesso: edge.id, edge.weight, edge.neighbor
+  ```
+- **Note di migrazione:** Tutti i siti che leggevano `.first`/`.second` sull'arco sono stati aggiornati: `Graph::traverse` (`graph.h`, `edge.weight`), i loop di scrittura `write_relation_node_list` (`graph_io.h:105`) e `update_node_edges` (`graph_io.cpp:344`) scrivono `ref.id`/`ref.weight`, il read path (`graph_io.h:236`) costruisce `EdgeRef{edge.id, weight, nullptr}`. La firma di `reconstruct_neighbors` (stub, [BUG-003](known_bugs.md#2026-05-26--bug-003-reconstruct_neighbors-non-implementata)) è stata allineata al nuovo tipo di ritorno. Nessun cambiamento al formato su disco (`Edge` POD invariato; cambia solo la *semantica* del campo `id`). Il typo `neihborgs` di `node_form_pod` ([BUG-004](known_bugs.md#2026-05-26--bug-004-typo-neihborgs-in-node_form_pod)) resta invariato (template non istanziato).
+- **Riferimenti:** commit `309d3f9`. `graph_core/struct/domain_struct.h:24,38`, `graph_core/graph.cpp:137`, `graph_core/io/graph_io.h:105,236`, `graph_core/io/graph_io.cpp:344`, `graph_core/odt/node_odt.{h,cpp}`.
 
 ---
 

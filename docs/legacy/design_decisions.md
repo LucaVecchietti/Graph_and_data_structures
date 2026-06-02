@@ -6,14 +6,15 @@
 |---|---|
 | Tipo | legacy-decisions |
 | Lingua | en |
-| Ultimo aggiornamento | 2026-05-30 |
-| Commit di riferimento | d7ba798 |
+| Ultimo aggiornamento | 2026-06-02 |
+| Commit di riferimento | 309d3f9 |
 | Mirror | — |
 
 ---
 
 ## Indice
 
+- [2026-06-02 — Id arco globale: sorgente in `MetaRecord.next_edge_id`, memorizzato in `EdgeRef`](#2026-06-02--id-arco-globale-sorgente-in-metarecordnext_edge_id-memorizzato-in-edgeref)
 - [2026-05-30 — Edge persistence: append + obsolete + in-place index patch](#2026-05-30--edge-persistence-append--obsolete--in-place-index-patch)
 - [2026-05-26 — Storage sidecar JSON per nodi COMPLEX](#2026-05-26--storage-sidecar-json-per-nodi-complex)
 - [2026-05-26 — Introduzione tag NodeType::COMPLEX + ComplexRecord (WIP)](#2026-05-26--introduzione-tag-nodetypecomplex--complexrecord-wip)
@@ -24,6 +25,24 @@
 - [2026-05-26 — Single-open append su nodes.dat](#2026-05-26--single-open-append-su-nodesdat)
 - [2026-05-26 — POD packed e fragilità ABI](#2026-05-26--pod-packed-e-fragilità-abi)
 - [2026-05-26 — Hash table standalone in C (non linkata)](#2026-05-26--hash-table-standalone-in-c-non-linkata)
+
+---
+
+### 2026-06-02 — Id arco globale: sorgente in `MetaRecord.next_edge_id`, memorizzato in `EdgeRef`
+
+- **Stato:** active
+- **Contesto:** Chiusura di [BUG-002](known_bugs.md#2026-05-26--bug-002-edgeid-non-globale-tra-nodi): `Edge.id` non era univoco perché veniva generato da un contatore locale azzerato per ogni nodo. La difficoltà è che `update_node_edges` riscrive **tutti** gli archi del nodo ad ogni `add_edge`; se gli id si rigenerassero ad ogni riscrittura non sarebbero né stabili né globali, e un contatore che parte da `next_edge_id` crescerebbe di `N` (numero archi del nodo) ad ogni chiamata. Perché un arco esistente conservi il suo id quando viene riscritto, l'id deve essere **ricordato**.
+- **Decisione:** L'id dell'arco è globale e stabile. Sorgente unica: `MetaRecord.next_edge_id` (monotona, persistita su `meta.dat`). L'id è memorizzato in RAM nella struct di dominio `EdgeRef { uint64_t id; int weight; BaseNode* neighbor; }`, che sostituisce la vecchia `std::pair<int, BaseNode*>` come valore della mappa di adiacenza. Flusso in `add_edge`: un arco **nuovo** consuma `id = next_edge_id` e incrementa `next_edge_id` + `edge_count`; un arco **esistente** riusa il proprio `id` (si sovrascrive solo il peso). I loop di scrittura emettono `EdgeRef.id` nel POD `Edge`; il read path ricostruisce `EdgeRef` con `Edge.id` letto da disco, così l'id sopravvive a reload e riscritture complete del nodo.
+- **Alternative considerate:**
+  - *Contatore che parte da `next_edge_id` dentro `update_node_edges`, senza memorizzare l'id*: scartata — riassegna gli id ad ogni riscrittura del nodo (non stabili) e gonfia `next_edge_id`.
+  - *`std::tuple<uint64_t,int,BaseNode*>` invece di una struct nominata*: scartata per leggibilità — i campi nominati (`.id/.weight/.neighbor`) sostituiscono i vecchi `.first/.second` in modo più chiaro dei `std::get<N>`.
+- **Conseguenze:**
+  - Schema break su `meta.dat` (24 → 48 byte): vedi [API change MetaRecord](api_changes.md#2026-06-02--metarecord-aggiunti-i-campi-edge_count-next_edge_id-free_edge_count).
+  - Il POD `Edge` su disco è invariato: cambia solo la **semantica** del campo `id` (ora globale).
+  - Tutti i siti che usavano `.first/.second` sull'arco aggiornati (vedi [API change neighborgs](api_changes.md#2026-06-02--basenodeneighborgs-da-pairint-basenode-a-edgeref)).
+  - `next_edge_id` cresce di 1 per arco realmente nuovo; un overwrite non lo tocca ma riscrive comunque il salvataggio dell'arco (comportamento richiesto).
+  - Senza freelist, gli archi cancellati (non ancora implementati) non riuseranno gli id: `next_edge_id` resta monotona.
+- **Riferimenti:** commit `309d3f9`. `graph_core/struct/domain_struct.h:24` (`EdgeRef`), `graph_core/struct/pod_struct.h:136` (`MetaRecord`), `graph_core/graph.cpp:57` (`add_edge`), `graph_core/io/graph_io.h:105,236`, `graph_core/io/graph_io.cpp:344`.
 
 ---
 
@@ -144,7 +163,7 @@
 - **Contesto:** Insert frequenti, mai (per ora) cancellazioni o riscritture in-place. Si vuole massima semplicità di scrittura e poter sapere a colpo d'occhio dove finirà il prossimo record.
 - **Decisione:**
   - `nodes.dat`, `nodes.idx`, `edges.dat` → aperti con `std::ios::binary | std::ios::app`. Le scritture sono sempre in fondo. Gli offset si ottengono via `tellp()` prima della `write`.
-  - `meta.dat` → aperto con `std::ios::binary | std::ios::trunc` ad ogni `write_meta`: viene riscritto per intero (24 byte). Costo trascurabile.
+  - `meta.dat` → aperto con `std::ios::binary | std::ios::trunc` ad ogni `write_meta`: viene riscritto per intero (24 byte all'epoca della decisione; 48 byte dal 2026-06-02, vedi [API change MetaRecord](api_changes.md#2026-06-02--metarecord-aggiunti-i-campi-edge_count-next_edge_id-free_edge_count)). Costo trascurabile.
 - **Alternative considerate:**
   - *In-place updates*: richiederebbe un freelist e records di lunghezza variabile gestiti con cura. Rimandato.
 - **Conseguenze:**

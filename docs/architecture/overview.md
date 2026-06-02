@@ -6,8 +6,8 @@
 |---|---|
 | Tipo | architecture |
 | Lingua | en |
-| Ultimo aggiornamento | 2026-05-30 |
-| Commit di riferimento | d7ba798 |
+| Ultimo aggiornamento | 2026-06-02 |
+| Commit di riferimento | 309d3f9 |
 | Mirror | — |
 
 ---
@@ -119,7 +119,8 @@ main.cpp
 Graph::add_edge        (graph_core/graph.cpp)
    │ if start/end not in RAM but id < meta.next_id:
    │     read_node(id)   ← lazy load from disk
-   │ node->neighborgs[type][end] = (weight, ptr)   ← RAM-first
+   │ id = new edge ? meta.next_edge_id : existing EdgeRef.id
+   │ node->neighborgs[type][end] = EdgeRef{id, weight, ptr}   ← RAM-first
    ▼
 update_node_edges      (graph_core/io/graph_io.cpp)  ← persistence since 2026-05-30
    │ read OLD NodeIndex + RelationNodeList        ← identify orphaned regions
@@ -130,9 +131,10 @@ update_node_edges      (graph_core/io/graph_io.cpp)  ← persistence since 2026-
    │     append tail entry [name][off][count]     → nodes.dat
    │ open nodes.idx (binary | in | out)           ← NOT app: in-place seek
    │ patch NodeIndex.relation_offset in place     → nodes.idx
+   │ if new edge: meta.next_edge_id++; meta.edge_count++; write_meta()
 ```
 
-Since 2026-05-30, `add_edge` persists. [BUG-001](../legacy/known_bugs.md#2026-05-26--bug-001-add_edge-non-persiste-su-disco) closed. Trade-off: the old `RelationNodeList` and edge chunks become orphaned bytes — the persistent freelist that will reclaim them is not implemented yet. See [Edge persistence design decision](../legacy/design_decisions.md#2026-05-30--edge-persistence-append--obsolete--in-place-index-patch).
+Since 2026-05-30, `add_edge` persists. [BUG-001](../legacy/known_bugs.md#2026-05-26--bug-001-add_edge-non-persiste-su-disco) closed. Trade-off: the old `RelationNodeList` and edge chunks become orphaned bytes — the persistent freelist that will reclaim them is not implemented yet. See [Edge persistence design decision](../legacy/design_decisions.md#2026-05-30--edge-persistence-append--obsolete--in-place-index-patch). Since 2026-06-02 each `Edge.id` is globally unique, sourced from `MetaRecord.next_edge_id` and stored in `EdgeRef` ([BUG-002](../legacy/known_bugs.md#2026-05-26--bug-002-edgeid-non-globale-tra-nodi) closed; see [decision](../legacy/design_decisions.md#2026-06-02--id-arco-globale-sorgente-in-metarecordnext_edge_id-memorizzato-in-edgeref)).
 
 ### Read-back flow
 
