@@ -6,8 +6,8 @@
 |---|---|
 | Tipo | architecture |
 | Lingua | en |
-| Ultimo aggiornamento | 2026-06-02 |
-| Commit di riferimento | 309d3f9 |
+| Ultimo aggiornamento | 2026-06-03 |
+| Commit di riferimento | ca567e4 |
 | Mirror | — |
 
 ---
@@ -51,6 +51,8 @@ A standalone C subtree (`data_tructures/`, `node_n_pointers.c`) holds the origin
                   │  nodes.idx                       │
                   │  edges.dat                       │
                   │  meta.dat                        │
+                  │  freelist/                       │
+                  │   └── {prefix}_{size}.dat (×N)   │
                   │  attributes/                     │
                   │   ├── attributes_meta.dat        │
                   │   └── {prog}_{label}.json (×N)   │
@@ -69,7 +71,7 @@ A standalone C subtree (`data_tructures/`, `node_n_pointers.c`) holds the origin
 
 ## Componenti
 
-- **`main.cpp`** — entry point. Builds a small graph, inserts nodes, adds edges, runs BFS. Currently a smoke test, not a real CLI.
+- **`main.cpp`** — entry point. Builds a small graph, inserts nodes, adds edges, runs BFS, and (Phase 3, since 2026-06-03) deletes a node and re-inserts to exercise the freelist reuse path. Currently a smoke test, not a real CLI.
 - **`graph_core/`** — see [modules/graph_core.md](../modules/graph_core.md).
   - `graph.h/cpp` — `Graph` class: in-memory adjacency, BFS/DFS, persistence hooks.
   - `struct/` — POD and domain structs, traversal policies, type registry.
@@ -136,6 +138,33 @@ update_node_edges      (graph_core/io/graph_io.cpp)  ← persistence since 2026-
 
 Since 2026-05-30, `add_edge` persists. [BUG-001](../legacy/known_bugs.md#2026-05-26--bug-001-add_edge-non-persiste-su-disco) closed. Trade-off: the old `RelationNodeList` and edge chunks become orphaned bytes — the persistent freelist that will reclaim them is not implemented yet. See [Edge persistence design decision](../legacy/design_decisions.md#2026-05-30--edge-persistence-append--obsolete--in-place-index-patch). Since 2026-06-02 each `Edge.id` is globally unique, sourced from `MetaRecord.next_edge_id` and stored in `EdgeRef` ([BUG-002](../legacy/known_bugs.md#2026-05-26--bug-002-edgeid-non-globale-tra-nodi) closed; see [decision](../legacy/design_decisions.md#2026-06-02--id-arco-globale-sorgente-in-metarecordnext_edge_id-memorizzato-in-edgeref)).
 
+### Node delete + freelist reuse flow (since 2026-06-03)
+
+```
+main.cpp
+   │ g.delete_node(id)
+   ▼
+Graph::delete_node       (graph_core/graph.cpp)
+   │ lazy-load if id not in RAM (id < meta.next_id) else throw
+   │ erase from `nodes`, delete the pointer
+   ▼
+delete_node_from_disk    (graph_core/io/graph_io.cpp)
+   │ read NodeIndex + RelationNodeList for `id`
+   │ push NodeRecord region       → db/freelist/nodes_<size>.dat
+   │ push RelationNodeList region → db/freelist/rel_<size>.dat
+   │ push each edge chunk         → db/freelist/edges_<size>.dat
+   │ (NOT done yet: tombstone nodes.idx, update meta, drop inbound edges — BUG-016)
+
+g.insert(value)          ← reuse path (primitives only)
+   │ pop_free_offset(db/freelist/nodes_<size>.dat)
+   │ if a freed slot exists:
+   │     write_node_in_freed_slot  → NodeRecord + NodeIndex written in place
+   │     recycle id; meta.node_count++ (meta.next_id NOT bumped)
+   │ else: append path (write_node + next_id++)
+```
+
+Push (`delete_node`) and pop (`insert`) are O(1); each bin holds one fixed size so a pop is always an exact fit. `update_node_edges`' orphaned regions are not pushed here yet. See the [freelist design decision](../legacy/design_decisions.md#2026-06-03--freelist-a-bin-segregati-per-dimensione-esatta--cancellazione-nodo) and [BUG-016](../legacy/known_bugs.md#2026-06-03--bug-016-delete_node-prototipo-non-aggiorna-idx-contatori-meta-archi-entranti-complex).
+
 ### Read-back flow
 
 ```
@@ -179,3 +208,4 @@ main.cpp
 - [Append-only data files, truncated meta](../legacy/design_decisions.md#2026-05-26--append-only-data-files-truncated-meta) — file open modes.
 - [Edge persistence: append + obsolete + in-place index patch](../legacy/design_decisions.md#2026-05-30--edge-persistence-append--obsolete--in-place-index-patch) — how `add_edge` persists since 2026-05-30, and the exception that `nodes.idx` is no longer purely append-only.
 - [Storage sidecar JSON per nodi COMPLEX](../legacy/design_decisions.md#2026-05-26--storage-sidecar-json-per-nodi-complex) — why COMPLEX records put their JSON payload in `attributes/` rather than inline.
+- [Freelist a bin segregati per dimensione esatta + cancellazione nodo](../legacy/design_decisions.md#2026-06-03--freelist-a-bin-segregati-per-dimensione-esatta--cancellazione-nodo) — how `delete_node` reclaims space and `insert` reuses freed slots.

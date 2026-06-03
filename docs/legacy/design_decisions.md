@@ -6,14 +6,15 @@
 |---|---|
 | Tipo | legacy-decisions |
 | Lingua | en |
-| Ultimo aggiornamento | 2026-06-02 |
-| Commit di riferimento | 309d3f9 |
+| Ultimo aggiornamento | 2026-06-03 |
+| Commit di riferimento | ca567e4 |
 | Mirror | — |
 
 ---
 
 ## Indice
 
+- [2026-06-03 — Freelist a bin segregati per dimensione esatta + cancellazione nodo](#2026-06-03--freelist-a-bin-segregati-per-dimensione-esatta--cancellazione-nodo)
 - [2026-06-02 — Id arco globale: sorgente in `MetaRecord.next_edge_id`, memorizzato in `EdgeRef`](#2026-06-02--id-arco-globale-sorgente-in-metarecordnext_edge_id-memorizzato-in-edgeref)
 - [2026-05-30 — Edge persistence: append + obsolete + in-place index patch](#2026-05-30--edge-persistence-append--obsolete--in-place-index-patch)
 - [2026-05-26 — Storage sidecar JSON per nodi COMPLEX](#2026-05-26--storage-sidecar-json-per-nodi-complex)
@@ -25,6 +26,28 @@
 - [2026-05-26 — Single-open append su nodes.dat](#2026-05-26--single-open-append-su-nodesdat)
 - [2026-05-26 — POD packed e fragilità ABI](#2026-05-26--pod-packed-e-fragilità-abi)
 - [2026-05-26 — Hash table standalone in C (non linkata)](#2026-05-26--hash-table-standalone-in-c-non-linkata)
+
+---
+
+### 2026-06-03 — Freelist a bin segregati per dimensione esatta + cancellazione nodo
+
+- **Stato:** active (prototipo — le parti non ancora cablate sono tracciate in [BUG-016](known_bugs.md#2026-06-03--bug-016-delete_node-prototipo-non-aggiorna-idx-contatori-meta-archi-entranti-complex))
+- **Contesto:** Dal 2026-05-30 ogni `add_edge` orfanizza la vecchia `RelationNodeList` e i vecchi chunk di edge, e il DB cresce monotono (vedi [Edge persistence](#2026-05-30--edge-persistence-append--obsolete--in-place-index-patch)). Mancavano due cose: (a) una cancellazione di nodo, e (b) il meccanismo di reclamo dello spazio orfano promesso da quel design. La vecchia POD `FreeRecord` (un solo `uint64_t offset`) e `MetaRecord.free_count` erano placeholder mai usati: un solo offset senza la **dimensione** della regione non permette di riusare un buco in sicurezza.
+- **Decisione:** Freelist persistente a **bin segregati per dimensione esatta**: un file per ogni size distinta di regione libera, sotto `db/freelist/<prefix>_<size>.dat`, con `prefix ∈ {nodes, rel, edges}`. La size è codificata nel nome del file, quindi:
+  - **push** (su delete/orphan) = append di un record in fondo al bin giusto → O(1);
+  - **pop** (su insert/reuse) = legge l'ultimo record e tronca il file di un record (`resize_file`) → O(1), LIFO.
+  Ogni record di un bin ha la stessa size, quindi un pop è **sempre un fit esatto**: niente scan, niente rewrite del file, niente byte sprecati. Tre nuove POD sostituiscono `FreeRecord`: `NodeFreeOffset {idx, offset, size}` (porta anche l'id riusabile dello slot in `nodes.idx`), `RelationNodeListFreeOffset {offset, size}`, `BatchOfEdgesFreeOffset {idx, offset, size}` (un intero chunk di edge contigui, `idx` = id del primo arco del batch). `Graph::delete_node` spinge le tre regioni del nodo sui bin via `write_free_offset` + `freelist_bin_path`; `Graph::insert` — **solo per i primitivi a size fissa**, mai per COMPLEX — prova un `pop_free_offset` sul bin `nodes_<size>` e, se trova un buco, riusa id e regione via `write_node_in_freed_slot` invece di appendere (`next_id` non avanza, `node_count` sì).
+- **Alternative considerate:**
+  - *Singola freelist flat (`FreeRecord`, un solo offset) con first-fit*: scartata — senza size ogni reuse dovrebbe scansionare e rischierebbe fit parziali con frammentazione interna.
+  - *Freelist unica con `(offset, size)` e best-fit*: scartata per ora — best-fit richiede ordinamento/scan O(n); i bin per size danno fit esatto in O(1), al costo di molti file piccoli.
+  - *Mark-and-sweep / compaction periodica*: rimandata — richiede riscrivere e re-indicizzare i file interi.
+- **Conseguenze:**
+  - Nuova sottocartella `db/freelist/` con un file per classe di size (creata on-demand da `write_free_offset`). Tanti file piccoli, uno per size class.
+  - LIFO: l'ultima regione liberata di una data size è la prima riusata. Località temporale, ma nessuna garanzia di compattazione.
+  - `delete_node` è un **prototipo**: registra le regioni orfane sui bin ma NON tombstona lo slot in `nodes.idx`, NON aggiorna i contatori `meta` (`node_count`/`free_count` → `meta` resta `const &`), NON rimuove gli archi entranti da altri nodi (vicini dangling), NON gestisce la size variabile del payload COMPLEX (`node_record_payload_size` per COMPLEX ritorna solo `sizeof(ComplexHeader)`). Vedi [BUG-016](known_bugs.md#2026-06-03--bug-016-delete_node-prototipo-non-aggiorna-idx-contatori-meta-archi-entranti-complex).
+  - `update_node_edges` continua a **solo loggare** le regioni orfane: non le spinge ancora sui bin. Il leak su `add_edge` resta finché non viene cablato sullo stesso `write_free_offset` (TODO in `graph_io.cpp`).
+  - `FreeRecord` rimossa dal POD layout (vedi [API change](api_changes.md#2026-06-03--freerecord-rimossa-sostituita-da-tre-pod-free-offset)). I riferimenti "FreeRecord / free_count riservati" nelle decisioni precedenti ([Append-only](#2026-05-26--append-only-data-files-truncated-meta), [Edge persistence](#2026-05-30--edge-persistence-append--obsolete--in-place-index-patch)) vanno letti come superati da questa.
+- **Riferimenti:** commit `ca567e4`. `graph_core/struct/pod_struct.h:182,196,209` (le tre POD), `graph_core/io/graph_io.h:321` (`freelist_bin_path`), `:333` (`write_free_offset`), `:355` (`pop_free_offset`), `:190` (`write_node_in_freed_slot`), `graph_core/io/graph_io.cpp:380` (`delete_node_from_disk`), `graph_core/graph.cpp:163` (`Graph::delete_node`), `graph_core/graph.h:43` (reuse path di `insert`), `graph_core/struct/type_registry.cpp` (`node_record_payload_size`).
 
 ---
 
@@ -53,7 +76,7 @@
 - **Decisione:** Strategia "append + obsolete + in-place index patch" per ogni `add_edge`:
   1. Mutare prima `node->neighborgs[type][end]` in RAM. La funzione di persistenza opera sullo stato finale.
   2. Leggere `NodeIndex` corrente + `RelationNodeList` corrente per identificare le regioni che diventeranno orfane (la RelationNodeList stessa in `nodes.dat`, più i chunk per ciascuna relazione in `edges.dat`).
-  3. Loggare le regioni orfane su `graph_io.log` come placeholder. **La freelist persistente non è implementata** — `FreeRecord` e `MetaRecord.free_count` esistono come POD/campo ma non c'è ancora `freelist.dat` né i percorsi di read/write. Lo spazio orfanato resta come byte morti finché la freelist non arriverà.
+  3. Loggare le regioni orfane su `graph_io.log` come placeholder. **La freelist persistente non era implementata** — `FreeRecord` e `MetaRecord.free_count` esistevano come POD/campo ma non c'erano `freelist.dat` né i percorsi di read/write. Lo spazio orfanato restava byte morti. *(Aggiornamento 2026-06-03: la freelist esiste ora come bin segregati per size sotto `db/freelist/` e `FreeRecord` è stata rimossa — vedi [Freelist a bin segregati](#2026-06-03--freelist-a-bin-segregati-per-dimensione-esatta--cancellazione-nodo). `update_node_edges` però continua a solo loggare le regioni orfane: non le spinge ancora sui bin, quindi il leak su `add_edge` resta.)*
   4. Appendere a `nodes.dat` la nuova `RelationNodeList` POD (16 byte: `type_count` + `batch_size`) e poi, per ogni relazione, appendere il chunk di edge in `edges.dat` (fresh contiguous block) seguito dalla entry della tail in `nodes.dat`. Niente edge "vecchio" viene riusato.
   5. Patcharare in-place `NodeIndex.relation_offset` in `nodes.idx`. È l'**unica scrittura in-place** del sistema: tutti gli altri file restano append-only. `nodes.idx` resta a record fissi da 25 byte, quindi `seekp(node_id * sizeof(NodeIndex) + offsetof(NodeIndex, relation_offset))` è ben definito; aperto con `std::ios::binary | std::ios::in | std::ios::out` (non `app`, perché su Windows `seekp` in app mode viene ignorato).
 - **Alternative considerate:**
@@ -167,7 +190,7 @@
 - **Alternative considerate:**
   - *In-place updates*: richiederebbe un freelist e records di lunghezza variabile gestiti con cura. Rimandato.
 - **Conseguenze:**
-  - Il file system cresce monotono finché non si introducono cancellazioni. `MetaRecord.free_count` e `FreeRecord` sono già definiti per quel futuro.
+  - Il file system cresce monotono finché non si introducono cancellazioni. `MetaRecord.free_count` e `FreeRecord` erano definiti per quel futuro. *(Aggiornamento 2026-06-03: arrivata `Graph::delete_node` + freelist a bin segregati; `FreeRecord` rimossa e sostituita da tre POD free-offset — vedi [Freelist a bin segregati](#2026-06-03--freelist-a-bin-segregati-per-dimensione-esatta--cancellazione-nodo).)*
   - Nessuna ricostruzione/compaction è prevista al momento.
   - I bug di scrittura non sono recuperabili: un record corrotto resta nel file.
 - **Riferimenti:** `graph_core/io/graph_io.h:46`, `graph_core/io/graph_io.cpp:74`.
@@ -193,7 +216,7 @@
 
 - **Stato:** active
 - **Contesto:** I record su disco devono avere offset di campo prevedibili byte-a-byte, indipendentemente dall'ABI del compilatore.
-- **Decisione:** Tutti i POD persistiti (`NodeIndex`, `NodeRecord<T>`, `RelationNodeList`, `Edge`, `MetaRecord`, `FreeRecord`) sono avvolti in `#pragma pack(push, 1)` / `#pragma pack(pop)`. Le scritture passano per `write_pod` che `static_assert`a `is_trivially_copyable_v<T>` e scrive `sizeof(T)` byte raw.
+- **Decisione:** Tutti i POD persistiti (`NodeIndex`, `NodeRecord<T>`, `RelationNodeList`, `Edge`, `MetaRecord`, e dal 2026-06-03 `NodeFreeOffset` / `RelationNodeListFreeOffset` / `BatchOfEdgesFreeOffset`; `FreeRecord` rimossa) sono avvolti in `#pragma pack(push, 1)` / `#pragma pack(pop)`. Le scritture passano per `write_pod` che `static_assert`a `is_trivially_copyable_v<T>` e scrive `sizeof(T)` byte raw.
 - **Alternative considerate:**
   - *Padding "naturale" + commenti*: fragile; ogni compilatore poteva scegliere padding diverso.
   - *Serializzazione campo-per-campo*: più sicura ma verbosa, e cancellerebbe il vantaggio della copia raw.

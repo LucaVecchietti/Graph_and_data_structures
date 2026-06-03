@@ -6,8 +6,8 @@
 |---|---|
 | Tipo | module |
 | Lingua | en |
-| Ultimo aggiornamento | 2026-06-02 |
-| Commit di riferimento | 309d3f9 |
+| Ultimo aggiornamento | 2026-06-03 |
+| Commit di riferimento | ca567e4 |
 | Mirror | — |
 
 ---
@@ -26,6 +26,10 @@ db/
 ├── nodes.idx                             array of NodeIndex records (appended on insert)
 ├── nodes.dat                             NodeRecord<T> | ComplexHeader+strings + RelationNodeList (appended on insert)
 ├── edges.dat                             Edge records (appended on insert)
+├── freelist/                             size-segregated free-offset bins (created on first delete)
+│   ├── nodes_{size}.dat                  NodeFreeOffset records, one bin per NodeRecord size
+│   ├── rel_{size}.dat                    RelationNodeListFreeOffset records, one bin per region size
+│   └── edges_{size}.dat                  BatchOfEdgesFreeOffset records, one bin per chunk size
 └── attributes/                           COMPLEX sidecars (created on first COMPLEX node)
     ├── attributes_meta.dat               JsonMeta (truncated + rewritten on every COMPLEX write)
     └── {prog_number}_{type_label}.json   JSON attributes payload per COMPLEX node
@@ -43,7 +47,8 @@ The `attributes/` subtree only exists once at least one COMPLEX node has been wr
 - **Fixed-width `NodeIndex`** — allows O(1) lookup by id via `seekg(id * sizeof(NodeIndex))` in `nodes.idx`. Also enables the in-place patch above.
 - **Type tag inside `NodeIndex`** — lets `read_node` dispatch to the right `read_typed_node<T>` without touching `nodes.dat`.
 - **Edges stored separately** — `edges.dat` holds the flat list of all edges; each `RelationNodeList` tail entry stores `(name, edge_offset, edge_count)` pointing into it.
-- **Edge updates: append + obsolete** — `add_edge` rewrites the affected node's `RelationNodeList` and all its edge chunks at fresh offsets, then patches `NodeIndex.relation_offset`. The old regions become orphaned bytes. A persistent freelist (`FreeRecord` POD + `MetaRecord.free_count` already reserved, no file yet) is the planned reclaim mechanism. See [Edge persistence](../legacy/design_decisions.md#2026-05-30--edge-persistence-append--obsolete--in-place-index-patch).
+- **Edge updates: append + obsolete** — `add_edge` rewrites the affected node's `RelationNodeList` and all its edge chunks at fresh offsets, then patches `NodeIndex.relation_offset`. The old regions become orphaned bytes. `update_node_edges` still only **logs** them (it is not yet wired to the freelist), so `add_edge` continues to leak. See [Edge persistence](../legacy/design_decisions.md#2026-05-30--edge-persistence-append--obsolete--in-place-index-patch).
+- **Freelist: size-segregated bins (since 2026-06-03)** — `db/freelist/<prefix>_<size>.dat`, one bin file per distinct free-region size. Push (`delete_node`) appends a free-offset record; pop (`insert` reuse path) reads the last record and truncates one record — both O(1), and a pop is always an exact fit. `delete_node` populates the bins; `insert` reuses a freed `nodes` slot for fixed-size primitives. `FreeRecord` was removed in favour of three sized POD records (`NodeFreeOffset` / `RelationNodeListFreeOffset` / `BatchOfEdgesFreeOffset`). `MetaRecord.free_count` / `free_edge_count` are still unused (`delete_node` does not update meta — [BUG-016](../legacy/known_bugs.md#2026-06-03--bug-016-delete_node-prototipo-non-aggiorna-idx-contatori-meta-archi-entranti-complex)). See [Freelist a bin segregati](../legacy/design_decisions.md#2026-06-03--freelist-a-bin-segregati-per-dimensione-esatta--cancellazione-nodo).
 - **COMPLEX payload stored out-of-line** — for `NodeType::COMPLEX`, the record in `nodes.dat` carries only the header + the labels; the actual JSON attributes live in `attributes/{prog_number}_{type_label}.json`, named via the `JsonMeta.prog_number` counter.
 
 See [Append-only data files, truncated meta](../legacy/design_decisions.md#2026-05-26--append-only-data-files-truncated-meta), [Edge persistence](../legacy/design_decisions.md#2026-05-30--edge-persistence-append--obsolete--in-place-index-patch) and [Storage sidecar JSON per nodi COMPLEX](../legacy/design_decisions.md#2026-05-26--storage-sidecar-json-per-nodi-complex).
@@ -121,6 +126,18 @@ offset  size  field
 ```
 
 Edges for a given `(node, relation)` are stored consecutively starting at `RelationNodeList.tail.edge_offset` for `edge_count` entries. When `add_edge` modifies a `(node, relation)`, a fresh contiguous chunk is appended at end-of-file and the new entry in the rewritten `RelationNodeList` points there — the old chunk becomes orphaned, so `edges.dat` grows monotonically with every `add_edge`. Since 2026-06-02 each `Edge.id` is globally unique and stable: it is assigned once from `MetaRecord.next_edge_id` and preserved across the full-node rewrites (an edge read back from disk keeps its id, so re-saving it does not change it). See [BUG-002 fixed](../legacy/known_bugs.md#2026-05-26--bug-002-edgeid-non-globale-tra-nodi).
+
+### `freelist/<prefix>_<size>.dat`
+
+Size-segregated free-offset bins, created lazily on the first `delete_node` (via `write_free_offset`, which `create_directories` on `db/freelist/`). One file per `(prefix, size)` pair; every record in a given file is the same fixed-size POD, so the file is a flat array. Bins are LIFO: push = append one record, pop = read the last record + `resize_file` down by one record.
+
+| Prefix | Record POD | Region reclaimed |
+|---|---|---|
+| `nodes` | `NodeFreeOffset` (24 B: `idx`, `offset`, `size`) | a freed `NodeRecord` region in `nodes.dat` + its reusable id slot in `nodes.idx`. `size ∈ {1,4,8}` for the current primitives. |
+| `rel` | `RelationNodeListFreeOffset` (16 B: `offset`, `size`) | a freed `RelationNodeList` region (header + tail) in `nodes.dat`. |
+| `edges` | `BatchOfEdgesFreeOffset` (24 B: `idx`, `offset`, `size`) | a freed contiguous chunk of `Edge` records in `edges.dat` (`size = edge_count * 32`). |
+
+The `<size>` in the filename is the byte size of the free region; it makes a pop an exact fit with no scan. Only `delete_node` writes these bins today; `insert` reads only the `nodes` bins (primitives). `update_node_edges`' orphaned regions are **not** yet pushed here. See the [freelist design decision](../legacy/design_decisions.md#2026-06-03--freelist-a-bin-segregati-per-dimensione-esatta--cancellazione-nodo).
 
 ### `attributes/attributes_meta.dat`
 
@@ -203,6 +220,9 @@ The exact filename **must** match the `json_file_path` string stored in the on-d
 
 ## Voci legacy collegate
 
+- [Freelist a bin segregati per dimensione esatta + cancellazione nodo](../legacy/design_decisions.md#2026-06-03--freelist-a-bin-segregati-per-dimensione-esatta--cancellazione-nodo)
+- [API — FreeRecord rimossa, tre POD free-offset](../legacy/api_changes.md#2026-06-03--freerecord-rimossa-sostituita-da-tre-pod-free-offset)
+- [BUG-016 — delete_node prototipo incompleto](../legacy/known_bugs.md#2026-06-03--bug-016-delete_node-prototipo-non-aggiorna-idx-contatori-meta-archi-entranti-complex)
 - [Edge persistence: append + obsolete + in-place index patch](../legacy/design_decisions.md#2026-05-30--edge-persistence-append--obsolete--in-place-index-patch)
 - [Storage sidecar JSON per nodi COMPLEX](../legacy/design_decisions.md#2026-05-26--storage-sidecar-json-per-nodi-complex)
 - [Introduzione tag NodeType::COMPLEX + ComplexRecord (WIP)](../legacy/design_decisions.md#2026-05-26--introduzione-tag-nodetypecomplex--complexrecord-wip)
@@ -222,7 +242,7 @@ The exact filename **must** match the `json_file_path` string stored in the on-d
 ## Riferimenti
 
 - `graph_core/struct/pod_struct.h:16` — `NodeType` enum (incl. `COMPLEX = 255`).
-- `graph_core/struct/pod_struct.h:40-149` — POD layouts for `NodeIndex`, `NodeRecord`, `RelationNodeList`, `Edge`, `MetaRecord`, `FreeRecord`.
+- `graph_core/struct/pod_struct.h:40-220` — POD layouts for `NodeIndex`, `NodeRecord`, `RelationNodeList`, `Edge`, `MetaRecord`, `ComplexHeader`, `JsonMeta`, and the freelist `NodeFreeOffset` / `RelationNodeListFreeOffset` / `BatchOfEdgesFreeOffset` (`FreeRecord` removed 2026-06-03).
 - `graph_core/struct/pod_struct.h:136` — `MetaRecord` (now 48 bytes: 3 node + 3 edge counters).
 - `graph_core/struct/domain_struct.h:24` — `EdgeRef { id, weight, neighbor }` (RAM-side edge, source of `Edge.id`).
 - `graph_core/graph.cpp:57` — `add_edge` (assigns edge id, bumps `next_edge_id`/`edge_count`).
@@ -241,3 +261,6 @@ The exact filename **must** match the `json_file_path` string stored in the on-d
 - `graph_core/io/graph_io.cpp:247` — `update_node_edges` (rewrites RelationNodeList + edge chunks at fresh offsets, patches `NodeIndex.relation_offset` in place).
 - `graph_core/odt/node_odt.cpp:27` — `node_to_relation_list` (now computes `batch_size`).
 - `graph_core/io/io_utils.cpp:4` — `write_string` (length-prefixed).
+- `graph_core/struct/pod_struct.h:182,196,209` — `NodeFreeOffset`, `RelationNodeListFreeOffset`, `BatchOfEdgesFreeOffset` (freelist bin records).
+- `graph_core/io/graph_io.h:321,333,355` — `freelist_bin_path`, `write_free_offset`, `pop_free_offset` (bin path + push/pop).
+- `graph_core/io/graph_io.cpp:380` — `delete_node_from_disk` (pushes the node's regions onto the bins).

@@ -6,14 +6,15 @@
 |---|---|
 | Tipo | legacy-bugs |
 | Lingua | en |
-| Ultimo aggiornamento | 2026-06-02 |
-| Commit di riferimento | 309d3f9 |
+| Ultimo aggiornamento | 2026-06-03 |
+| Commit di riferimento | ca567e4 |
 | Mirror | — |
 
 ---
 
 ## Indice
 
+- [2026-06-03 — BUG-016: `delete_node` prototipo non aggiorna idx, contatori meta, archi entranti, COMPLEX](#2026-06-03--bug-016-delete_node-prototipo-non-aggiorna-idx-contatori-meta-archi-entranti-complex)
 - [2026-05-30 — BUG-015: `Graph::insert` chiama `std::to_string` su `newNode->data`, incompatibile con `ComplexRecord`](#2026-05-30--bug-015-graphinsert-chiama-stdto_string-su-newnode-data-incompatibile-con-complexrecord)
 - [2026-05-26 — BUG-014: `prog_number` mai incrementato/persistito dopo write COMPLEX](#2026-05-26--bug-014-prog_number-mai-incrementatopersistito-dopo-write-complex)
 - [2026-05-26 — BUG-013: path del file JSON sidecar incoerente tra `complex_node_to_record` e `write_complex`](#2026-05-26--bug-013-path-del-file-json-sidecar-incoerente-tra-complex_node_to_record-e-write_complex)
@@ -29,6 +30,20 @@
 - [2026-05-26 — BUG-003: `reconstruct_neighbors` non implementata](#2026-05-26--bug-003-reconstruct_neighbors-non-implementata)
 - [2026-05-26 — BUG-002: `Edge.id` non globale tra nodi](#2026-05-26--bug-002-edgeid-non-globale-tra-nodi)
 - [2026-05-26 — BUG-001: `add_edge` non persiste su disco](#2026-05-26--bug-001-add_edge-non-persiste-su-disco)
+
+---
+
+### 2026-06-03 — BUG-016: `delete_node` prototipo non aggiorna idx, contatori meta, archi entranti, COMPLEX
+
+- **Stato:** open
+- **Sintomo:** `Graph::delete_node` + `delete_node_from_disk` (`graph_core/graph.cpp:163`, `graph_core/io/graph_io.cpp:380`) liberano lo spazio del nodo sulla freelist, ma la cancellazione è parziale:
+  1. lo slot del nodo in `nodes.idx` non è tombstonato: l'entry resta e punta a byte ormai morti. Una futura `read_node(node_id)` rileggerebbe spazzatura (o un record già riscritto da un reuse) finché lo slot non viene riusato via `pop_free_offset`;
+  2. i contatori `meta` non sono aggiornati (`node_count` non decrementa, `free_count` / `free_edge_count` non incrementano) — per questo `delete_node_from_disk` prende ancora `meta` per `const &` e non chiama `write_meta`;
+  3. gli archi **entranti** da altri nodi che puntano a `node_id` non vengono rimossi: restano in `nodes.dat`/`edges.dat` come vicini dangling (la cancellazione tocca solo l'adiacenza **uscente** del nodo);
+  4. il payload **COMPLEX** a size variabile non è gestito: `node_record_payload_size` per COMPLEX ritorna solo `sizeof(ComplexHeader)`, quindi la regione spinta sul bin `nodes` sarebbe sotto-dimensionata e il file sidecar JSON non viene rimosso.
+- **Root cause:** Implementazione volutamente a step: il commit introduce il lato push del reclamo (freelist) e la rimozione RAM, lasciando integrazione meta / tombstoning idx / cleanup archi entranti / COMPLEX a un passo successivo. I TODO sono annotati in coda a `Graph::delete_node` e a `delete_node_from_disk`.
+- **Fix:** n/a (open). Step previsti: tombstonare/azzerare lo slot `nodes.idx` (o un flag in `NodeIndex.type_id`), aggiornare `meta` (`node_count--`, `free_count`/`free_edge_count++`) e `write_meta`, scansionare/rimuovere gli archi entranti, e calcolare la size reale del record COMPLEX (header + lunghezze stringhe) prima di spingerlo sul bin + cancellare il sidecar.
+- **Regression guard:** nessuno (nessuna test suite). La Phase 3 di `main.cpp` esercita solo il caso felice (delete di un `int` + reuse dello slot via `insert`), confronto visuale su `graph.log` / `db/freelist/`.
 
 ---
 

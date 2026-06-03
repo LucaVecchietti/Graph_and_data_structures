@@ -6,14 +6,19 @@
 |---|---|
 | Tipo | legacy-api |
 | Lingua | en |
-| Ultimo aggiornamento | 2026-06-02 |
-| Commit di riferimento | 309d3f9 |
+| Ultimo aggiornamento | 2026-06-03 |
+| Commit di riferimento | ca567e4 |
 | Mirror | — |
 
 ---
 
 ## Indice
 
+- [2026-06-03 — `FreeRecord` rimossa, sostituita da tre POD free-offset](#2026-06-03--freerecord-rimossa-sostituita-da-tre-pod-free-offset)
+- [2026-06-03 — Nuova `Graph::delete_node(int)`](#2026-06-03--nuova-graphdelete_nodeint)
+- [2026-06-03 — `Graph::insert<T>`: aggiunto il reuse path via freelist](#2026-06-03--graphinsertt-aggiunto-il-reuse-path-via-freelist)
+- [2026-06-03 — Nuove funzioni I/O freelist + `delete_node_from_disk`](#2026-06-03--nuove-funzioni-io-freelist--delete_node_from_disk)
+- [2026-06-03 — Nuovo `node_record_payload_size` + TU `type_registry.cpp`](#2026-06-03--nuovo-node_record_payload_size--tu-type_registrycpp)
 - [2026-06-02 — `MetaRecord`: aggiunti i campi `edge_count`, `next_edge_id`, `free_edge_count`](#2026-06-02--metarecord-aggiunti-i-campi-edge_count-next_edge_id-free_edge_count)
 - [2026-06-02 — `BaseNode::neighborgs`: da `pair<int, BaseNode*>` a `EdgeRef`](#2026-06-02--basenodeneighborgs-da-pairint-basenode-a-edgeref)
 - [2026-05-30 — `Graph::add_edge`: persistenza su disco via `update_node_edges`](#2026-05-30--graphadd_edge-persistenza-su-disco-via-update_node_edges)
@@ -30,6 +35,135 @@
 > Nota: il progetto non ha ancora consumatori esterni, quindi "API pubblica" qui significa: classe `Graph`, POD persistiti su disco (`pod_struct.h`), funzioni esposte nei header pubblici (`io/graph_io.h`, `io/io_utils.h`, `odt/*.h`, `struct/*.h`).
 >
 > Le modifiche ai POD persistiti sono particolarmente sensibili perché rompono il formato su disco — andranno tracciate qui anche se prive di consumatori esterni.
+
+---
+
+### 2026-06-03 — `FreeRecord` rimossa, sostituita da tre POD free-offset
+
+- **Motivazione:** `FreeRecord` portava solo un `uint64_t offset` — niente size, niente id: insufficiente per riusare in sicurezza un buco di dimensione nota o per riassegnare un id. La nuova freelist a bin segregati per size (vedi [decisione](design_decisions.md#2026-06-03--freelist-a-bin-segregati-per-dimensione-esatta--cancellazione-nodo)) richiede `(idx?, offset, size)` per regione.
+- **Before:**
+  ```cpp
+  #pragma pack(push, 1)
+  struct FreeRecord {
+      uint64_t offset; // free offset in nodes.dat
+  };
+  #pragma pack(pop)
+  ```
+- **After:**
+  ```cpp
+  // pod_struct.h — tre POD distinte, una per tipo di regione reclamabile
+  #pragma pack(push, 1)
+  struct NodeFreeOffset {            // regione NodeRecord in nodes.dat + slot id riusabile in nodes.idx
+      uint64_t idx;    // id nodo riusabile
+      uint64_t offset; // inizio del NodeRecord orfanato
+      uint64_t size;   // byte della regione libera
+  };
+  struct RelationNodeListFreeOffset { // regione RelationNodeList (header + coda) in nodes.dat
+      uint64_t offset;
+      uint64_t size;   // = sizeof(RelationNodeList) + batch_size
+  };
+  struct BatchOfEdgesFreeOffset {     // chunk contiguo di Edge in edges.dat
+      uint64_t idx;    // id del primo arco del batch (id riusabile di partenza)
+      uint64_t offset;
+      uint64_t size;   // = edge_count * sizeof(Edge)
+  };
+  #pragma pack(pop)
+  ```
+- **Note di migrazione:** `FreeRecord` non era mai stata scritta su disco, quindi nessun `db/` esistente la contiene: la rimozione **non** è uno schema-break dei file dati. Le tre nuove POD sono scritte/lette dai template `write_free_offset` / `pop_free_offset` nei bin `db/freelist/<prefix>_<size>.dat`. `MetaRecord.free_count` / `free_edge_count` restano riservati (ancora mai scritti se non `0`): `delete_node_from_disk` non aggiorna i contatori (vedi [BUG-016](known_bugs.md#2026-06-03--bug-016-delete_node-prototipo-non-aggiorna-idx-contatori-meta-archi-entranti-complex)).
+- **Riferimenti:** commit `ca567e4`. `graph_core/struct/pod_struct.h:182,196,209`.
+
+---
+
+### 2026-06-03 — Nuova `Graph::delete_node(int)`
+
+- **Motivazione:** Prima non esisteva alcuna cancellazione di nodo. Insieme alla freelist, fornisce il lato "push" del reclamo dello spazio (vedi [decisione](design_decisions.md#2026-06-03--freelist-a-bin-segregati-per-dimensione-esatta--cancellazione-nodo)).
+- **Before:** assente.
+- **After:**
+  ```cpp
+  // graph.h:117
+  void delete_node(int node_id);
+  ```
+  Comportamento: se il nodo non è in RAM ma `node_id < meta.next_id`, lo lazy-carica via `read_node` (stesso pattern di `add_edge`); altrimenti throw `std::out_of_range`. Logga il numero di archi uscenti che verranno persi, rimuove il nodo da `nodes` e fa `delete` del puntatore, poi chiama `delete_node_from_disk(node_id, meta)` per spingere le regioni del nodo (NodeRecord, RelationNodeList, ogni chunk di edge) sui bin della freelist.
+- **Note di migrazione:** **Prototipo, non una cancellazione completa.** Limiti tracciati in [BUG-016](known_bugs.md#2026-06-03--bug-016-delete_node-prototipo-non-aggiorna-idx-contatori-meta-archi-entranti-complex): lo slot in `nodes.idx` non è tombstonato (l'entry punta ancora a byte morti), i contatori `meta` non sono aggiornati, gli archi **entranti** da altri nodi non sono rimossi (vicini dangling), il payload COMPLEX a size variabile non è gestito. Throw `std::runtime_error` se la rilettura del nodo da disco fallisce.
+- **Riferimenti:** commit `6774330`, `ca567e4`. `graph_core/graph.h:117` (decl), `graph_core/graph.cpp:163` (impl).
+
+---
+
+### 2026-06-03 — `Graph::insert<T>`: aggiunto il reuse path via freelist
+
+- **Motivazione:** Lato "pop" del reclamo: riusare uno slot/regione liberati da una `delete_node` precedente invece di appendere sempre in fondo.
+- **Before:**
+  ```cpp
+  // sempre append: id fresco e regione nuova in coda
+  nodes[meta.next_id] = newNode;
+  write_node(*newNode, meta);
+  meta.node_count++;
+  meta.next_id++;
+  ```
+- **After:**
+  ```cpp
+  // reuse path: solo per primitivi a size fissa (mai COMPLEX)
+  if constexpr (node_type_of_v<ValueType> != NodeType::COMPLEX) {
+      uint64_t needed = node_record_payload_size(node_type_of_v<ValueType>);
+      std::optional<NodeFreeOffset> slot = pop_free_offset<NodeFreeOffset>(freelist_bin_path("nodes", needed));
+      if (slot) {
+          node_id = slot->idx;                                 // ricicla l'id liberato
+          nodes[node_id] = newNode;
+          write_node_in_freed_slot(*newNode, node_id, slot->offset);
+          meta.node_count++;                                   // next_id NON avanza
+          reused = true;
+      }
+  }
+  if (!reused) {                                               // append path invariato
+      node_id = meta.next_id;
+      nodes[node_id] = newNode;
+      write_node(*newNode, meta);
+      meta.node_count++;
+      meta.next_id++;
+  }
+  ```
+- **Note di migrazione:** La firma di `insert` è invariata. Cambia il comportamento osservabile: dopo una `delete_node`, una `insert` di un primitivo della **stessa size** riusa id e regione (il log riporta `(reused slot)`); `next_id` non avanza, `node_count` sì. Il `if constexpr` impedisce anche l'istanziazione di `write_node_in_freed_slot<ComplexRecord>` (fallirebbe lo `static_assert` di `node_to_record`). COMPLEX prende sempre l'append path. Il log su ramo COMPLEX usa `node_id` invece di `meta.next_id - 1`.
+- **Riferimenti:** commit `6774330`, `ca567e4`. `graph_core/graph.h:43`.
+
+---
+
+### 2026-06-03 — Nuove funzioni I/O freelist + `delete_node_from_disk`
+
+- **Motivazione:** Implementare push/pop sulla freelist a bin segregati per size e la cancellazione lato disco (vedi [decisione](design_decisions.md#2026-06-03--freelist-a-bin-segregati-per-dimensione-esatta--cancellazione-nodo)).
+- **Before:** assenti.
+- **After:**
+  ```cpp
+  // graph_io.h
+  std::filesystem::path freelist_bin_path(const std::string &prefix, uint64_t size); // inline
+  template <typename T> void               write_free_offset(const T &fo, const std::filesystem::path &p);
+  template <typename T> std::optional<T>   pop_free_offset(const std::filesystem::path &p);
+  template <typename T> void               write_node_in_freed_slot(const Node<T> &node, uint64_t node_id, uint64_t record_offset);
+  void                                     delete_node_from_disk(uint64_t node_id, const MetaRecord &meta);
+  ```
+  Comportamento:
+  - `freelist_bin_path` → `db/freelist/<prefix>_<size>.dat`.
+  - `write_free_offset` → append di un record (push); crea `db/freelist/` al primo uso.
+  - `pop_free_offset` → legge l'ultimo record e tronca il file di un record (pop LIFO, fit esatto); `std::nullopt` se il bin manca/è vuoto; throw se la `resize_file` fallisce.
+  - `write_node_in_freed_slot` → scrive il `NodeRecord<T>` **in place** alla regione liberata e il `NodeIndex` **in place** allo slot id liberato in `nodes.idx`; la `RelationNodeList` (vuota per un nodo fresco) è comunque **appesa** a fine `nodes.dat`.
+  - `delete_node_from_disk` → legge `NodeIndex` + `RelationNodeList` del nodo, calcola le regioni reclamabili e le spinge sui bin `nodes`/`rel`/`edges`. Per i chunk di edge legge il primo `Edge` per recuperare l'id di partenza del batch.
+- **Note di migrazione:** `write_free_offset` / `pop_free_offset` sono template generici sui tre POD free-offset, dichiarati una sola volta (niente decl per-tipo). `delete_node_from_disk` prende `const MetaRecord &meta` ma oggi **non lo usa** (`(void)meta;`) — riservato per quando aggiornerà i contatori. `update_node_edges` **non** è stata cablata su `write_free_offset`: continua a solo loggare le regioni orfane (il suo TODO ora rimanda a questo path). Tutte throw `std::runtime_error` se un file non si apre.
+- **Riferimenti:** commit `6774330`, `ca567e4`. `graph_core/io/graph_io.h:65,190,321,333,355`, `graph_core/io/graph_io.cpp:380`.
+
+---
+
+### 2026-06-03 — Nuovo `node_record_payload_size` + TU `type_registry.cpp`
+
+- **Motivazione:** Servire la size on-disk del payload di un nodo dato il suo `NodeType`, per scegliere il bin della freelist (`freelist_bin_path("nodes", size)`) sia in `delete_node_from_disk` (push) sia in `Graph::insert` (pop).
+- **Before:** `type_registry.h` era header-only (solo il template `node_type_of` / `node_type_of_v`); nessun `type_registry.cpp` nel build.
+- **After:**
+  ```cpp
+  // type_registry.h (dichiarazione)
+  size_t node_record_payload_size(NodeType type_id);
+  // type_registry.cpp (nuova TU, aggiunta a CMakeLists.txt)
+  //   INT→4, FLOAT→4, DOUBLE→8, CHAR→1, BOOL→1, COMPLEX→sizeof(ComplexHeader); default → throw
+  ```
+- **Note di migrazione:** La funzione è non-template e definita **out-of-line** in `type_registry.cpp` per avere una sola definizione nel programma (un corpo in header darebbe multiple-definition/ODR). `CMakeLists.txt` ora elenca `graph_core/struct/type_registry.cpp` tra i sorgenti di `graph_core`. **Limite noto:** per `NodeType::COMPLEX` ritorna solo `sizeof(ComplexHeader)`, non la size reale (header + due stringhe length-prefixed): chi deve reclamare un record COMPLEX deve calcolare le lunghezze a parte (vedi [BUG-016](known_bugs.md#2026-06-03--bug-016-delete_node-prototipo-non-aggiorna-idx-contatori-meta-archi-entranti-complex)). `NodeType::COMPLEX` non prende comunque mai il reuse path di `insert`.
+- **Riferimenti:** commit `6774330`, `ca567e4`. `graph_core/struct/type_registry.h:51`, `graph_core/struct/type_registry.cpp`, `CMakeLists.txt:13`.
 
 ---
 
