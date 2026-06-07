@@ -15,6 +15,7 @@ Graph::Graph(){
     else
     {
         load_meta();
+        build_in_edges(); // reconstruct the in-RAM reverse edge index from disk
     }
 } // Basic constructor
 
@@ -46,6 +47,14 @@ void Graph::load_meta()
     // This is necessary for maintaining the integrity of the graph across sessions.
 
     Graph::meta = read_meta();
+}
+
+void Graph::build_in_edges()
+{
+    // One O(N + E) scan of the persisted graph rebuilds the reverse index. From
+    // here it is kept in sync incrementally by add_edge / delete_node, so deletes
+    // resolve their inbound edges in O(deg_in) without re-scanning.
+    in_edges = build_inbound_index(meta.next_id);
 }
 
 // ---- Public Methods ----
@@ -150,6 +159,7 @@ void Graph::add_edge(int start, int end, std::string type, int weight)
     // truncated + rewritten so the counters survive a restart.
     if (is_new_edge)
     {
+        in_edges[end].insert(start); // reverse index: `start` now points at `end`
         meta.next_edge_id++;
         meta.edge_count++;
         write_meta(meta);
@@ -194,6 +204,76 @@ void Graph::delete_node(int node_id)
         edge_count += neighbors.size();
     }
     logger.info("Deleting node " + std::to_string(node_id) + " and its " + std::to_string(edge_count) + " edges.");
+
+    // --- Reverse index: this node's OUTBOUND edges vanish, so drop node_id from
+    //     the inbound set of every node it pointed at. Done while `node` is still
+    //     resident, before we free it below. ---
+    for (const auto &[rel_type, neighbors] : node->neighborgs)
+    {
+        for (const auto &[to_id, ref] : neighbors)
+        {
+            (void)ref;
+            auto it = in_edges.find(to_id);
+            if (it != in_edges.end()) it->second.erase(node_id);
+        }
+    }
+
+    // X's own outbound edges are reclaimed by delete_node_from_disk below, but that
+    // function only touches the node/free counters — account for the lost live edges
+    // here (edge_count was previously never decremented on delete).
+    meta.edge_count -= edge_count;
+
+    // --- Inbound cleanup: remove the edges that OTHER nodes aim at node_id. The
+    //     reverse index hands us those owners directly (O(deg_in)). For each owner
+    //     we erase node_id from its adjacency and re-persist via update_node_edges,
+    //     so no dangling neighbour survives a reload. ---
+    auto inbound_it = in_edges.find(node_id);
+    if (inbound_it != in_edges.end())
+    {
+        for (int owner_id : inbound_it->second)
+        {
+            if (owner_id == node_id) continue; // self-loop: reclaimed with node_id's own edges
+
+            BaseNode *owner = nullptr;
+            auto oit = nodes.find(owner_id);
+            if (oit != nodes.end())
+            {
+                owner = oit->second;
+            }
+            else
+            {
+                try
+                {
+                    owner = read_node(static_cast<uint64_t>(owner_id));
+                }
+                catch (const std::exception &e)
+                {
+                    Graph::logger.error("delete_node: could not load inbound owner " + std::to_string(owner_id) + ": " + e.what());
+                    continue;
+                }
+                nodes[owner_id] = owner;
+            }
+
+            // Erase node_id from every relation of the owner; drop relations left empty.
+            uint64_t removed = 0;
+            for (auto rel_it = owner->neighborgs.begin(); rel_it != owner->neighborgs.end();)
+            {
+                removed += rel_it->second.erase(node_id);
+                if (rel_it->second.empty())
+                    rel_it = owner->neighborgs.erase(rel_it);
+                else
+                    ++rel_it;
+            }
+
+            if (removed > 0)
+            {
+                update_node_edges(*owner, meta, static_cast<uint64_t>(owner_id));
+                meta.edge_count -= removed;
+                logger.info("delete_node: removed " + std::to_string(removed) + " inbound edge(s) " + std::to_string(owner_id) + " -> " + std::to_string(node_id));
+            }
+        }
+        in_edges.erase(node_id);
+    }
 
     // Remove from the in-memory map and free it — whether it was already resident
     // or was just lazy-loaded above. (The previous version leaked a just-loaded

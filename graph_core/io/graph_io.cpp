@@ -538,8 +538,49 @@ void delete_node_from_disk(uint64_t node_id, MetaRecord &meta)
     meta.free_count++;
     meta.free_edge_count += edge_chunk_free_offsets.size(); // one freelist record per orphaned chunk
 
-    // TODO(BUG-016 — remaining steps): inbound edges from OTHER nodes that point at node_id
-    // are still left dangling (only the node's OUTBOUND adjacency is reclaimed here), and the
-    // variable-width COMPLEX payload is not handled (record_size is header-only for COMPLEX,
-    // and its JSON sidecar is not removed).
+    // TODO(BUG-016 — remaining step): the variable-width COMPLEX payload is not handled here
+    // (record_size is header-only for COMPLEX, and its JSON sidecar is not removed). Inbound-edge
+    // cleanup now lives in Graph::delete_node, driven by the reverse index (build_inbound_index).
+}
+
+std::unordered_map<int, std::unordered_set<int>> build_inbound_index(uint64_t next_id)
+{
+    namespace fs = std::filesystem;
+    std::unordered_map<int, std::unordered_set<int>> in_edges;
+
+    std::ifstream idx_in(fs::path(DB_PATH) / "nodes.idx", std::ios::binary);
+    if (!idx_in) return in_edges; // no nodes persisted yet
+
+    std::ifstream dat_in(fs::path(DB_PATH) / "nodes.dat", std::ios::binary);
+    std::ifstream edges_in(fs::path(DB_PATH) / "edges.dat", std::ios::binary);
+
+    for (uint64_t id = 0; id < next_id; ++id)
+    {
+        idx_in.clear();
+        idx_in.seekg(static_cast<std::streamoff>(id * sizeof(NodeIndex)));
+        NodeIndex ni = read_node_index(idx_in);
+        if (!idx_in) break; // short / truncated index — stop defensively
+
+        if (ni.type_id == NodeType::TOMBSTONE) continue; // deleted slot: no live edges
+
+        // Follow only this LIVE node's relation chunks, so zeroed/freed edge
+        // regions are never read. from_node == id for every edge it owns.
+        dat_in.clear();
+        dat_in.seekg(static_cast<std::streamoff>(ni.relation_offset));
+        std::vector<RelationEntry> entries = read_relation_node_list(dat_in);
+
+        for (const auto &entry : entries)
+        {
+            edges_in.clear();
+            edges_in.seekg(static_cast<std::streamoff>(entry.edge_offset));
+            for (uint64_t i = 0; i < entry.edge_count; ++i)
+            {
+                Edge e = read_pod<Edge>(edges_in);
+                in_edges[static_cast<int>(e.to_node)].insert(static_cast<int>(e.from_node));
+            }
+        }
+    }
+
+    logger.info("build_inbound_index: built reverse index over " + std::to_string(in_edges.size()) + " target node(s).");
+    return in_edges;
 }

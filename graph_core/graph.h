@@ -22,12 +22,20 @@ class Graph
 private:
     std::unordered_map<int, BaseNode *> nodes; // Owns all nodes — responsible for their lifetime
 
+    // Inbound (reverse) edge index: to_id → set of node ids that have an edge
+    // pointing at to_id. Built at load (build_in_edges) and maintained
+    // incrementally by add_edge / delete_node. Lets delete_node find the nodes
+    // whose edges point at the deleted node in O(deg_in) instead of scanning all
+    // edges. In-RAM only — never persisted; rebuilt from disk on the next load.
+    std::unordered_map<int, std::unordered_set<int>> in_edges;
+
     MetaRecord meta; // Metadata for disk storage management
 
     Logger logger = Logger("graph.log", LogLevel::DEBUG); // Logger instance for debugging and info
 
     void init_meta();
     void load_meta();
+    void build_in_edges(); // populate in_edges from disk (called once at load)
 
 public:
     Graph();// Basic constructor

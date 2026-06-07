@@ -12,6 +12,8 @@
 #include <vector>
 #include <string>
 #include <optional>
+#include <unordered_map>
+#include <unordered_set>
 
 // Graph I/O header — defines functions for saving and loading the graph to/from disk in a binary format.
 
@@ -63,6 +65,16 @@ JsonMeta        read_json_attributes_meta();
 void            update_node_edges(BaseNode &node, const MetaRecord &meta, uint64_t node_id);
 
 void            delete_node_from_disk(uint64_t node_id, MetaRecord &meta);
+
+/**
+ * Builds the inbound (reverse) edge index by scanning every live node on disk:
+ * for each live node's outbound edge (from_node → to_node), records
+ * to_node → { from_node, ... }. Tombstoned slots are skipped and only live
+ * nodes' relation chunks are followed, so zeroed/freed edge regions are never
+ * mistaken for live edges. O(N + E). Used by Graph at load to answer
+ * "who points at X?" in O(deg_in) when deleting X.
+ */
+std::unordered_map<int, std::unordered_set<int>> build_inbound_index(uint64_t next_id);
 
 // NOTE: write_free_offset / read_free_offset are templates (see below), so they
 // work uniformly with NodeFreeOffset, RelationNodeListFreeOffset and
