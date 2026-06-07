@@ -59,10 +59,10 @@ public:
         bool reused = false;
 
         // Reuse path: try to pop a freed slot whose record size matches exactly.
-        // Only for fixed-size primitive payloads — COMPLEX has a variable on-disk
-        // size, so it can never exact-fit a bin and always takes the append path.
-        // (The if constexpr also keeps write_node_in_freed_slot<ComplexRecord>
-        // from ever being instantiated, which would fail node_to_record's assert.)
+        // The if constexpr dispatches the two writers (primitive vs COMPLEX) at
+        // compile time so each is only instantiated for the types it supports
+        // (write_node_in_freed_slot would fail node_to_record's assert for COMPLEX,
+        // and write_complex_in_freed_slot needs the ComplexRecord payload).
         if constexpr (node_type_of_v<ValueType> != NodeType::COMPLEX)
         {
             uint64_t needed = node_record_payload_size(node_type_of_v<ValueType>);
@@ -72,6 +72,23 @@ public:
                 node_id = slot->idx;            // recycle the freed id slot
                 nodes[node_id] = newNode;
                 write_node_in_freed_slot(*newNode, node_id, slot->offset);
+                meta.node_count++;              // next_id is NOT bumped — the id was reused
+                meta.free_count--;              // one fewer free node slot in the bins
+                reused = true;
+            }
+        }
+        else
+        {
+            // COMPLEX: size is fixed PER type_label length (sidecar prog_number is
+            // zero-padded to a fixed width), so the `complex_<size>` bins act as
+            // per-type size classes and a freed slot is an exact fit.
+            uint64_t needed = complex_record_on_disk_size(newNode->data.type_label.size());
+            std::optional<NodeFreeOffset> slot = pop_free_offset<NodeFreeOffset>(freelist_bin_path("complex", needed));
+            if (slot)
+            {
+                node_id = slot->idx;            // recycle the freed id slot
+                nodes[node_id] = newNode;
+                write_complex_in_freed_slot(*newNode, node_id, slot->offset);
                 meta.node_count++;              // next_id is NOT bumped — the id was reused
                 meta.free_count--;              // one fewer free node slot in the bins
                 reused = true;
@@ -96,6 +113,7 @@ public:
         if constexpr (node_type_of_v<ValueType> == NodeType::COMPLEX)
         {
             logger.info("Inserted node with ID " + std::to_string(node_id)
+                        + (reused ? " (reused slot)" : "")
                         + " of complex type \"" + newNode->data.type_label + "\"");
         }
         else

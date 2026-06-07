@@ -103,6 +103,29 @@ int main()
                      "and db/freelist/ for the bin files.\n";
     }
 
+    // ===== Phase 4: COMPLEX delete + reuse ================================
+    // Exercises:
+    //   - Graph::delete_node on a COMPLEX node (id 3): real record size taken
+    //     from the on-disk ComplexHeader -> db/freelist/complex_<size>.dat, the
+    //     JSON sidecar file removed, and its prog_number recycled onto the json
+    //     free list (db/freelist/json_prog.dat).
+    //   - Graph::insert<ComplexRecord> reuse path: same type_label "Athlete" ->
+    //     same size class -> exact-fit reuse of id 3, recycling prog_number 0 and
+    //     rewriting the record + sidecar in place (next_id stays 4).
+    std::cout << "\n=== Phase 4: COMPLEX delete + reuse ===\n";
+    {
+        Graph g; // next_id is still 4 after phases 1-3.
+
+        g.delete_node(3); // Athlete -> complex bin + recycled prog_number + removed sidecar
+
+        // Re-insert an Athlete: same size class -> pops the complex bin and the
+        // recycled prog_number 0, so the same sidecar filename is reborn with new JSON.
+        g.insert(ComplexRecord{ "Athlete", R"({"name":"Gatlin","age":42})" });
+
+        std::cout << "deleted COMPLEX node 3, re-inserted an Athlete — see graph.log for\n"
+                     "id/prog reuse, db/freelist/complex_*.dat and db/attributes/.\n";
+    }
+
     system("pause");
     return 0;
 }

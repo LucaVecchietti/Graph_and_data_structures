@@ -82,10 +82,35 @@ NodeRecord<ComplexHeader> complex_node_to_record(const Node<ComplexRecord> &node
         throw; // Rethrow the exception after logging
     }
 
-    // Construct the ComplexHeader.json_file_path based on the metadata and the type label of the node.
-    // The base path for JSON attributes files is defined in costants.h as JSON_ATTR_PATH and is used by the graph_io functions to write and read the JSON attributes of the complex nodes.
-    // std::to_string on prog_number is required: without it, "uint64_t + const char*" is pointer arithmetic, not string concatenation.
-    json_file_path = std::to_string(meta_json.prog_number) + "_" + node.data.type_label + ".json";
+    // Decide THIS node's prog_number. Prefer a recycled one from the json free list
+    // (a prog_number freed by a previous COMPLEX delete) so numbers stay dense and the
+    // counter does not grow unbounded. Only when none is available do we consume — and
+    // persist — a fresh value from the monotonic counter (BUG-014: previously the
+    // counter was read but never advanced/persisted, so every sidecar collided on 0).
+    // Reserve-before-persist: if the persist throws, the number is "consumed" but no
+    // two records can ever share it.
+    uint64_t prog;
+    std::optional<uint64_t> recycled = pop_free_offset<uint64_t>(json_freelist_path());
+    if (recycled)
+    {
+        prog = *recycled;
+    }
+    else
+    {
+        prog = meta_json.prog_number;
+        meta_json.prog_number = prog + 1;
+        write_json_attributes_meta(meta_json);
+    }
+
+    // Zero-pad prog_number to COMPLEX_PROG_DIGITS so the sidecar filename — and
+    // therefore json_file_path_size, and therefore the whole on-disk record size —
+    // has a FIXED width regardless of how many digits prog has. This makes a
+    // record's size a pure function of type_label length, so the exact-size
+    // freelist bins double as per-type size classes (see costants.h).
+    // num.size() <= 20 for any uint64, so the pad count is never negative.
+    std::string num = std::to_string(prog);
+    std::string padded = std::string(COMPLEX_PROG_DIGITS - num.size(), '0') + num;
+    json_file_path = padded + "_" + node.data.type_label + ".json";
 
     // Construct the ComplexHeader with the type label and JSON attributes
     ComplexHeader header;

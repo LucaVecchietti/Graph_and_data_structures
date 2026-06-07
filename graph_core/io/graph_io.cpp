@@ -52,7 +52,7 @@ void write_node_index(const uint64_t record_offset, const uint64_t relation_offs
  * json_file_path so the on-disk header is always self-consistent with the two
  * strings that follow it.
  */
-void write_complex(const ComplexRecord &record, const std::string &json_file_path, std::ofstream &dat_out)
+void write_complex(const ComplexRecord &record, const std::string &json_file_path, std::ostream &dat_out)
 {
     // 1. Build the POD header from the current string sizes and write it.
     //    These two uint64_t fields are technically redundant with the length
@@ -439,8 +439,50 @@ void delete_node_from_disk(uint64_t node_id, MetaRecord &meta)
 
     logger.debug("delete_node_from_disk: read " + std::to_string(relation_entries.size()) + " relation entries for node " + std::to_string(node_id));
 
-    // 3. Log the offsets and sizes of the regions to be orphaned by this deletion.
-    uint64_t record_size = node_record_payload_size(node_idx.type_id);
+    // 3. Determine the orphaned NodeRecord size and the freelist bin prefix.
+    //    Primitives have a fixed size from the type tag. COMPLEX is variable: its
+    //    real size is ComplexHeader + the two strings, read from the header here,
+    //    and it lands in the `complex_<size>` bins (per-type size classes). While
+    //    we have the header open we also reclaim the JSON sidecar: delete the file
+    //    and recycle its prog_number onto the json free list.
+    std::string node_bin_prefix = "nodes";
+    uint64_t record_size;
+    if (node_idx.type_id == NodeType::COMPLEX)
+    {
+        node_bin_prefix = "complex";
+        std::ifstream dat_in(std::filesystem::path(DB_PATH) / "nodes.dat", std::ios::binary);
+        if (!dat_in)
+        {
+            logger.error("delete_node_from_disk: failed to open nodes.dat to read COMPLEX header.");
+            throw std::runtime_error("delete_node_from_disk: failed to open nodes.dat to read COMPLEX header.");
+        }
+        dat_in.seekg(static_cast<std::streamoff>(node_idx.offset));
+        ComplexHeader h = read_pod<ComplexHeader>(dat_in);
+        std::string type_label = read_string(dat_in);            // advances past type_label
+        std::string json_file_path = read_string(dat_in);        // the sidecar filename
+        record_size = sizeof(ComplexHeader) + h.type_label_size + h.json_file_path_size;
+
+        // Reclaim the sidecar file and recycle its prog_number (the zero-padded
+        // leading digits of the filename) for the next COMPLEX insert.
+        std::error_code ec;
+        std::filesystem::remove(std::filesystem::path(JSON_ATTR_PATH) / json_file_path, ec);
+        if (ec)
+            logger.error("delete_node_from_disk: failed to remove JSON sidecar " + json_file_path + ": " + ec.message());
+        try
+        {
+            uint64_t prog = std::stoull(json_file_path.substr(0, COMPLEX_PROG_DIGITS));
+            write_free_offset<uint64_t>(prog, json_freelist_path());
+        }
+        catch (const std::exception &e)
+        {
+            logger.error("delete_node_from_disk: could not recycle prog_number from " + json_file_path + ": " + e.what());
+        }
+    }
+    else
+    {
+        record_size = node_record_payload_size(node_idx.type_id);
+    }
+
     logger.info("delete_node_from_disk: orphaning NodeRecord at offset "
                 + std::to_string(node_idx.offset)
                 + " of size " + std::to_string(record_size) + " bytes (nodes.dat)");
@@ -492,7 +534,7 @@ void delete_node_from_disk(uint64_t node_id, MetaRecord &meta)
     // 5. Push each free offset onto its EXACT-SIZE bin under db/freelist/.
     //    The bin is selected by the region size, so a later insert/update of the
     //    same size pops an exact fit in O(1) (see freelist_bin_path / pop_free_offset).
-    write_free_offset(record_free_offset, freelist_bin_path("nodes", record_free_offset.size));
+    write_free_offset(record_free_offset, freelist_bin_path(node_bin_prefix, record_free_offset.size));
     write_free_offset(relation_list_free_offset, freelist_bin_path("rel", relation_list_free_offset.size));
     for (const auto &edge_free_offset : edge_chunk_free_offsets)
     {
@@ -538,9 +580,9 @@ void delete_node_from_disk(uint64_t node_id, MetaRecord &meta)
     meta.free_count++;
     meta.free_edge_count += edge_chunk_free_offsets.size(); // one freelist record per orphaned chunk
 
-    // TODO(BUG-016 — remaining step): the variable-width COMPLEX payload is not handled here
-    // (record_size is header-only for COMPLEX, and its JSON sidecar is not removed). Inbound-edge
-    // cleanup now lives in Graph::delete_node, driven by the reverse index (build_inbound_index).
+    // COMPLEX is now fully handled above (real record size from the header, JSON sidecar
+    // removed + prog_number recycled, `complex_<size>` bins). Inbound-edge cleanup lives in
+    // Graph::delete_node, driven by the reverse index (build_inbound_index).
 }
 
 std::unordered_map<int, std::unordered_set<int>> build_inbound_index(uint64_t next_id)

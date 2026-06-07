@@ -38,7 +38,7 @@ void write_node_index(uint64_t record_offset, uint64_t relation_offset, NodeType
  * writes record.json_attributes into it as raw UTF-8.
  * Throws std::runtime_error if the sidecar file cannot be opened.
  */
-void write_complex(const ComplexRecord &record, const std::string &json_file_path, std::ofstream &dat_out);
+void write_complex(const ComplexRecord &record, const std::string &json_file_path, std::ostream &dat_out);
 
 /**
  * Reads the on-disk payload of a COMPLEX node into a ComplexRecord.
@@ -236,6 +236,57 @@ void write_node_in_freed_slot(const Node<T> &node, uint64_t node_id, uint64_t re
 }
 
 /**
+ * COMPLEX counterpart of write_node_in_freed_slot: writes a freshly-inserted
+ * COMPLEX node into a reclaimed slot instead of appending. The freed slot is an
+ * EXACT fit because COMPLEX records of the same type_label length all have the
+ * same size (see complex_record_on_disk_size), so writing the new header + two
+ * strings in place never overruns the hole.
+ *
+ *   1. ComplexHeader + type_label + json_file_path IN PLACE at record_offset, and
+ *      the JSON sidecar file written by write_complex. complex_node_to_record
+ *      assigns the prog_number (recycled from the json free list, or fresh).
+ *   2. The (empty, fresh node) RelationNodeList is APPENDED at end-of-file.
+ *   3. The NodeIndex is written IN PLACE at the freed id slot.
+ */
+inline void write_complex_in_freed_slot(const Node<ComplexRecord> &node, uint64_t node_id, uint64_t record_offset)
+{
+    namespace fs = std::filesystem;
+
+    // 1. ComplexHeader + two strings IN PLACE at the freed offset (exact-fit slot),
+    //    plus the sidecar JSON file.
+    {
+        std::fstream dat(fs::path(DB_PATH) / "nodes.dat", std::ios::binary | std::ios::in | std::ios::out);
+        if (!dat) throw std::runtime_error("write_complex_in_freed_slot: failed to open nodes.dat for in-place write.");
+        dat.seekp(static_cast<std::streamoff>(record_offset));
+        std::string json_file_path;
+        complex_node_to_record(node, json_file_path); // assigns prog_number + sidecar filename
+        write_complex(node.data, json_file_path, dat);
+    }
+
+    // 2. Empty RelationNodeList appended at end-of-file (fresh node has no edges).
+    uint64_t relation_offset = 0;
+    {
+        std::ofstream dat_app(fs::path(DB_PATH) / "nodes.dat", std::ios::binary | std::ios::app);
+        if (!dat_app) throw std::runtime_error("write_complex_in_freed_slot: failed to open nodes.dat for append.");
+        dat_app.seekp(0, std::ios::end);
+        relation_offset = write_relation_node_list<ComplexRecord>(node, node_id, dat_app);
+    }
+
+    // 3. NodeIndex in place, at the freed id slot in nodes.idx.
+    {
+        std::fstream idx(fs::path(DB_PATH) / "nodes.idx", std::ios::binary | std::ios::in | std::ios::out);
+        if (!idx) throw std::runtime_error("write_complex_in_freed_slot: failed to open nodes.idx for in-place write.");
+        idx.seekp(static_cast<std::streamoff>(node_id * sizeof(NodeIndex)));
+        NodeIndex ni;
+        ni.id              = node_id;
+        ni.offset          = record_offset;
+        ni.relation_offset = relation_offset;
+        ni.type_id         = NodeType::COMPLEX;
+        write_pod(ni, idx);
+    }
+}
+
+/**
  * Reads a node from disk based on its ID.
  * @param id The ID of the node to read.
  * @return A pointer to the reconstructed node.
@@ -333,6 +384,31 @@ BaseNode* read_typed_node(const NodeIndex &node_idx, std::ifstream &dat_in)
 inline std::filesystem::path freelist_bin_path(const std::string &prefix, uint64_t size)
 {
     return std::filesystem::path(DB_PATH) / "freelist" / (prefix + "_" + std::to_string(size) + ".dat");
+}
+
+/**
+ * On-disk size of a COMPLEX record as a pure function of its type_label length.
+ * Because the sidecar filename is zero-padded to a FIXED width (COMPLEX_PROG_DIGITS),
+ * json_file_path_size no longer depends on prog_number — so every record of a given
+ * type_label length has the exact same size, and the `complex_<size>.dat` freelist
+ * bins act as per-type size classes. Layout: ComplexHeader + type_label + json_file_path,
+ * where json_file_path = "<20 digits>_<type_label>.json".
+ */
+inline uint64_t complex_record_on_disk_size(uint64_t type_label_len)
+{
+    uint64_t json_path_len = COMPLEX_PROG_DIGITS + 1 + type_label_len + 5; // "_" (1) + ".json" (5)
+    return sizeof(ComplexHeader) + type_label_len + json_path_len;
+}
+
+/**
+ * Path of the json free list: a flat LIFO stack of freed prog_numbers (uint64).
+ * Each COMPLEX node owns one sidecar FILE (no offsets), so reclaiming it is just
+ * deleting the file and recycling its prog_number — pushed here on delete, popped
+ * by complex_node_to_record on the next COMPLEX insert.
+ */
+inline std::filesystem::path json_freelist_path()
+{
+    return std::filesystem::path(DB_PATH) / "freelist" / "json_prog.dat";
 }
 
 /**
