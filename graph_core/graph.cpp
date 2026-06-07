@@ -201,10 +201,8 @@ void Graph::delete_node(int node_id)
     nodes.erase(node_id);
     delete node;
 
-    // Persist the deletion: orphan the node's regions onto the freelists.
+    // Persist the deletion: orphan + zero the node's regions onto the freelists,
+    // tombstone its idx slot, and update the meta counters (mutated in place).
     delete_node_from_disk(static_cast<uint64_t>(node_id), meta);
-
-    // TODO(next step): once delete_node_from_disk updates the meta counters
-    // (node_count--, free_count++ / free_edge_count++), re-persist meta here with
-    // write_meta(meta), and decide nodes.idx tombstoning + inbound-edge cleanup.
+    write_meta(meta);
 }

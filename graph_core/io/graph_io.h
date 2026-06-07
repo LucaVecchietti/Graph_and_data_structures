@@ -62,7 +62,7 @@ JsonMeta        read_json_attributes_meta();
 
 void            update_node_edges(BaseNode &node, const MetaRecord &meta, uint64_t node_id);
 
-void            delete_node_from_disk(uint64_t node_id, const MetaRecord &meta);
+void            delete_node_from_disk(uint64_t node_id, MetaRecord &meta);
 
 // NOTE: write_free_offset / read_free_offset are templates (see below), so they
 // work uniformly with NodeFreeOffset, RelationNodeListFreeOffset and

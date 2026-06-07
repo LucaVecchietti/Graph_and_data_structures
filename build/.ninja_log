@@ -21,3 +21,11 @@
 1867	2046	8021430153032012	libgraph_core.a	f5249015c293a17a
 38	4015	8021430134736460	CMakeFiles/graph.dir/main.cpp.obj	a4f31c6a1db1e2cb
 4016	4250	8021430174509742	graph.exe	5b1c0d08442b3da6
+64	997	8025484281444123	CMakeFiles/graph_core.dir/graph_core/odt/edge_odt.cpp.obj	3b9f3862b23ffe42
+70	1030	8025484281504211	CMakeFiles/graph_core.dir/graph_core/struct/type_registry.cpp.obj	fd3fcb38a2880768
+67	1662	8025484281474164	CMakeFiles/graph_core.dir/graph_core/odt/node_odt.cpp.obj	fbdd16338e996f8b
+54	1935	8025484281343109	CMakeFiles/graph_core.dir/graph_core/graph.cpp.obj	598901488ace7179
+60	2062	8025484281403247	CMakeFiles/graph_core.dir/graph_core/io/graph_io.cpp.obj	1776d0a50f6c82bf
+2063	2252	8025484301421558	libgraph_core.a	f5249015c293a17a
+74	4494	8025484281544576	CMakeFiles/graph.dir/main.cpp.obj	a4f31c6a1db1e2cb
+4494	4763	8025484325742696	graph.exe	5b1c0d08442b3da6

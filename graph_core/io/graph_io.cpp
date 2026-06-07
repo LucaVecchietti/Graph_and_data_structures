@@ -11,6 +11,18 @@
 // node_odt.cpp (and any other TU that follows this pattern).
 namespace {
     Logger logger("graph_io.log", LogLevel::DEBUG);
+
+    // Zero `size` bytes starting at `offset` in a stream opened in|out binary.
+    // Used on delete to leave no dead bytes behind (NodeRecord, RelationNodeList,
+    // edge chunks). The freelist bins track offset+size, not the byte content, so a
+    // later reuse simply overwrites these zeros.
+    void zero_region(std::fstream &f, uint64_t offset, uint64_t size)
+    {
+        if (size == 0) return;
+        std::vector<char> zeros(static_cast<size_t>(size), 0);
+        f.seekp(static_cast<std::streamoff>(offset));
+        f.write(zeros.data(), static_cast<std::streamoff>(size));
+    }
 }
 
 /**
@@ -153,6 +165,8 @@ BaseNode* read_node(uint64_t id)
         case NodeType::CHAR:   return read_typed_node<char>  (node_idx, dat_in);
         case NodeType::BOOL:   return read_typed_node<bool>  (node_idx, dat_in);
         case NodeType::COMPLEX: return read_typed_node<ComplexRecord>(node_idx, dat_in);
+        case NodeType::TOMBSTONE:
+            throw std::runtime_error("read_node: node id " + std::to_string(id) + " is tombstoned (deleted).");
         default: throw std::runtime_error("Unknown NodeType for node id " + std::to_string(id));
     }
 }
@@ -377,11 +391,8 @@ void update_node_edges(BaseNode &node, const MetaRecord &meta, uint64_t node_id)
                 + " relation_offset patched to " + std::to_string(new_relation_offset));
 }
 
-void delete_node_from_disk(uint64_t node_id, const MetaRecord &meta)
+void delete_node_from_disk(uint64_t node_id, MetaRecord &meta)
 {
-    (void)meta; // Not used yet — will be needed to update the counters (node_count, free_count)
-                // once the freelist write-back lands. See the TODO at the end of this function.
-
     // 0. Calculate the node index offset for the given node_id and log it for debugging purposes.
     uint64_t node_index_offset = node_id * sizeof(NodeIndex);
     logger.info("delete_node_from_disk: calculated node index offset for node " + std::to_string(node_id) + ": " + std::to_string(node_index_offset));
@@ -488,9 +499,47 @@ void delete_node_from_disk(uint64_t node_id, const MetaRecord &meta)
         write_free_offset(edge_free_offset, freelist_bin_path("edges", edge_free_offset.size));
     }
 
-    // TODO(freelist integration — next step): this prototype records the orphaned regions but does NOT yet:
-    //   - free / tombstone the node's slot in nodes.idx (the entry still points at now-dead bytes);
-    //   - update meta (node_count--, free_count/free_edge_count++), which is why meta is still taken by const ref;
-    //   - reclaim edge ids, nor remove inbound edges from OTHER nodes that point at node_id (dangling neighbours);
-    //   - account for the variable-width COMPLEX payload (record_size is header-only for COMPLEX).
+    // 6. Zero the orphaned regions on disk (no dead bytes / no leak): the NodeRecord and
+    //    RelationNodeList in nodes.dat, and every edge chunk in edges.dat. The content is no
+    //    longer needed — the freelist bins track offset+size, not the bytes — and a future
+    //    reuse will overwrite these zeros.
+    {
+        std::fstream dat(std::filesystem::path(DB_PATH) / "nodes.dat", std::ios::binary | std::ios::in | std::ios::out);
+        if (!dat) throw std::runtime_error("delete_node_from_disk: failed to open nodes.dat for zeroing.");
+        zero_region(dat, node_idx.offset, record_size);
+        zero_region(dat, node_idx.relation_offset, relation_list_total_size);
+    }
+    if (!edge_chunk_free_offsets.empty())
+    {
+        std::fstream edges(std::filesystem::path(DB_PATH) / "edges.dat", std::ios::binary | std::ios::in | std::ios::out);
+        if (!edges) throw std::runtime_error("delete_node_from_disk: failed to open edges.dat for zeroing.");
+        for (const auto &e : edge_chunk_free_offsets) zero_region(edges, e.offset, e.size);
+    }
+
+    // 7. Tombstone the slot in nodes.idx: the entry stays (the id is reusable via the freelist),
+    //    but type_id=TOMBSTONE and the offsets are zeroed. A later reuse (write_node_in_freed_slot)
+    //    rewrites the whole NodeIndex in place, clearing the tombstone naturally.
+    {
+        std::fstream idx(std::filesystem::path(DB_PATH) / "nodes.idx", std::ios::binary | std::ios::in | std::ios::out);
+        if (!idx) throw std::runtime_error("delete_node_from_disk: failed to open nodes.idx for tombstoning.");
+        idx.seekp(static_cast<std::streamoff>(node_index_offset));
+        NodeIndex tomb;
+        tomb.id              = node_id;
+        tomb.offset          = 0;
+        tomb.relation_offset = 0;
+        tomb.type_id         = NodeType::TOMBSTONE;
+        write_pod(tomb, idx);
+    }
+
+    // 8. Update the meta counters. write_meta is left to the caller (Graph::delete_node),
+    //    consistent with the add_edge pattern. free_count is a global count of free node
+    //    slots across all freelist bins (+1 here, -1 on reuse in Graph::insert).
+    meta.node_count--;
+    meta.free_count++;
+    meta.free_edge_count += edge_chunk_free_offsets.size(); // one freelist record per orphaned chunk
+
+    // TODO(BUG-016 — remaining steps): inbound edges from OTHER nodes that point at node_id
+    // are still left dangling (only the node's OUTBOUND adjacency is reclaimed here), and the
+    // variable-width COMPLEX payload is not handled (record_size is header-only for COMPLEX,
+    // and its JSON sidecar is not removed).
 }

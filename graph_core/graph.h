@@ -65,6 +65,7 @@ public:
                 nodes[node_id] = newNode;
                 write_node_in_freed_slot(*newNode, node_id, slot->offset);
                 meta.node_count++;              // next_id is NOT bumped — the id was reused
+                meta.free_count--;              // one fewer free node slot in the bins
                 reused = true;
             }
         }

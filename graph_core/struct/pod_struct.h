@@ -21,6 +21,13 @@ enum class NodeType : uint8_t
     CHAR   = 3,
     BOOL   = 4,
 
+    TOMBSTONE = 254, // Logically-deleted slot. The entry in nodes.idx survives (so the id
+                     // can be recycled via the freelist), but offset/relation_offset are
+                     // zeroed and the on-disk NodeRecord / RelationNodeList / edge chunks
+                     // have been zero-filled. read_node on a tombstoned id throws; a later
+                     // reuse (write_node_in_freed_slot) overwrites the whole NodeIndex in
+                     // place, clearing the tombstone naturally.
+
     COMPLEX = 255 // Reserved for Record that require a type label (e.g. std::string type = "Athlete" | "Item" | "Company" etc.) with different attributes.
     /**
      * To support different type of record we can use the COMPLEX type and write the type label as a string that rapresent the type of the record .
