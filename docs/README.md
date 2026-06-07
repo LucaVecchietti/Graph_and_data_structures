@@ -6,13 +6,16 @@
 |---|---|
 | Tipo | index |
 | Lingua | en |
-| Ultimo aggiornamento | 2026-05-30 |
-| Commit di riferimento | d7ba798 |
+| Ultimo aggiornamento | 2026-06-07 |
+| Commit di riferimento | 9966603 |
 | Mirror | — |
 
 ---
 
 ## Mappa della documentazione
+
+### Stato del progetto
+- [ROADMAP.md](ROADMAP.md) — current capabilities, partial work, and the prioritized TODO list.
 
 ### Architettura
 - [overview.md](architecture/overview.md) — top-level view of the system, components and data flow.
