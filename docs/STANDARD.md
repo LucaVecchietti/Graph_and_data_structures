@@ -6,8 +6,8 @@
 |---|---|
 | Tipo | index |
 | Lingua | en |
-| Ultimo aggiornamento | 2026-05-26 |
-| Commit di riferimento | 9e8b589 |
+| Ultimo aggiornamento | 2026-06-07 |
+| Commit di riferimento | 9966603 |
 | Mirror | — |
 
 ---
@@ -23,7 +23,7 @@ Every `.md` under `docs/` starts with this block. The title is a level-1 heading
 
 | Campo | Valore |
 |---|---|
-| Tipo | module \| architecture \| legacy-decisions \| legacy-api \| legacy-bugs \| snapshot \| index |
+| Tipo | module \| architecture \| roadmap \| legacy-decisions \| legacy-api \| legacy-bugs \| snapshot \| index |
 | Lingua | en \| it |
 | Ultimo aggiornamento | YYYY-MM-DD |
 | Commit di riferimento | {short hash} \| N/A |
@@ -86,6 +86,22 @@ Rules:
 2. Convenzioni                    — pointer to docs/STANDARD.md
 ```
 
+### 2.6 `roadmap` — `docs/ROADMAP.md`
+
+Living checkpoint of project state plus the prioritized backlog. Single file.
+
+```
+1. In one sentence                — one-line characterization of the system today
+2. What it can do today           — implemented, working capabilities
+3. Partial / half-done            — present-but-incomplete features (table: area / state)
+4. TODO — what is missing         — prioritized checklist, grouped by area
+5. Known fragilities              — sharp edges / caveats a contributor must know
+6. Related                        — links to architecture / module / legacy docs
+```
+
+Keep it current: update at each milestone, move shipped items out of "TODO". It records
+*state and intent*, not the *why* (which belongs in `legacy/design_decisions.md`).
+
 ## 3. Internal structure of legacy log entries
 
 ### 3.1 Entry in `design_decisions.md`
@@ -137,6 +153,7 @@ Rules:
 |---|---|
 | Module doc | `docs/modules/{snake_case}.md` |
 | Architecture doc | `docs/architecture/{topic}.md` |
+| Roadmap | `docs/ROADMAP.md` (single file) |
 | Legacy aggregator | `docs/legacy/{category}.md` |
 | Snapshot | `docs/legacy/snapshots/{YYYY-MM-DD}_{topic}.md` |
 | Italian mirror | same path under `docs/it/...` |
