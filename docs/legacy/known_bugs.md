@@ -6,8 +6,8 @@
 |---|---|
 | Tipo | legacy-bugs |
 | Lingua | en |
-| Ultimo aggiornamento | 2026-06-03 |
-| Commit di riferimento | ca567e4 |
+| Ultimo aggiornamento | 2026-06-07 |
+| Commit di riferimento | 9966603 |
 | Mirror | — |
 
 ---
@@ -35,15 +35,19 @@
 
 ### 2026-06-03 — BUG-016: `delete_node` prototipo non aggiorna idx, contatori meta, archi entranti, COMPLEX
 
-- **Stato:** open
+- **Stato:** fixed (2026-06-07)
 - **Sintomo:** `Graph::delete_node` + `delete_node_from_disk` (`graph_core/graph.cpp:163`, `graph_core/io/graph_io.cpp:380`) liberano lo spazio del nodo sulla freelist, ma la cancellazione è parziale:
   1. lo slot del nodo in `nodes.idx` non è tombstonato: l'entry resta e punta a byte ormai morti. Una futura `read_node(node_id)` rileggerebbe spazzatura (o un record già riscritto da un reuse) finché lo slot non viene riusato via `pop_free_offset`;
   2. i contatori `meta` non sono aggiornati (`node_count` non decrementa, `free_count` / `free_edge_count` non incrementano) — per questo `delete_node_from_disk` prende ancora `meta` per `const &` e non chiama `write_meta`;
   3. gli archi **entranti** da altri nodi che puntano a `node_id` non vengono rimossi: restano in `nodes.dat`/`edges.dat` come vicini dangling (la cancellazione tocca solo l'adiacenza **uscente** del nodo);
   4. il payload **COMPLEX** a size variabile non è gestito: `node_record_payload_size` per COMPLEX ritorna solo `sizeof(ComplexHeader)`, quindi la regione spinta sul bin `nodes` sarebbe sotto-dimensionata e il file sidecar JSON non viene rimosso.
 - **Root cause:** Implementazione volutamente a step: il commit introduce il lato push del reclamo (freelist) e la rimozione RAM, lasciando integrazione meta / tombstoning idx / cleanup archi entranti / COMPLEX a un passo successivo. I TODO sono annotati in coda a `Graph::delete_node` e a `delete_node_from_disk`.
-- **Fix:** n/a (open). Step previsti: tombstonare/azzerare lo slot `nodes.idx` (o un flag in `NodeIndex.type_id`), aggiornare `meta` (`node_count--`, `free_count`/`free_edge_count++`) e `write_meta`, scansionare/rimuovere gli archi entranti, e calcolare la size reale del record COMPLEX (header + lunghezze stringhe) prima di spingerlo sul bin + cancellare il sidecar.
-- **Regression guard:** nessuno (nessuna test suite). La Phase 3 di `main.cpp` esercita solo il caso felice (delete di un `int` + reuse dello slot via `insert`), confronto visuale su `graph.log` / `db/freelist/`.
+- **Fix (2026-06-07, in tre commit `b56e86e` → `1315b00` → `9966603`):** chiusi tutti e quattro i punti.
+  1. **Tombstone + azzeramento** (`b56e86e`): nuovo tag `NodeType::TOMBSTONE = 254`. `delete_node_from_disk` azzera su disco la regione `NodeRecord`, la `RelationNodeList` e ogni chunk di edge (helper `zero_region` in `graph_io.cpp`, niente byte morti), poi tombstona lo slot `nodes.idx` (`type_id=TOMBSTONE`, offset azzerati). `read_node` su uno slot tombstonato lancia. Un reuse via `write_node_in_freed_slot` riscrive l'intero `NodeIndex` in place, cancellando il tombstone. Vedi [decisione](design_decisions.md#2026-06-07--tombstone--azzeramento-delle-regioni-su-delete).
+  2. **Contatori meta** (`b56e86e`): `delete_node_from_disk` ora prende `MetaRecord &` (non più `const`), aggiorna `node_count--` / `free_count++` / `free_edge_count += chunk`; `Graph::delete_node` chiama `write_meta`. Il ramo reuse di `insert` decrementa `free_count` per mantenerlo veritiero. `Graph::delete_node` decrementa anche `edge_count` (archi uscenti del nodo + entranti rimossi) — prima non veniva mai decrementato.
+  3. **Archi entranti** (`1315b00`): indice inverso in-RAM `Graph::in_edges` (`to_id → {from_id}`), ricostruito al load da `build_inbound_index` (scan O(N+E) dei soli nodi vivi) e mantenuto da `add_edge`/`delete_node`. Su delete, per ogni proprietario entrante si rimuove l'arco dall'adiacenza e si ri-persiste via `update_node_edges` → nessun vicino dangling dopo reload. Vedi [decisione](design_decisions.md#2026-06-07--indice-inverso-degli-archi-entranti-in-ram).
+  4. **COMPLEX a size variabile** (`9966603`): `delete_node_from_disk` legge lo `ComplexHeader` per la size reale (`16 + type_label_size + json_file_path_size`), spinge la regione sui bin `complex_<size>`, rimuove il file sidecar JSON e ricicla il `prog_number` sulla json free list. Reso possibile dal binning per-tipo via `prog_number` zero-paddato. Vedi [decisione](design_decisions.md#2026-06-07--bin-per-tipo-per-i-record-complex-via-prog_number-zero-paddato).
+- **Regression guard:** nessuna test suite. Lo smoke test `main.cpp` esercita ora il giro completo: Phase 3 (delete di un `int` + reuse) e **Phase 4** (delete del nodo COMPLEX `Athlete` + re-insert con reuse dello slot, riciclo del `prog_number` e rinascita del sidecar). Verifica visuale su `graph.log` / `graph_io.log`, `db/freelist/` (bin `nodes_*`, `complex_*`, `json_prog.dat`), `db/attributes/` e i contatori in `meta.dat`. Limite residuo: `update_node_edges` continua a **solo loggare** i chunk orfanati dei proprietari (non li spinge sui bin), quindi `free_edge_count` non li conta — vedi nota in `graph_io.cpp` e nella [decisione freelist](design_decisions.md#2026-06-03--freelist-a-bin-segregati-per-dimensione-esatta--cancellazione-nodo).
 
 ---
 
@@ -107,11 +111,11 @@
 
 ### 2026-05-26 — BUG-014: `prog_number` mai incrementato/persistito dopo write COMPLEX
 
-- **Stato:** open
+- **Stato:** fixed (2026-06-07)
 - **Sintomo:** Anche al netto degli altri bug del ramo COMPLEX: `complex_node_to_record` legge `prog_number` via `read_json_attributes_meta` ma non lo **incrementa** e non chiama mai `write_json_attributes_meta(meta_json)` per persistere il nuovo valore. Conseguenza: ogni nodo COMPLEX verrebbe assegnato allo stesso `prog_number` (zero, alla prima esecuzione), e il file sidecar `{0}_{type_label}.json` verrebbe sovrascritto per ogni record di quel tipo.
 - **Root cause:** Il design del [Storage sidecar JSON](design_decisions.md#2026-05-26--storage-sidecar-json-per-nodi-complex) prevede `prog_number` come contatore monotonico per garantire nomi univoci, ma la mutazione non è stata implementata.
-- **Fix:** n/a (open). Dopo aver costruito `json_file_path` in `complex_node_to_record` (o nel chiamante, a seconda di dove si decide debba stare l'effetto collaterale), incrementare `meta_json.prog_number` e chiamare `write_json_attributes_meta(meta_json)`. Decidere se l'incremento avviene prima o dopo (riserva del numero) — meglio prima, così se la write fallisce il numero resta "consumato" ma non si rischiano collisioni.
-- **Regression guard:** un test che inserisce due nodi COMPLEX con lo stesso `type_label` e verifica che producano due file distinti in `db/attributes/`.
+- **Fix (2026-06-07, commit `9966603`):** `complex_node_to_record` (`graph_core/odt/node_odt.cpp`) ora decide il `prog_number` con politica reserve-before-persist: prova prima un riuso dalla **json free list** (`pop_free_offset<uint64_t>(json_freelist_path())`, prog_number liberati da delete precedenti); se vuota, consuma `meta_json.prog_number`, lo incrementa e lo persiste subito via `write_json_attributes_meta`. Così ogni nodo COMPLEX ottiene un numero distinto e il contatore sopravvive ai riavvii. L'incremento avviene **solo** quando non si ricicla. Il numero scelto viene inoltre zero-paddato a `COMPLEX_PROG_DIGITS` (= 20) nel filename, rendendo la size del record costante per tipo — vedi [decisione binning COMPLEX](design_decisions.md#2026-06-07--bin-per-tipo-per-i-record-complex-via-prog_number-zero-paddato).
+- **Regression guard:** nessuna test suite. La Phase 1 + Phase 4 di `main.cpp` inseriscono/cancellano nodi COMPLEX `Athlete`: dopo la Phase 1 `attributes_meta.dat` riporta `prog_number = 1` (consumato lo 0); la Phase 4 cancella il nodo (riciclo dello 0 sulla json free list) e reinserisce un Athlete che ripesca lo 0 — il sidecar `00000000000000000000_Athlete.json` rinasce col nuovo JSON e `prog_number` resta 1.
 
 ---
 

@@ -6,14 +6,17 @@
 |---|---|
 | Tipo | legacy-decisions |
 | Lingua | en |
-| Ultimo aggiornamento | 2026-06-03 |
-| Commit di riferimento | ca567e4 |
+| Ultimo aggiornamento | 2026-06-07 |
+| Commit di riferimento | 9966603 |
 | Mirror | — |
 
 ---
 
 ## Indice
 
+- [2026-06-07 — Bin per-tipo per i record COMPLEX via prog_number zero-paddato](#2026-06-07--bin-per-tipo-per-i-record-complex-via-prog_number-zero-paddato)
+- [2026-06-07 — Indice inverso degli archi entranti in-RAM](#2026-06-07--indice-inverso-degli-archi-entranti-in-ram)
+- [2026-06-07 — Tombstone + azzeramento delle regioni su delete](#2026-06-07--tombstone--azzeramento-delle-regioni-su-delete)
 - [2026-06-03 — Freelist a bin segregati per dimensione esatta + cancellazione nodo](#2026-06-03--freelist-a-bin-segregati-per-dimensione-esatta--cancellazione-nodo)
 - [2026-06-02 — Id arco globale: sorgente in `MetaRecord.next_edge_id`, memorizzato in `EdgeRef`](#2026-06-02--id-arco-globale-sorgente-in-metarecordnext_edge_id-memorizzato-in-edgeref)
 - [2026-05-30 — Edge persistence: append + obsolete + in-place index patch](#2026-05-30--edge-persistence-append--obsolete--in-place-index-patch)
@@ -29,9 +32,59 @@
 
 ---
 
+### 2026-06-07 — Bin per-tipo per i record COMPLEX via prog_number zero-paddato
+
+- **Stato:** active
+- **Contesto:** La freelist a bin segregati (vedi [decisione 2026-06-03](#2026-06-03--freelist-a-bin-segregati-per-dimensione-esatta--cancellazione-nodo)) assume regioni di **size esatta**: pop = fit esatto, scrittura in place senza slack. I primitivi hanno 3 size ({1,4,8}). Un record COMPLEX vale invece `R = sizeof(ComplexHeader) + type_label_size + json_file_path_size`, con `json_file_path = "{prog_number}_{type_label}.json"` → `R = 22 + 2·L + d` (L = lunghezza `type_label`, d = cifre di `prog_number`). La varianza ha due sorgenti: **L** (intrinseca al tipo) e **d** (incidentale all'istanza, cresce di 1 byte ad ogni decade del contatore). Con size quasi-continua i bin esatti esplodono (un file per byte-size) e l'hit-rate di riuso crolla.
+- **Decisione:** Azzerare la sorgente incidentale **zero-paddando `prog_number` a larghezza fissa** `COMPLEX_PROG_DIGITS = 20` (copre l'intero range `uint64`). Così `json_file_path_size` diventa costante per un dato tipo e `R = (22 + COMPLEX_PROG_DIGITS) + 2·L` dipende **solo da L**: tutti i record di un tipo (o di tipi con lo stesso `L`) hanno la stessa size esatta, e i bin esatti esistenti `complex_<R>.dat` funzionano automaticamente come **classi di size per-tipo** — nessuna funzione di bucketing né padding del record. Helper `complex_record_on_disk_size(L)` calcola `R` prima della scrittura. Il sidecar JSON è gestito a parte: ogni nodo COMPLEX è **un file** (nessun offset), quindi su delete si fa `remove()` del file e si ricicla il `prog_number` su una **json free list** (`db/freelist/json_prog.dat`, stack LIFO di `uint64`); `complex_node_to_record` ripesca un numero riciclato prima di consumarne uno nuovo (chiude anche [BUG-014](known_bugs.md#2026-05-26--bug-014-prog_number-mai-incrementatopersistito-dopo-write-complex)). Il reuse in place è gestito da `write_complex_in_freed_slot`.
+- **Alternative considerate:**
+  - *Bin per classe di size con padding del record (ladder lineare/potenze di 2)*: avrebbe richiesto padding e gestione dello slack; lo zero-padding del filename sposta lo "spreco" in qualche byte di nome (sidecar) invece che in byte morti dentro `nodes.dat`, e mantiene i bin esatti.
+  - *Bin senza padding + best-fit con scan su freelist unica*: scartata — perde il pop O(1) e introduce leak della "coda" sotto churn (il record migrerebbe in una classe più piccola ad ogni ciclo).
+  - *`Dbudget` più piccolo (es. 10 cifre)*: nomi più corti ma richiede un guard sull'overflow del contatore; con 20 cifre l'overflow su `uint64` è impossibile, nessun guard.
+- **Conseguenze:**
+  - I filename dei sidecar sono zero-paddati (es. `00000000000000000000_Athlete.json`); ~+19 byte di path per record COMPLEX rispetto al minimo, deterministici.
+  - Due tipi **diversi con lo stesso `L`** condividono il bin: è corretto e desiderato (uno slot liberato è riusabile da qualunque record della stessa size).
+  - Nuovo bin-prefix `complex` e nuovo file `db/freelist/json_prog.dat`. `node_record_payload_size(COMPLEX)` resta header-only ma non è più sul percorso di delete (la size reale si legge dall'header).
+  - `write_complex` ora prende `std::ostream &` (non più `std::ofstream &`) per poter scrivere in place su `std::fstream` (vedi [API change](api_changes.md#2026-06-07--write_complex-su-stdostream--write_complex_in_freed_slot)).
+- **Riferimenti:** commit `9966603`. `graph_core/costants.h` (`COMPLEX_PROG_DIGITS`), `graph_core/odt/node_odt.cpp` (`complex_node_to_record`), `graph_core/io/graph_io.h` (`complex_record_on_disk_size`, `json_freelist_path`, `write_complex_in_freed_slot`), `graph_core/io/graph_io.cpp` (ramo COMPLEX di `delete_node_from_disk`), `graph_core/graph.h` (ramo COMPLEX del reuse di `insert`).
+
+---
+
+### 2026-06-07 — Indice inverso degli archi entranti in-RAM
+
+- **Stato:** active
+- **Contesto:** Il modello è diretto e **solo-uscente**: l'adiacenza è memorizzata dal lato sorgente (`BaseNode::neighborgs[relation][to_id]`). Cancellare un nodo X deve rimuovere anche gli archi **entranti** (di altri nodi che puntano a X), altrimenti restano vicini dangling che dopo un reload puntano a uno slot tombstonato. Ma "chi punta a X?" non è interrogabile: nessun indice per `to_node`. Il POD `Edge` ha `from_node`, quindi da un arco si risale al proprietario, ma serve un modo di trovarli senza scansionare tutto `edges.dat` ad ogni delete.
+- **Decisione:** Indice inverso **in-RAM**, mai persistito, ricostruito al load. `Graph::in_edges` è una `unordered_map<int to_id, unordered_set<int from_id>>`. `build_inbound_index(next_id)` lo costruisce con uno scan O(N+E) che segue **solo i nodi vivi** (salta i `TOMBSTONE`) leggendo le loro `RelationNodeList` → quindi non legge mai chunk azzerati/liberi (evita falsi positivi su edge a zero). È mantenuto incrementale da `add_edge` (`in_edges[end].insert(start)` su arco nuovo) e da `delete_node`. Su delete di X: (a) per ogni vicino uscente si toglie X dalla loro inbound set; (b) per ogni proprietario entrante (da `in_edges[X]`) si carica il nodo, si rimuove X da ogni relazione e si ri-persiste via `update_node_edges`; (c) si decrementa `edge_count` di conseguenza.
+- **Alternative considerate:**
+  - *Scan di `edges.dat` ad ogni delete (nessuna struttura)*: minima da implementare, ma O(E) per cancellazione e va gestita la trappola degli edge azzerati.
+  - *Reverse adjacency persistita su disco*: delete O(deg_in) ma raddoppia le scritture e tocca il formato on-disk (fragile).
+  - *Indice inverso in-RAM (scelta)*: uno scan O(N+E) una volta al load, poi delete in O(deg_in); nessun cambio di schema, struttura volatile.
+- **Conseguenze:**
+  - Il costruttore di `Graph` ora fa uno scan O(N+E) al load (prima leggeva solo `meta`). Per il prototipo (grafi piccoli) accettabile.
+  - `delete_node` rimuove e ri-persiste i nodi proprietari → nessun vicino dangling dopo reload. I loro **vecchi** chunk vengono orfanati da `update_node_edges` che però li **solo logga** (non li spinge sui bin): `free_edge_count` non li conta. Limite noto pre-esistente.
+  - `edge_count` ora viene davvero decrementato sul delete (prima restava invariato).
+- **Riferimenti:** commit `1315b00`. `graph_core/graph.h` (`in_edges`, `build_in_edges`), `graph_core/graph.cpp` (`Graph::delete_node`, `add_edge`, costruttore), `graph_core/io/graph_io.cpp` / `graph_core/io/graph_io.h` (`build_inbound_index`).
+
+---
+
+### 2026-06-07 — Tombstone + azzeramento delle regioni su delete
+
+- **Stato:** active
+- **Contesto:** Il prototipo di `delete_node` ([decisione 2026-06-03](#2026-06-03--freelist-a-bin-segregati-per-dimensione-esatta--cancellazione-nodo)) spingeva le regioni del nodo sui bin ma lasciava lo slot in `nodes.idx` intatto (puntava a byte ormai morti) e i byte del record non azzerati. Una `read_node` su un id cancellato (anche un vicino dangling) avrebbe riletto spazzatura finché lo slot non veniva riusato.
+- **Decisione:** Nuovo tag `NodeType::TOMBSTONE = 254`. Su delete, `delete_node_from_disk` (1) **azzera** su disco la regione `NodeRecord`, la `RelationNodeList` e ogni chunk di edge (helper `zero_region`, niente byte morti / niente leak), (2) **tombstona** lo slot scrivendo un `NodeIndex` con `type_id = TOMBSTONE` e offset azzerati, conservando l'`id` (lo slot resta riusabile via freelist). `read_node` su uno slot `TOMBSTONE` lancia (fallimento rumoroso invece di spazzatura silenziosa — sinergia con la pulizia degli archi entranti). Un reuse successivo (`write_node_in_freed_slot` / `write_complex_in_freed_slot`) riscrive l'intero `NodeIndex` in place, cancellando naturalmente il tombstone.
+- **Alternative considerate:**
+  - *Azzerare l'intero slot idx*: ambiguo, perché `id = 0` è un nodo valido.
+  - *Non tombstonare, affidarsi solo alla freelist*: lascia lo slot a puntare a byte morti fino al reuse — è proprio il sintomo da chiudere.
+- **Conseguenze:**
+  - `NodeType` guadagna 254; `read_node` ha un `case NodeType::TOMBSTONE` che lancia. `node_record_payload_size(TOMBSTONE)` cade nel `default` (throw) ma non è mai chiamato su un tombstone (la size si calcola dal tipo originale prima di tombstonare).
+  - Nessun cambio di layout POD (`NodeIndex`/`MetaRecord` invariati): i `db/` esistenti restano compatibili, è solo un nuovo valore enum.
+- **Riferimenti:** commit `b56e86e`. `graph_core/struct/pod_struct.h` (`NodeType::TOMBSTONE`), `graph_core/io/graph_io.cpp` (`zero_region`, ramo tombstone di `delete_node_from_disk`, `case TOMBSTONE` in `read_node`).
+
+---
+
 ### 2026-06-03 — Freelist a bin segregati per dimensione esatta + cancellazione nodo
 
-- **Stato:** active (prototipo — le parti non ancora cablate sono tracciate in [BUG-016](known_bugs.md#2026-06-03--bug-016-delete_node-prototipo-non-aggiorna-idx-contatori-meta-archi-entranti-complex))
+- **Stato:** active (il prototipo `delete_node` è stato completato il 2026-06-07 — [BUG-016](known_bugs.md#2026-06-03--bug-016-delete_node-prototipo-non-aggiorna-idx-contatori-meta-archi-entranti-complex) chiuso: vedi [tombstone](#2026-06-07--tombstone--azzeramento-delle-regioni-su-delete), [archi entranti](#2026-06-07--indice-inverso-degli-archi-entranti-in-ram), [binning COMPLEX](#2026-06-07--bin-per-tipo-per-i-record-complex-via-prog_number-zero-paddato). Le "Conseguenze" sul prototipo qui sotto restano per contesto storico.)
 - **Contesto:** Dal 2026-05-30 ogni `add_edge` orfanizza la vecchia `RelationNodeList` e i vecchi chunk di edge, e il DB cresce monotono (vedi [Edge persistence](#2026-05-30--edge-persistence-append--obsolete--in-place-index-patch)). Mancavano due cose: (a) una cancellazione di nodo, e (b) il meccanismo di reclamo dello spazio orfano promesso da quel design. La vecchia POD `FreeRecord` (un solo `uint64_t offset`) e `MetaRecord.free_count` erano placeholder mai usati: un solo offset senza la **dimensione** della regione non permette di riusare un buco in sicurezza.
 - **Decisione:** Freelist persistente a **bin segregati per dimensione esatta**: un file per ogni size distinta di regione libera, sotto `db/freelist/<prefix>_<size>.dat`, con `prefix ∈ {nodes, rel, edges}`. La size è codificata nel nome del file, quindi:
   - **push** (su delete/orphan) = append di un record in fondo al bin giusto → O(1);

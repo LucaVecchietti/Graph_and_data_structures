@@ -6,14 +6,19 @@
 |---|---|
 | Tipo | legacy-api |
 | Lingua | en |
-| Ultimo aggiornamento | 2026-06-03 |
-| Commit di riferimento | ca567e4 |
+| Ultimo aggiornamento | 2026-06-07 |
+| Commit di riferimento | 9966603 |
 | Mirror | — |
 
 ---
 
 ## Indice
 
+- [2026-06-07 — `NodeType::TOMBSTONE` aggiunto](#2026-06-07--nodetypetombstone-aggiunto)
+- [2026-06-07 — `delete_node_from_disk`: `const MetaRecord&` → `MetaRecord&`; `build_inbound_index`](#2026-06-07--delete_node_from_disk-const-metarecord--metarecord-build_inbound_index)
+- [2026-06-07 — `Graph`: membro `in_edges` + `build_in_edges`; `delete_node` completata](#2026-06-07--graph-membro-in_edges--build_in_edges-delete_node-completata)
+- [2026-06-07 — `write_complex` su `std::ostream&` + `write_complex_in_freed_slot`](#2026-06-07--write_complex-su-stdostream--write_complex_in_freed_slot)
+- [2026-06-07 — `complex_node_to_record`: `prog_number` incrementato/persistito + zero-pad; `COMPLEX_PROG_DIGITS`](#2026-06-07--complex_node_to_record-prog_number-incrementatopersistito--zero-pad-complex_prog_digits)
 - [2026-06-03 — `FreeRecord` rimossa, sostituita da tre POD free-offset](#2026-06-03--freerecord-rimossa-sostituita-da-tre-pod-free-offset)
 - [2026-06-03 — Nuova `Graph::delete_node(int)`](#2026-06-03--nuova-graphdelete_nodeint)
 - [2026-06-03 — `Graph::insert<T>`: aggiunto il reuse path via freelist](#2026-06-03--graphinsertt-aggiunto-il-reuse-path-via-freelist)
@@ -35,6 +40,122 @@
 > Nota: il progetto non ha ancora consumatori esterni, quindi "API pubblica" qui significa: classe `Graph`, POD persistiti su disco (`pod_struct.h`), funzioni esposte nei header pubblici (`io/graph_io.h`, `io/io_utils.h`, `odt/*.h`, `struct/*.h`).
 >
 > Le modifiche ai POD persistiti sono particolarmente sensibili perché rompono il formato su disco — andranno tracciate qui anche se prive di consumatori esterni.
+
+---
+
+### 2026-06-07 — `NodeType::TOMBSTONE` aggiunto
+
+- **Motivazione:** marcare uno slot `nodes.idx` come logicamente cancellato senza rimuoverlo (l'id resta riusabile via freelist), così `read_node` su un id cancellato fallisce in modo rumoroso invece di rileggere byte morti. Vedi [decisione](design_decisions.md#2026-06-07--tombstone--azzeramento-delle-regioni-su-delete).
+- **Before:**
+  ```cpp
+  enum class NodeType : uint8_t {
+      INT=0, FLOAT=1, DOUBLE=2, CHAR=3, BOOL=4,
+      COMPLEX = 255
+  };
+  ```
+- **After:**
+  ```cpp
+  enum class NodeType : uint8_t {
+      INT=0, FLOAT=1, DOUBLE=2, CHAR=3, BOOL=4,
+      TOMBSTONE = 254, // slot cancellato: offset azzerati, byte azzerati, id riusabile
+      COMPLEX   = 255
+  };
+  ```
+- **Note di migrazione:** non è uno schema-break (il layout `NodeIndex` è invariato, è solo un nuovo valore del tag). `read_node` ha ora un `case NodeType::TOMBSTONE` che lancia; chi itera gli slot deve saltarli (così fa `build_inbound_index`). Un reuse riscrive lo slot col tipo reale, cancellando il tombstone.
+- **Riferimenti:** commit `b56e86e`. `graph_core/struct/pod_struct.h` (`NodeType`), `graph_core/io/graph_io.cpp` (`read_node`).
+
+---
+
+### 2026-06-07 — `delete_node_from_disk`: `const MetaRecord&` → `MetaRecord&`; `build_inbound_index`
+
+- **Motivazione:** `delete_node_from_disk` deve ora aggiornare i contatori `meta` (prima era un no-op con `(void)meta`); e serve un modo per ricostruire l'indice inverso degli archi entranti dal disco al load.
+- **Before:**
+  ```cpp
+  void delete_node_from_disk(uint64_t node_id, const MetaRecord &meta);
+  // (build_inbound_index non esisteva)
+  ```
+- **After:**
+  ```cpp
+  void delete_node_from_disk(uint64_t node_id, MetaRecord &meta); // muta node_count/free_count/free_edge_count
+  std::unordered_map<int, std::unordered_set<int>> build_inbound_index(uint64_t next_id); // to_id -> {from_id}
+  ```
+- **Note di migrazione:** `delete_node_from_disk` non chiama `write_meta` (lo fa il chiamante `Graph::delete_node`, come per `add_edge`). `build_inbound_index` scansiona i soli nodi vivi (salta `TOMBSTONE`). Vedi [decisione archi entranti](design_decisions.md#2026-06-07--indice-inverso-degli-archi-entranti-in-ram).
+- **Riferimenti:** commit `b56e86e` (firma), `1315b00` (`build_inbound_index`). `graph_core/io/graph_io.h`, `graph_core/io/graph_io.cpp`.
+
+---
+
+### 2026-06-07 — `Graph`: membro `in_edges` + `build_in_edges`; `delete_node` completata
+
+- **Motivazione:** chiudere la cancellazione di nodo (archi entranti, contatori). L'indice inverso vive in `Graph` (volatile, ricostruito al load).
+- **Before:**
+  ```cpp
+  class Graph {
+      std::unordered_map<int, BaseNode*> nodes;
+      MetaRecord meta;
+      // delete_node: spingeva solo le regioni sui bin; edge_count mai decrementato
+  };
+  ```
+- **After:**
+  ```cpp
+  class Graph {
+      std::unordered_map<int, BaseNode*> nodes;
+      std::unordered_map<int, std::unordered_set<int>> in_edges; // to_id -> {from_id}, in-RAM
+      MetaRecord meta;
+      void build_in_edges(); // = build_inbound_index(meta.next_id), chiamata al load
+      // add_edge: in_edges[end].insert(start) su arco nuovo
+      // delete_node: pulizia inbound (via in_edges) + edge_count decrementato + write_meta
+  };
+  ```
+- **Note di migrazione:** il costruttore di `Graph`, quando carica un DB esistente, esegue ora `build_in_edges()` (scan O(N+E)); prima leggeva solo `meta`. Nessun cambiamento di firma pubblica di `insert`/`add_edge`/`delete_node`.
+- **Riferimenti:** commit `1315b00`. `graph_core/graph.h`, `graph_core/graph.cpp`.
+
+---
+
+### 2026-06-07 — `write_complex` su `std::ostream&` + `write_complex_in_freed_slot`
+
+- **Motivazione:** abilitare il reuse in place dei record COMPLEX (scrittura su `std::fstream` a un offset liberato), che `std::ofstream&` non permetteva.
+- **Before:**
+  ```cpp
+  void write_complex(const ComplexRecord &record, const std::string &json_file_path, std::ofstream &dat_out);
+  // nessun percorso di reuse per COMPLEX (insert appendeva sempre)
+  ```
+- **After:**
+  ```cpp
+  void write_complex(const ComplexRecord &record, const std::string &json_file_path, std::ostream &dat_out);
+  inline uint64_t complex_record_on_disk_size(uint64_t type_label_len); // R = (22 + COMPLEX_PROG_DIGITS) + 2*L
+  inline std::filesystem::path json_freelist_path(); // db/freelist/json_prog.dat
+  inline void write_complex_in_freed_slot(const Node<ComplexRecord>&, uint64_t node_id, uint64_t record_offset);
+  ```
+- **Note di migrazione:** `write_complex` resta compatibile con i chiamanti esistenti (`std::ofstream` converte a `std::ostream&`). Il ramo COMPLEX di `Graph::insert` ora prova un `pop_free_offset` sul bin `complex_<R>` prima di appendere. Vedi [decisione binning COMPLEX](design_decisions.md#2026-06-07--bin-per-tipo-per-i-record-complex-via-prog_number-zero-paddato).
+- **Riferimenti:** commit `9966603`. `graph_core/io/graph_io.h`, `graph_core/io/graph_io.cpp`, `graph_core/graph.h`.
+
+---
+
+### 2026-06-07 — `complex_node_to_record`: `prog_number` incrementato/persistito + zero-pad; `COMPLEX_PROG_DIGITS`
+
+- **Motivazione:** chiudere [BUG-014](known_bugs.md#2026-05-26--bug-014-prog_number-mai-incrementatopersistito-dopo-write-complex) (contatore mai avanzato → sidecar collidono su 0) e rendere la size del record COMPLEX costante per tipo (vedi [decisione](design_decisions.md#2026-06-07--bin-per-tipo-per-i-record-complex-via-prog_number-zero-paddato)).
+- **Before:**
+  ```cpp
+  // node_odt.cpp
+  meta_json = read_json_attributes_meta();
+  json_file_path = std::to_string(meta_json.prog_number) + "_" + node.data.type_label + ".json";
+  // prog_number mai incrementato né ripersistito
+  ```
+- **After:**
+  ```cpp
+  // node_odt.cpp — riuso dalla json free list, altrimenti consuma+persiste
+  std::optional<uint64_t> recycled = pop_free_offset<uint64_t>(json_freelist_path());
+  uint64_t prog = recycled ? *recycled
+                           : (meta_json.prog_number,            // consuma
+                              write_json_attributes_meta({meta_json.prog_number + 1}), // persiste +1
+                              meta_json.prog_number);
+  std::string num = std::to_string(prog);
+  std::string padded = std::string(COMPLEX_PROG_DIGITS - num.size(), '0') + num; // zero-pad a 20
+  json_file_path = padded + "_" + node.data.type_label + ".json";
+  ```
+  (Nuova costante `constexpr uint8_t COMPLEX_PROG_DIGITS = 20;` in `costants.h`. Lo pseudo-codice "After" è una sintesi: il sorgente usa un `if/else` esplicito.)
+- **Note di migrazione:** i nuovi sidecar hanno il prefisso numerico zero-paddato a 20 cifre (`00000000000000000000_<type>.json`); i `db/attributes/` scritti col formato vecchio non sono leggibili con il nuovo (il `json_file_path` su disco resta però autodescrittivo, quindi un singolo record vecchio si rilegge — è il binning a non combaciare). Per coerenza, partire da `db/` pulito.
+- **Riferimenti:** commit `9966603`. `graph_core/costants.h`, `graph_core/odt/node_odt.cpp`.
 
 ---
 

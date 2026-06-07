@@ -6,8 +6,8 @@
 |---|---|
 | Tipo | module |
 | Lingua | en |
-| Ultimo aggiornamento | 2026-06-03 |
-| Commit di riferimento | ca567e4 |
+| Ultimo aggiornamento | 2026-06-07 |
+| Commit di riferimento | 9966603 |
 | Mirror | — |
 
 ---
@@ -27,17 +27,19 @@ db/
 ├── nodes.dat                             NodeRecord<T> | ComplexHeader+strings + RelationNodeList (appended on insert)
 ├── edges.dat                             Edge records (appended on insert)
 ├── freelist/                             size-segregated free-offset bins (created on first delete)
-│   ├── nodes_{size}.dat                  NodeFreeOffset records, one bin per NodeRecord size
+│   ├── nodes_{size}.dat                  NodeFreeOffset records, one bin per primitive NodeRecord size
+│   ├── complex_{size}.dat                NodeFreeOffset records, one bin per COMPLEX size class (per-type)
 │   ├── rel_{size}.dat                    RelationNodeListFreeOffset records, one bin per region size
-│   └── edges_{size}.dat                  BatchOfEdgesFreeOffset records, one bin per chunk size
+│   ├── edges_{size}.dat                  BatchOfEdgesFreeOffset records, one bin per chunk size
+│   └── json_prog.dat                     LIFO stack of freed prog_numbers (uint64) for COMPLEX sidecars
 └── attributes/                           COMPLEX sidecars (created on first COMPLEX node)
     ├── attributes_meta.dat               JsonMeta (truncated + rewritten on every COMPLEX write)
-    └── {prog_number}_{type_label}.json   JSON attributes payload per COMPLEX node
+    └── {prog_number:020}_{type_label}.json   JSON attributes payload per COMPLEX node (prog zero-padded)
 ```
 
 There is no header magic, no version field, no checksum. Reading a `db/` produced by a build with a different `NodeType` enum or different POD layout will silently misinterpret data. The most recent schema break (2026-06-02) added three edge-bookkeeping fields to `MetaRecord`, taking it from 24 to 48 bytes; the prior one (2026-05-30) added `batch_size` to `RelationNodeList` (8 → 16 bytes). Any `db/` produced before the relevant commit must be wiped.
 
-The `attributes/` subtree only exists once at least one COMPLEX node has been written (or once `read_json_attributes_meta` is called and lazy-creates `attributes_meta.dat`). The COMPLEX write+read path compiles and runs end-to-end since 2026-05-30 ([BUG-009..BUG-013](../legacy/known_bugs.md) and [BUG-015](../legacy/known_bugs.md) fixed); the only remaining open item on this path is [BUG-014](../legacy/known_bugs.md) (`prog_number` never persisted, so two COMPLEX nodes with the same `type_label` collide on the same sidecar file). See the [sidecar JSON design decision](../legacy/design_decisions.md#2026-05-26--storage-sidecar-json-per-nodi-complex).
+The `attributes/` subtree only exists once at least one COMPLEX node has been written (or once `read_json_attributes_meta` is called and lazy-creates `attributes_meta.dat`). The full COMPLEX lifecycle (write, read, delete, slot reuse) runs end-to-end as of 2026-06-07: [BUG-014](../legacy/known_bugs.md#2026-05-26--bug-014-prog_number-mai-incrementatopersistito-dopo-write-complex) (`prog_number` now incremented + persisted, so sidecars no longer collide) and the COMPLEX part of [BUG-016](../legacy/known_bugs.md#2026-06-03--bug-016-delete_node-prototipo-non-aggiorna-idx-contatori-meta-archi-entranti-complex) are fixed. See the [sidecar JSON design decision](../legacy/design_decisions.md#2026-05-26--storage-sidecar-json-per-nodi-complex) and the [per-type binning decision](../legacy/design_decisions.md#2026-06-07--bin-per-tipo-per-i-record-complex-via-prog_number-zero-paddato).
 
 ## Design
 
@@ -48,8 +50,8 @@ The `attributes/` subtree only exists once at least one COMPLEX node has been wr
 - **Type tag inside `NodeIndex`** — lets `read_node` dispatch to the right `read_typed_node<T>` without touching `nodes.dat`.
 - **Edges stored separately** — `edges.dat` holds the flat list of all edges; each `RelationNodeList` tail entry stores `(name, edge_offset, edge_count)` pointing into it.
 - **Edge updates: append + obsolete** — `add_edge` rewrites the affected node's `RelationNodeList` and all its edge chunks at fresh offsets, then patches `NodeIndex.relation_offset`. The old regions become orphaned bytes. `update_node_edges` still only **logs** them (it is not yet wired to the freelist), so `add_edge` continues to leak. See [Edge persistence](../legacy/design_decisions.md#2026-05-30--edge-persistence-append--obsolete--in-place-index-patch).
-- **Freelist: size-segregated bins (since 2026-06-03)** — `db/freelist/<prefix>_<size>.dat`, one bin file per distinct free-region size. Push (`delete_node`) appends a free-offset record; pop (`insert` reuse path) reads the last record and truncates one record — both O(1), and a pop is always an exact fit. `delete_node` populates the bins; `insert` reuses a freed `nodes` slot for fixed-size primitives. `FreeRecord` was removed in favour of three sized POD records (`NodeFreeOffset` / `RelationNodeListFreeOffset` / `BatchOfEdgesFreeOffset`). `MetaRecord.free_count` / `free_edge_count` are still unused (`delete_node` does not update meta — [BUG-016](../legacy/known_bugs.md#2026-06-03--bug-016-delete_node-prototipo-non-aggiorna-idx-contatori-meta-archi-entranti-complex)). See [Freelist a bin segregati](../legacy/design_decisions.md#2026-06-03--freelist-a-bin-segregati-per-dimensione-esatta--cancellazione-nodo).
-- **COMPLEX payload stored out-of-line** — for `NodeType::COMPLEX`, the record in `nodes.dat` carries only the header + the labels; the actual JSON attributes live in `attributes/{prog_number}_{type_label}.json`, named via the `JsonMeta.prog_number` counter.
+- **Freelist: size-segregated bins (since 2026-06-03)** — `db/freelist/<prefix>_<size>.dat`, one bin file per distinct free-region size. Push (`delete_node`) appends a free-offset record; pop (`insert` reuse path) reads the last record and truncates one record — both O(1), and a pop is always an exact fit. `delete_node` populates the bins; `insert` reuses a freed slot for primitives (`nodes` bins) and for COMPLEX (`complex` bins). `FreeRecord` was removed in favour of three sized POD records (`NodeFreeOffset` / `RelationNodeListFreeOffset` / `BatchOfEdgesFreeOffset`). Since 2026-06-07 `delete_node` updates `MetaRecord.node_count`/`free_count`/`free_edge_count` ([BUG-016](../legacy/known_bugs.md#2026-06-03--bug-016-delete_node-prototipo-non-aggiorna-idx-contatori-meta-archi-entranti-complex) closed); the chunks orphaned by `update_node_edges` are still only logged, so `free_edge_count` does not count those. See [Freelist a bin segregati](../legacy/design_decisions.md#2026-06-03--freelist-a-bin-segregati-per-dimensione-esatta--cancellazione-nodo).
+- **COMPLEX payload stored out-of-line, per-type size class** — for `NodeType::COMPLEX`, the record in `nodes.dat` carries only the header + the two labels; the JSON attributes live in `attributes/{prog_number:020}_{type_label}.json`. The `prog_number` is **zero-padded to `COMPLEX_PROG_DIGITS` (20)**, which makes the record's on-disk size a pure function of `type_label` length — so the exact-size `complex_<size>` bins act as per-type size classes. On COMPLEX delete the sidecar file is removed and its `prog_number` recycled onto `freelist/json_prog.dat`. See the [per-type binning decision](../legacy/design_decisions.md#2026-06-07--bin-per-tipo-per-i-record-complex-via-prog_number-zero-paddato).
 
 See [Append-only data files, truncated meta](../legacy/design_decisions.md#2026-05-26--append-only-data-files-truncated-meta), [Edge persistence](../legacy/design_decisions.md#2026-05-30--edge-persistence-append--obsolete--in-place-index-patch) and [Storage sidecar JSON per nodi COMPLEX](../legacy/design_decisions.md#2026-05-26--storage-sidecar-json-per-nodi-complex).
 
@@ -63,10 +65,10 @@ A single `MetaRecord` POD, 48 bytes (24 → 48 on 2026-06-02, edge fields added)
 offset  size  field
   0      8    next_id          (uint64_t)  — next node id
   8      8    node_count       (uint64_t)
- 16      8    free_count       (uint64_t)  — node freelist size, currently unused
+ 16      8    free_count       (uint64_t)  — free node slots across all bins (+1 delete, −1 reuse)
  24      8    edge_count       (uint64_t)  — number of live edges
  32      8    next_edge_id     (uint64_t)  — next edge id (source of Edge.id)
- 40      8    free_edge_count  (uint64_t)  — edge freelist size, currently unused
+ 40      8    free_edge_count  (uint64_t)  — freed edge chunks (delete only; not update_node_edges)
 ```
 
 Rewritten in full on every insert via `write_meta`; also rewritten by `add_edge` whenever a genuinely new edge bumps `edge_count` / `next_edge_id`.
@@ -80,12 +82,12 @@ offset  size  field
   0      8    id              (uint64_t)
   8      8    offset          (uint64_t) → into nodes.dat (NodeRecord<T> or ComplexHeader)
  16      8    relation_offset (uint64_t) → into nodes.dat (RelationNodeList)
- 24      1    type_id         (uint8_t)  → NodeType enum  (0..4 primitives, 255 = COMPLEX)
+ 24      1    type_id         (uint8_t)  → NodeType enum  (0..4 primitives, 254 = TOMBSTONE, 255 = COMPLEX)
 ```
 
 Random access by id: `seekg(id * 25)`.
 
-`type_id == 255` (`NodeType::COMPLEX`) marks a record whose payload at `offset` is a `ComplexHeader` followed by two length-prefixed strings (`type_label`, `json_file_path`) — see below. The actual JSON payload lives in a separate sidecar file under `attributes/`. Write and read paths for COMPLEX are functional since 2026-05-30 (see [BUG-009..BUG-013](../legacy/known_bugs.md) and [BUG-015](../legacy/known_bugs.md)); [BUG-014](../legacy/known_bugs.md) is still open (sidecar filename collisions for two COMPLEX nodes with the same `type_label`). The value `255` is reserved.
+`type_id == 255` (`NodeType::COMPLEX`) marks a record whose payload at `offset` is a `ComplexHeader` followed by two length-prefixed strings (`type_label`, `json_file_path`) — see below. The actual JSON payload lives in a separate sidecar file under `attributes/`. The full COMPLEX path (write, read, delete, reuse) runs end-to-end as of 2026-06-07 ([BUG-014](../legacy/known_bugs.md#2026-05-26--bug-014-prog_number-mai-incrementatopersistito-dopo-write-complex) fixed — no more sidecar collisions). `type_id == 254` (`NodeType::TOMBSTONE`, added 2026-06-07) marks a logically-deleted slot: the entry stays (id reusable via the freelist) but `offset`/`relation_offset` are zeroed and the referenced bytes have been zero-filled; `read_node` on a tombstoned slot throws. The values `254` and `255` are reserved.
 
 **In-place mutation of `NodeIndex.relation_offset`.** Since 2026-05-30, `add_edge` causes the node's `relation_offset` to be patched in place by `update_node_edges` (the rest of the entry stays untouched: `id`, `offset`, and `type_id` are still set once at insert time and never moved). This is the single in-place write in the system; the file is opened with `std::ios::binary | std::ios::in | std::ios::out` (NOT `app` — Windows ignores `seekp` in app mode) and the patch lands at `node_id * sizeof(NodeIndex) + offsetof(NodeIndex, relation_offset)`. See [Edge persistence](../legacy/design_decisions.md#2026-05-30--edge-persistence-append--obsolete--in-place-index-patch).
 
@@ -133,11 +135,14 @@ Size-segregated free-offset bins, created lazily on the first `delete_node` (via
 
 | Prefix | Record POD | Region reclaimed |
 |---|---|---|
-| `nodes` | `NodeFreeOffset` (24 B: `idx`, `offset`, `size`) | a freed `NodeRecord` region in `nodes.dat` + its reusable id slot in `nodes.idx`. `size ∈ {1,4,8}` for the current primitives. |
+| `nodes` | `NodeFreeOffset` (24 B: `idx`, `offset`, `size`) | a freed primitive `NodeRecord` region in `nodes.dat` + its reusable id slot in `nodes.idx`. `size ∈ {1,4,8}` for the current primitives. |
+| `complex` | `NodeFreeOffset` (24 B: `idx`, `offset`, `size`) | a freed COMPLEX record region in `nodes.dat` + its reusable id slot. `size = (22 + COMPLEX_PROG_DIGITS) + 2·L` — constant per `type_label` length, so the bin is a per-type size class. |
 | `rel` | `RelationNodeListFreeOffset` (16 B: `offset`, `size`) | a freed `RelationNodeList` region (header + tail) in `nodes.dat`. |
 | `edges` | `BatchOfEdgesFreeOffset` (24 B: `idx`, `offset`, `size`) | a freed contiguous chunk of `Edge` records in `edges.dat` (`size = edge_count * 32`). |
 
-The `<size>` in the filename is the byte size of the free region; it makes a pop an exact fit with no scan. Only `delete_node` writes these bins today; `insert` reads only the `nodes` bins (primitives). `update_node_edges`' orphaned regions are **not** yet pushed here. See the [freelist design decision](../legacy/design_decisions.md#2026-06-03--freelist-a-bin-segregati-per-dimensione-esatta--cancellazione-nodo).
+`json_prog.dat` (no `<size>` suffix) is a separate LIFO stack of freed `prog_number`s (`uint64`), pushed on COMPLEX delete and popped by `complex_node_to_record` to keep sidecar numbers dense.
+
+The `<size>` in the filename is the byte size of the free region; it makes a pop an exact fit with no scan. `delete_node` populates the `nodes`/`complex`/`rel`/`edges` bins and `json_prog.dat`; `insert` reads the `nodes` bins (primitives) and the `complex` bins (COMPLEX). `update_node_edges`' orphaned regions are **not** yet pushed here. See the [freelist design decision](../legacy/design_decisions.md#2026-06-03--freelist-a-bin-segregati-per-dimensione-esatta--cancellazione-nodo).
 
 ### `attributes/attributes_meta.dat`
 
@@ -150,14 +155,14 @@ offset  size  field
 
 Truncated and rewritten in full via `write_json_attributes_meta`. Lazy-created on first call to `read_json_attributes_meta` (with `prog_number = 0`).
 
-### `attributes/{prog_number}_{type_label}.json`
+### `attributes/{prog_number:020}_{type_label}.json`
 
 The actual JSON attributes of a COMPLEX node, written as raw UTF-8 text (no length prefix, no framing). Filename composition:
 
-- `prog_number` comes from `JsonMeta.prog_number` at write time.
+- `prog_number` comes from `JsonMeta.prog_number` (or a recycled value from `json_prog.dat`) at write time, **zero-padded to `COMPLEX_PROG_DIGITS` (20)** — e.g. `00000000000000000000_Athlete.json`. The fixed width makes the record's on-disk size constant per type (see the [per-type binning decision](../legacy/design_decisions.md#2026-06-07--bin-per-tipo-per-i-record-complex-via-prog_number-zero-paddato)).
 - `type_label` is the COMPLEX node's runtime label (e.g. `Athlete`, `Item`).
 
-The exact filename **must** match the `json_file_path` string stored in the on-disk `ComplexHeader` so that the read path can reopen the file. Since 2026-05-30 (fix of [BUG-013](../legacy/known_bugs.md)) the same `json_file_path` string is threaded through `complex_node_to_record` → `write_complex` → both `write_string` on `nodes.dat` and the sidecar `std::ofstream` open, so the two sides cannot diverge anymore.
+The exact filename **must** match the `json_file_path` string stored in the on-disk `ComplexHeader` so that the read path can reopen the file. Since 2026-05-30 (fix of [BUG-013](../legacy/known_bugs.md#2026-05-26--bug-013-path-del-file-json-sidecar-incoerente-tra-complex_node_to_record-e-write_complex)) the same `json_file_path` string is threaded through `complex_node_to_record` → `write_complex` → both `write_string` on `nodes.dat` and the sidecar `std::ofstream` open, so the two sides cannot diverge. On COMPLEX delete the sidecar is removed (`std::filesystem::remove`) and its `prog_number` recycled.
 
 ## Diagrammi
 
@@ -220,9 +225,13 @@ The exact filename **must** match the `json_file_path` string stored in the on-d
 
 ## Voci legacy collegate
 
+- [Bin per-tipo per i record COMPLEX via prog_number zero-paddato](../legacy/design_decisions.md#2026-06-07--bin-per-tipo-per-i-record-complex-via-prog_number-zero-paddato)
+- [Tombstone + azzeramento delle regioni su delete](../legacy/design_decisions.md#2026-06-07--tombstone--azzeramento-delle-regioni-su-delete)
+- [Indice inverso degli archi entranti in-RAM](../legacy/design_decisions.md#2026-06-07--indice-inverso-degli-archi-entranti-in-ram)
+- [BUG-016 — delete_node completata (fixed)](../legacy/known_bugs.md#2026-06-03--bug-016-delete_node-prototipo-non-aggiorna-idx-contatori-meta-archi-entranti-complex)
+- [BUG-014 — prog_number incrementato/persistito (fixed)](../legacy/known_bugs.md#2026-05-26--bug-014-prog_number-mai-incrementatopersistito-dopo-write-complex)
 - [Freelist a bin segregati per dimensione esatta + cancellazione nodo](../legacy/design_decisions.md#2026-06-03--freelist-a-bin-segregati-per-dimensione-esatta--cancellazione-nodo)
 - [API — FreeRecord rimossa, tre POD free-offset](../legacy/api_changes.md#2026-06-03--freerecord-rimossa-sostituita-da-tre-pod-free-offset)
-- [BUG-016 — delete_node prototipo incompleto](../legacy/known_bugs.md#2026-06-03--bug-016-delete_node-prototipo-non-aggiorna-idx-contatori-meta-archi-entranti-complex)
 - [Edge persistence: append + obsolete + in-place index patch](../legacy/design_decisions.md#2026-05-30--edge-persistence-append--obsolete--in-place-index-patch)
 - [Storage sidecar JSON per nodi COMPLEX](../legacy/design_decisions.md#2026-05-26--storage-sidecar-json-per-nodi-complex)
 - [Introduzione tag NodeType::COMPLEX + ComplexRecord (WIP)](../legacy/design_decisions.md#2026-05-26--introduzione-tag-nodetypecomplex--complexrecord-wip)

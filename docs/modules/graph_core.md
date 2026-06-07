@@ -6,8 +6,8 @@
 |---|---|
 | Tipo | module |
 | Lingua | en |
-| Ultimo aggiornamento | 2026-06-03 |
-| Commit di riferimento | ca567e4 |
+| Ultimo aggiornamento | 2026-06-07 |
+| Commit di riferimento | 9966603 |
 | Mirror | — |
 
 ---
@@ -70,6 +70,7 @@ File + stderr logger. Constructor opens the log file in append mode and throws `
 | `META_FILE_PATH` | `constexpr std::string_view` | `"../db/meta.dat"` | Path to the meta file. Declared but currently unused — `write_meta`/`read_meta` still compose the path inline from `DB_PATH`. |
 | `JSON_ATTR_META_PATH` | `constexpr std::string_view` | `"../db/attributes/attributes_meta.dat"` | Path to the `JsonMeta` POD used to track unique JSON sidecar names. |
 | `JSON_ATTR_PATH` | `constexpr std::string_view` | `"../db/attributes/"` | Base directory for JSON sidecar files attached to COMPLEX nodes. |
+| `COMPLEX_PROG_DIGITS` | `constexpr uint8_t` | `20` | Fixed width of the zero-padded `prog_number` prefix in a COMPLEX sidecar filename. 20 covers the full `uint64` range, making a COMPLEX record's on-disk size a pure function of `type_label` length so the exact-size freelist bins act as per-type size classes. See the [binning decision](../legacy/design_decisions.md#2026-06-07--bin-per-tipo-per-i-record-complex-via-prog_number-zero-paddato). |
 
 ### `struct EdgeRef` (`struct/domain_struct.h`)
 RAM-side description of one outgoing edge. Inner value type of the adjacency map. Introduced 2026-06-02 to carry the edge id alongside the weight (see [API change](../legacy/api_changes.md#2026-06-02--basenodeneighborgs-da-pairint-basenode-a-edgeref)).
@@ -93,7 +94,7 @@ Virtual destructor so deleting through `BaseNode*` frees the derived `Node<T>` c
 Adds the typed payload `T data;`. `T` is constrained at use site to be POD (trivially copyable) by `node_to_record`'s `static_assert`.
 
 ### `enum class NodeType : uint8_t` (`struct/pod_struct.h`)
-On-disk tag for `T`. Values: `INT=0, FLOAT=1, DOUBLE=2, CHAR=3, BOOL=4, COMPLEX=255`. The integer values are stable — changing them breaks the on-disk format. `COMPLEX` is reserved for records carrying a runtime `type_label` + JSON attributes (see `ComplexHeader` and `ComplexRecord` below); its on-disk format follows the [sidecar JSON design](../legacy/design_decisions.md#2026-05-26--storage-sidecar-json-per-nodi-complex) and the write path is present but currently not compilable (see [BUG-009..BUG-014](../legacy/known_bugs.md)). Future primitive types should use values `5..254`.
+On-disk tag for `T`. Values: `INT=0, FLOAT=1, DOUBLE=2, CHAR=3, BOOL=4, TOMBSTONE=254, COMPLEX=255`. The integer values are stable — changing them breaks the on-disk format. `TOMBSTONE` (added 2026-06-07) marks a logically-deleted `nodes.idx` slot: the entry survives (its id stays reusable via the freelist) but its offsets are zeroed and the on-disk record/relation/edge bytes have been zero-filled; `read_node` on a tombstoned id throws, and a later reuse overwrites the whole `NodeIndex`, clearing it. See the [tombstone decision](../legacy/design_decisions.md#2026-06-07--tombstone--azzeramento-delle-regioni-su-delete). `COMPLEX` is for records carrying a runtime `type_label` + JSON attributes (see `ComplexHeader` and `ComplexRecord` below); its full insert→write→read→delete→reuse path is implemented (sidecar JSON design [here](../legacy/design_decisions.md#2026-05-26--storage-sidecar-json-per-nodi-complex)). Future primitive types should use values `5..253`.
 
 ### `struct NodeIndex` (POD, packed) (`struct/pod_struct.h`)
 Fixed-width entry stored in `nodes.idx`.
@@ -129,10 +130,10 @@ Per-relation entries `[uint64_t name_length][name bytes][uint64_t edge_offset][u
 |---|---|---|
 | `next_id` | `uint64_t` | Next node id to assign on insert. |
 | `node_count` | `uint64_t` | Total nodes ever inserted. |
-| `free_count` | `uint64_t` | Node freelist size. Reserved for freelist support — currently never written to except as `0`. |
+| `free_count` | `uint64_t` | Count of free node slots across all freelist bins. `delete_node_from_disk` increments it (+1), the reuse path of `Graph::insert` decrements it (−1). Maintained since 2026-06-07. |
 | `edge_count` | `uint64_t` | Number of live edges. Incremented by `add_edge` for each genuinely new edge (since 2026-06-02). |
 | `next_edge_id` | `uint64_t` | Next edge id to assign. Monotonic source for `Edge.id` / `EdgeRef.id` (since 2026-06-02 — [BUG-002](../legacy/known_bugs.md#2026-05-26--bug-002-edgeid-non-globale-tra-nodi) fixed). |
-| `free_edge_count` | `uint64_t` | Edge freelist size. Reserved — currently never written to except as `0`. |
+| `free_edge_count` | `uint64_t` | Count of freed edge chunks (one freelist record per orphaned `(node, relation)` chunk). `delete_node_from_disk` adds the deleted node's chunk count. Maintained since 2026-06-07. Caveat: the chunks orphaned by `update_node_edges` (on `add_edge` and on inbound-edge cleanup) are still only logged, not pushed — so they are NOT counted here. |
 
 POD layout grew from 24 to 48 bytes on 2026-06-02 (the three edge fields) — see [API change](../legacy/api_changes.md#2026-06-02--metarecord-aggiunti-i-campi-edge_count-next_edge_id-free_edge_count). Any `db/meta.dat` produced before that must be wiped.
 
@@ -172,9 +173,9 @@ The two strings (`type_label` then `json_file_path`) are written **after** the h
 Metadata for the COMPLEX sidecar file naming scheme.
 | Field | Type | Purpose |
 |---|---|---|
-| `prog_number` | `uint64_t` | Monotonic counter used to compose unique sidecar names `{prog_number}_{type_label}.json`. Persisted in `db/attributes/attributes_meta.dat`. |
+| `prog_number` | `uint64_t` | Monotonic counter used to compose unique sidecar names. Persisted in `db/attributes/attributes_meta.dat`. The name is `{prog_number:020}_{type_label}.json` — the number is **zero-padded to `COMPLEX_PROG_DIGITS` (20)** since 2026-06-07, so the record size is constant per type. |
 
-`read_json_attributes_meta` lazy-creates the file with `prog_number = 0` on first access. The counter is **not yet incremented by the write path** (see [BUG-014](../legacy/known_bugs.md)).
+`read_json_attributes_meta` lazy-creates the file with `prog_number = 0` on first access. Since 2026-06-07 the counter **is** advanced and persisted by `complex_node_to_record` ([BUG-014](../legacy/known_bugs.md#2026-05-26--bug-014-prog_number-mai-incrementatopersistito-dopo-write-complex) fixed): a fresh number is consumed (and `prog_number+1` persisted) only when no recycled number is available from the json free list (`db/freelist/json_prog.dat`, freed on COMPLEX delete).
 
 ### `struct ComplexRecord` (`struct/domain_struct.h`)
 RAM-side representation of a `COMPLEX` node payload. Not POD — contains `std::string`.
@@ -183,13 +184,13 @@ RAM-side representation of a `COMPLEX` node payload. Not POD — contains `std::
 | `type_label` | `std::string` | Runtime-typed label (e.g. `"Athlete"`, `"Item"`, `"Company"`). |
 | `json_attributes` | `std::string` | JSON-encoded attributes of the record (lives in RAM; on disk it is written to a sidecar file, not inline). |
 
-Because `ComplexRecord` is not trivially copyable, it **cannot** flow through the existing `node_to_record` / `write_pod` path: that template would fail the `static_assert` in `odt/node_odt.h:22`. The COMPLEX branch of `write_node` routes through `complex_node_to_record` (computes the sidecar path) + `write_complex` (writes the header, the two length-prefixed strings, and the sidecar JSON file). Since 2026-05-30, both this branch and `Graph::insert<ComplexRecord>` compile ([BUG-010](../legacy/known_bugs.md) and [BUG-015](../legacy/known_bugs.md) fixed); the only remaining COMPLEX-related open item is [BUG-014](../legacy/known_bugs.md) (`prog_number` never persisted).
+Because `ComplexRecord` is not trivially copyable, it **cannot** flow through the existing `node_to_record` / `write_pod` path: that template would fail the `static_assert` in `odt/node_odt.h:22`. The COMPLEX branch of `write_node` routes through `complex_node_to_record` (computes the sidecar path) + `write_complex` (writes the header, the two length-prefixed strings, and the sidecar JSON file). The full COMPLEX lifecycle is implemented: insert (append or reuse via `write_complex_in_freed_slot`), read (`read_complex`), and delete (`delete_node_from_disk` reads the header for the real size, removes the sidecar, recycles the `prog_number`). The previously-open COMPLEX items [BUG-014](../legacy/known_bugs.md#2026-05-26--bug-014-prog_number-mai-incrementatopersistito-dopo-write-complex) and the COMPLEX part of [BUG-016](../legacy/known_bugs.md#2026-06-03--bug-016-delete_node-prototipo-non-aggiorna-idx-contatori-meta-archi-entranti-complex) are fixed (2026-06-07).
 
 ### `template<class T> struct node_type_of` (`struct/type_registry.h`)
 Compile-time `T → NodeType` map. Primary template is intentionally undefined; specializations exist for `int, float, double, char, bool` and `ComplexRecord` (→ `COMPLEX`). Using an unsupported `T` triggers a clear compile error. Convenience: `node_type_of_v<T>`. The `ComplexRecord → COMPLEX` mapping is defined and `write_node` / `read_typed_node` / `Graph::insert` all dispatch on it via `if constexpr`. The full insert→write→read path compiles since 2026-05-30 ([BUG-010](../legacy/known_bugs.md) and [BUG-015](../legacy/known_bugs.md) fixed).
 
 ### `size_t node_record_payload_size(NodeType)` (`struct/type_registry.h` decl, `type_registry.cpp` def)
-Non-template runtime helper: on-disk payload size of a `NodeRecord` for a given `NodeType` (`INT`→4, `FLOAT`→4, `DOUBLE`→8, `CHAR`→1, `BOOL`→1, `COMPLEX`→`sizeof(ComplexHeader)`; `throw std::runtime_error` on unknown tag). Defined **out-of-line** in `type_registry.cpp` (added to `CMakeLists.txt` 2026-06-03) so it has a single definition across the program — a header body would be a multiple-definition/ODR error. Used to pick the freelist bin in `delete_node_from_disk` (push) and `Graph::insert`'s reuse path (pop). **COMPLEX caveat:** returns header-only size, not the real variable-width record size (header + two length-prefixed strings) — see [BUG-016](../legacy/known_bugs.md#2026-06-03--bug-016-delete_node-prototipo-non-aggiorna-idx-contatori-meta-archi-entranti-complex).
+Non-template runtime helper: on-disk payload size of a `NodeRecord` for a given `NodeType` (`INT`→4, `FLOAT`→4, `DOUBLE`→8, `CHAR`→1, `BOOL`→1, `COMPLEX`→`sizeof(ComplexHeader)`; `throw std::runtime_error` on unknown tag, including `TOMBSTONE`). Defined **out-of-line** in `type_registry.cpp` (added to `CMakeLists.txt` 2026-06-03) so it has a single definition across the program — a header body would be a multiple-definition/ODR error. Used to pick the freelist bin for primitives in `delete_node_from_disk` (push) and `Graph::insert`'s reuse path (pop). **COMPLEX is no longer routed through it:** since 2026-06-07 the COMPLEX paths use the real variable-width size — `complex_record_on_disk_size(L)` on insert and the on-disk `ComplexHeader` on delete (see [binning decision](../legacy/design_decisions.md#2026-06-07--bin-per-tipo-per-i-record-complex-via-prog_number-zero-paddato)).
 
 ### `struct BFSPolicy` / `struct DFSPolicy` (`struct/functions_policies.h`)
 Concept-style policies. Each provides:
@@ -206,19 +207,21 @@ In-memory form of one relation-type entry parsed from `RelationNodeList` tail. F
 ### `class Graph` (`graph.h`)
 **Members:**
 - `std::unordered_map<int, BaseNode*> nodes` — owns all heap-allocated nodes; freed in the destructor.
+- `std::unordered_map<int, std::unordered_set<int>> in_edges` — inbound (reverse) edge index `to_id → {from_id}`. In-RAM only, never persisted; rebuilt from disk at load by `build_in_edges` and maintained incrementally by `add_edge` / `delete_node`. Lets `delete_node` find inbound edges in O(deg_in). Added 2026-06-07 — see the [reverse-index decision](../legacy/design_decisions.md#2026-06-07--indice-inverso-degli-archi-entranti-in-ram).
 - `MetaRecord meta` — in-RAM copy of `meta.dat`.
 - `Logger logger` — writes to `graph.log` with `DEBUG` floor.
 
 **Private methods:**
 - `void init_meta()` — zero-fill `meta` and write `meta.dat`. Called by the constructor when no `meta.dat` exists.
 - `void load_meta()` — read `meta.dat` into `meta`.
+- `void build_in_edges()` — `in_edges = build_inbound_index(meta.next_id)`. Called by the constructor on the load path (existing DB). One O(N+E) disk scan.
 
 **Public methods:** see next section.
 
 ## Funzioni / interfacce esposte
 
 ### `Graph::Graph()` (`graph.cpp:8`)
-Creates `DB_PATH` if missing. If `meta.dat` doesn't exist or is zero-sized, calls `init_meta()`; otherwise `load_meta()`.
+Creates `DB_PATH` if missing. If `meta.dat` doesn't exist or is zero-sized, calls `init_meta()`; otherwise `load_meta()` followed by `build_in_edges()` (one O(N+E) scan to rebuild the reverse index — the only work the constructor does beyond reading `meta` on the load path).
 
 ### `Graph::~Graph()` (`graph.cpp:21`)
 `delete`s every node in `nodes`. The map itself is destroyed by the `unordered_map` destructor.
@@ -226,21 +229,24 @@ Creates `DB_PATH` if missing. If `meta.dat` doesn't exist or is zero-sized, call
 ### `template<class T> void Graph::insert(T&& value)` (`graph.h:43`)
 Allocates a `Node<ValueType>` (with `T` stripped of reference) and forwards `value` into `data`. Then, since 2026-06-03, picks one of two paths:
 
-- **Reuse path** (only `if constexpr (node_type_of_v<ValueType> != NodeType::COMPLEX)`): tries `pop_free_offset<NodeFreeOffset>(freelist_bin_path("nodes", node_record_payload_size(...)))`. If a fitting freed slot exists, recycles its `idx` as the node id and writes the record in place via `write_node_in_freed_slot`. `meta.node_count++` but **`meta.next_id` is NOT bumped** (the id was reused). The INFO log marks `(reused slot)`.
-- **Append path** (no fitting hole, or `COMPLEX`): mints `node_id = meta.next_id`, calls `write_node(*newNode, meta)`, then `meta.node_count++` and `meta.next_id++`.
+- **Reuse path**: tries to `pop_free_offset<NodeFreeOffset>` from the right size bin. An `if constexpr` dispatches by type:
+  - **primitives** (`!= COMPLEX`): bin `freelist_bin_path("nodes", node_record_payload_size(...))`; on a hit writes the record in place via `write_node_in_freed_slot`.
+  - **COMPLEX** (since 2026-06-07): bin `freelist_bin_path("complex", complex_record_on_disk_size(type_label.size()))`; on a hit writes via `write_complex_in_freed_slot`. The fixed per-type size makes the hit an exact fit.
+  On a hit, recycles the slot's `idx` as the node id, does `meta.node_count++` and `meta.free_count--`, but **`meta.next_id` is NOT bumped** (the id was reused). The INFO log marks `(reused slot)`.
+- **Append path** (no fitting hole): mints `node_id = meta.next_id`, calls `write_node(*newNode, meta)`, then `meta.node_count++` and `meta.next_id++`.
 
-Both paths place the node in `nodes[node_id]`, log at INFO, then `write_meta(meta)`. The `if constexpr` guard also keeps `write_node_in_freed_slot<ComplexRecord>` from ever being instantiated (it would fail `node_to_record`'s `static_assert`).
+Both paths place the node in `nodes[node_id]`, log at INFO, then `write_meta(meta)`. The `if constexpr` split keeps each writer instantiated only for its types (`write_node_in_freed_slot<ComplexRecord>` would fail `node_to_record`'s `static_assert`; `write_complex_in_freed_slot` needs the `ComplexRecord` payload).
 
-- Throws: whatever `write_node` / `write_node_in_freed_slot` / `pop_free_offset` / `write_meta` throw (runtime_error on file open/truncate failure).
-- Side effects: writes to `db/nodes.dat`, `db/nodes.idx`, `db/edges.dat` (empty edges section), `db/meta.dat`; on the reuse path also truncates a `db/freelist/nodes_<size>.dat` bin; appends to `graph.log` and stderr.
+- Throws: whatever the write helpers / `pop_free_offset` / `write_meta` throw (runtime_error on file open/truncate failure).
+- Side effects: writes to `db/nodes.dat`, `db/nodes.idx`, `db/edges.dat` (empty edges section), `db/meta.dat`; on the reuse path also truncates a `db/freelist/{nodes,complex}_<size>.dat` bin; for COMPLEX also writes the sidecar under `db/attributes/`; appends to `graph.log` and stderr.
 
 ### `void Graph::delete_node(int node_id)` (`graph.cpp:163`)
-Deletes a node and pushes its on-disk regions onto the freelist. Added 2026-06-03 — see [API change](../legacy/api_changes.md#2026-06-03--nuova-graphdelete_nodeint).
+Fully deletes a node (added 2026-06-03, completed 2026-06-07 — [BUG-016](../legacy/known_bugs.md#2026-06-03--bug-016-delete_node-prototipo-non-aggiorna-idx-contatori-meta-archi-entranti-complex) closed). See [API change](../legacy/api_changes.md#2026-06-03--nuova-graphdelete_nodeint).
 1. If `node_id` not in RAM: lazy-load via `read_node` when `node_id < meta.next_id` (same pattern as `add_edge`), else throw `std::out_of_range`. A failed reload throws `std::runtime_error`.
-2. Logs the count of outgoing edges being dropped (sum over `neighborgs`), erases the node from `nodes`, and `delete`s the pointer.
-3. Calls `delete_node_from_disk(node_id, meta)` to push the `NodeRecord`, `RelationNodeList`, and each edge chunk onto their size bins.
-
-**Incomplete (prototype):** does not tombstone the `nodes.idx` slot, does not update `meta` counters, does not remove inbound edges from other nodes, does not handle the variable-width COMPLEX payload. See [BUG-016](../legacy/known_bugs.md#2026-06-03--bug-016-delete_node-prototipo-non-aggiorna-idx-contatori-meta-archi-entranti-complex).
+2. Logs the count of outgoing edges. **Reverse-index outbound cleanup:** for every neighbor the node points at, removes `node_id` from `in_edges[neighbor]`. Decrements `meta.edge_count` by the node's outgoing edge count.
+3. **Inbound cleanup:** for each owner in `in_edges[node_id]`, loads it (lazy), erases `node_id` from every relation of its adjacency (dropping relations left empty), re-persists it via `update_node_edges`, and decrements `meta.edge_count` per removed edge. Then drops `in_edges[node_id]`. This is what prevents dangling neighbors after a reload.
+4. Erases the node from `nodes` and `delete`s the pointer.
+5. Calls `delete_node_from_disk(node_id, meta)` (orphans + zeroes the node's regions, tombstones its idx slot, removes the COMPLEX sidecar if any, updates `node_count`/`free_count`/`free_edge_count`), then `write_meta(meta)`.
 
 ### `void Graph::add_edge(int start, int end, std::string type = "", int weight = 1)` (`graph.cpp:53`)
 1. Rejects `type` longer than `RELATION_TYPE_MAX_SIZE` (throws `std::invalid_argument`).
@@ -263,7 +269,7 @@ Thin wrappers selecting `BFSPolicy` / `DFSPolicy`.
 | Function | Purpose |
 |---|---|
 | `void write_node_index(uint64_t record_offset, uint64_t relation_offset, NodeType, std::ofstream&, const MetaRecord&)` | Builds and writes a `NodeIndex` to `nodes.idx`. `idx.id = meta.next_id`. |
-| `void write_complex(const ComplexRecord&, const std::string &json_file_path, std::ofstream&)` | Writes the COMPLEX payload to `nodes.dat` (`ComplexHeader` built from current string sizes + two length-prefixed strings: `type_label` and `json_file_path`) and writes `record.json_attributes` to the sidecar file at `JSON_ATTR_PATH / json_file_path`. Throws `runtime_error` if the sidecar cannot be opened. Functional since 2026-05-30 ([BUG-009](../legacy/known_bugs.md), [BUG-011](../legacy/known_bugs.md), [BUG-013](../legacy/known_bugs.md) all fixed). |
+| `void write_complex(const ComplexRecord&, const std::string &json_file_path, std::ostream&)` | Writes the COMPLEX payload to `nodes.dat` (`ComplexHeader` built from current string sizes + two length-prefixed strings: `type_label` and `json_file_path`) and writes `record.json_attributes` to the sidecar file at `JSON_ATTR_PATH / json_file_path`. Takes `std::ostream&` (not `std::ofstream&`) since 2026-06-07 so it can also write **in place** on a `std::fstream` (reuse path). Throws `runtime_error` if the sidecar cannot be opened. |
 | `void read_complex(ComplexRecord&, std::ifstream&)` | Reads the COMPLEX payload (header + two length-prefixed strings) from `nodes.dat` and slurps the sidecar JSON file under `JSON_ATTR_PATH` into `out.json_attributes`. Throws `runtime_error` if the sidecar is missing. Called by the `if constexpr` COMPLEX branch of `read_typed_node<T>`. |
 | `void update_node_edges(BaseNode&, const MetaRecord&, uint64_t node_id)` | Persists the current `neighborgs` of an already-on-disk node to `nodes.dat` / `edges.dat` and patches `NodeIndex.relation_offset` in `nodes.idx` in place. Reads the OLD relation list to compute the orphaned regions and logs them on `graph_io.log` (placeholder for the future freelist). Single source of in-place mutation in the system; called by `Graph::add_edge` since 2026-05-30. The `MetaRecord&` parameter is currently unused — reserved for when the freelist becomes persistent. |
 | `NodeIndex read_node_index(std::ifstream&)` | Reads one `NodeIndex` from the current stream position. |
@@ -275,12 +281,16 @@ Thin wrappers selecting `BFSPolicy` / `DFSPolicy`.
 | `template<T> uint64_t write_node_record(const Node<T>&)` | Appends a `NodeRecord<T>` to `nodes.dat`. Returns the offset. |
 | `template<T> uint64_t write_relation_node_list(const Node<T>&, uint64_t node_id, std::ofstream& out)` | Appends `RelationNodeList` header (with `batch_size` populated via `node_to_relation_list`) + tail to `out` (already-open `nodes.dat`), and appends each edge to `edges.dat`. Returns the byte offset where the relation list was written. |
 | `template<T> void write_node(const Node<T>&, const MetaRecord&)` | Composes the three writes for a full node persist (record + relations + index). Dispatches the record write via `if constexpr (node_type_of_v<T> == NodeType::COMPLEX)`: primitives go through `node_to_record` + `write_pod`, `COMPLEX` goes through `complex_node_to_record` + `write_complex`. Compiles since 2026-05-30 ([BUG-010](../legacy/known_bugs.md) fixed). |
-| `BaseNode* read_node(uint64_t id)` | Reads `NodeIndex` at `id * sizeof(NodeIndex)` in `nodes.idx`, dispatches on `type_id` to the right `read_typed_node<T>`. No `case NodeType::COMPLEX:` yet — reading a COMPLEX index throws `"Unknown NodeType"`. |
+| `BaseNode* read_node(uint64_t id)` | Reads `NodeIndex` at `id * sizeof(NodeIndex)` in `nodes.idx`, dispatches on `type_id` to the right `read_typed_node<T>` (incl. `COMPLEX` → `read_typed_node<ComplexRecord>`). A `TOMBSTONE` tag throws `"node id N is tombstoned (deleted)"`; an unknown tag throws `"Unknown NodeType"`. |
 | `template<T> NodeRecord<T> read_node_record(std::ifstream&)` | Reads one `NodeRecord<T>`. |
 | `template<T> BaseNode* read_typed_node(const NodeIndex&, std::ifstream& dat_in)` | Builds a fresh `Node<T>` on the heap with data + neighbors (neighbor pointers left `nullptr`). |
-| `void delete_node_from_disk(uint64_t node_id, const MetaRecord& meta)` | Reads the node's `NodeIndex` + `RelationNodeList`, computes the reclaimable regions (NodeRecord, RelationNodeList, each edge chunk) and pushes them onto the `nodes`/`rel`/`edges` size bins via `write_free_offset`. For each edge chunk reads the first `Edge` to capture the batch's starting id. `meta` is currently **unused** (`(void)meta;`) — reserved for the counter update. Does NOT tombstone `nodes.idx`, update `meta`, clean inbound edges, or size COMPLEX correctly ([BUG-016](../legacy/known_bugs.md#2026-06-03--bug-016-delete_node-prototipo-non-aggiorna-idx-contatori-meta-archi-entranti-complex)). Throws `runtime_error` on file-open failure. |
+| `void delete_node_from_disk(uint64_t node_id, MetaRecord& meta)` | Orphans the node's regions (NodeRecord, RelationNodeList, each edge chunk) onto the size bins via `write_free_offset`, **zeroes** those byte regions (`zero_region`), **tombstones** the `nodes.idx` slot (`type_id = TOMBSTONE`, offsets zeroed), and updates the counters (`node_count--`, `free_count++`, `free_edge_count += chunks`). `meta` is taken by non-`const` ref since 2026-06-07 (caller does `write_meta`). For COMPLEX: reads the on-disk `ComplexHeader` for the real record size → `complex_<size>` bin, `remove()`s the JSON sidecar, and recycles its `prog_number` onto the json free list. Throws `runtime_error` on file-open failure. |
 | `template<T> void write_node_in_freed_slot(const Node<T>&, uint64_t node_id, uint64_t record_offset)` | Reuse-path counterpart of `write_node`: writes `NodeRecord<T>` **in place** at the freed `record_offset` in `nodes.dat`, the `NodeIndex` **in place** at the freed id slot in `nodes.idx`, and **appends** the (empty) `RelationNodeList` at end-of-`nodes.dat`. Never instantiated for COMPLEX (variable on-disk size). |
-| `std::filesystem::path freelist_bin_path(const std::string& prefix, uint64_t size)` (inline) | Builds `db/freelist/<prefix>_<size>.dat`. `prefix ∈ {"nodes","rel","edges"}`. |
+| `void write_complex_in_freed_slot(const Node<ComplexRecord>&, uint64_t node_id, uint64_t record_offset)` (inline) | COMPLEX counterpart of `write_node_in_freed_slot`. Writes `ComplexHeader` + two strings **in place** at the freed `record_offset` (exact-fit slot) via `complex_node_to_record` + `write_complex` (which also writes the sidecar and assigns the `prog_number`), appends the empty `RelationNodeList`, and writes the `NodeIndex` (`type_id = COMPLEX`) in place. Added 2026-06-07. |
+| `std::unordered_map<int, std::unordered_set<int>> build_inbound_index(uint64_t next_id)` | Scans every live node (skips `TOMBSTONE`) and follows its relation chunks to build the reverse index `to_node → {from_node}`. O(N+E). Only live nodes' chunks are read, so zeroed/freed edges are never counted. Used by `Graph::build_in_edges` at load. Added 2026-06-07. |
+| `uint64_t complex_record_on_disk_size(uint64_t type_label_len)` (inline) | On-disk size of a COMPLEX record as a pure function of `type_label` length: `sizeof(ComplexHeader) + L + (COMPLEX_PROG_DIGITS + 1 + L + 5)`. Used to pick the `complex_<size>` bin on insert. Added 2026-06-07. |
+| `std::filesystem::path json_freelist_path()` (inline) | Path of the json free list `db/freelist/json_prog.dat` (LIFO stack of freed `prog_number`s). Added 2026-06-07. |
+| `std::filesystem::path freelist_bin_path(const std::string& prefix, uint64_t size)` (inline) | Builds `db/freelist/<prefix>_<size>.dat`. `prefix ∈ {"nodes","rel","edges","complex"}`. |
 | `template<T> void write_free_offset(const T& fo, const std::filesystem::path&)` | Push: appends one free-offset record to its size bin (O(1)). Creates `db/freelist/` on first use. Throws on open failure. |
 | `template<T> std::optional<T> pop_free_offset(const std::filesystem::path&)` | Pop (LIFO): reads the last record then truncates the file by one record (O(1), exact fit). `std::nullopt` if the bin is missing/empty; throws if the truncate (`resize_file`) fails. |
 
@@ -300,7 +310,7 @@ Thin wrappers selecting `BFSPolicy` / `DFSPolicy`.
 | Function | Purpose |
 |---|---|
 | `template<T> NodeRecord<T> node_to_record(const Node<T>&)` (`node_odt.h:22`) | Copies `node.data` into a `NodeRecord<T>`. Asserts POD. |
-| `NodeRecord<ComplexHeader> complex_node_to_record(const Node<ComplexRecord>&, std::string &json_file_path)` (`node_odt.cpp:55`) | COMPLEX-specific ODT bridge: reads `JsonMeta`, composes the sidecar path into the out-param `json_file_path` as `{prog_number}_{type_label}.json` (uses `std::to_string`, see [BUG-011](../legacy/known_bugs.md) fix), builds a `ComplexHeader` from `type_label.size()` and `json_file_path.size()`, and returns it wrapped in `NodeRecord<ComplexHeader>`. The returned `NodeRecord` is currently unused by `write_node` (the header is rebuilt inside `write_complex` from the same inputs). Still does not persist the incremented `prog_number` — see [BUG-014](../legacy/known_bugs.md). |
+| `NodeRecord<ComplexHeader> complex_node_to_record(const Node<ComplexRecord>&, std::string &json_file_path)` (`node_odt.cpp`) | COMPLEX-specific ODT bridge. Decides the `prog_number`: pops a recycled one from the json free list, else consumes `JsonMeta.prog_number` and persists `+1` (BUG-014 fix). Composes the out-param `json_file_path` as `{prog_number:020}_{type_label}.json` — **zero-padded to `COMPLEX_PROG_DIGITS`** so the record size is constant per type. Builds a `ComplexHeader` from `type_label.size()` and `json_file_path.size()` and returns it wrapped in `NodeRecord<ComplexHeader>` (currently unused by `write_node`, which rebuilds the header inside `write_complex` from the same inputs). |
 | `RelationNodeList node_to_relation_list(const BaseNode&)` (`node_odt.cpp:27`) | Fills `type_count` and `batch_size`. `batch_size` is computed as `Σ (3 * sizeof(uint64_t) + name.size())` over all relations in `node.neighborgs` — see [API change](../legacy/api_changes.md#2026-05-30--relationnodelist-aggiunto-il-campo-batch_size). The variable-width tail itself is written separately by `write_relation_node_list` (on insert) or by `update_node_edges` (on edge update). |
 | `NodeIndex node_to_node_index(uint64_t id, uint64_t record_offset, uint64_t relation_offset)` (`node_odt.cpp:39`) | Builder for `NodeIndex` (currently unused — `write_node_index` builds the struct inline). |
 | `std::unordered_map<...> reconstruct_neighbors(const RelationNodeList&)` (`node_odt.cpp:86`) | **Stub — returns an empty map.** See [BUG-003](../legacy/known_bugs.md). |
@@ -361,6 +371,15 @@ No third-party libraries. No dependency on `data_tructures/`.
 
 ## Voci legacy collegate
 
+- [Bin per-tipo per i record COMPLEX via prog_number zero-paddato](../legacy/design_decisions.md#2026-06-07--bin-per-tipo-per-i-record-complex-via-prog_number-zero-paddato)
+- [Indice inverso degli archi entranti in-RAM](../legacy/design_decisions.md#2026-06-07--indice-inverso-degli-archi-entranti-in-ram)
+- [Tombstone + azzeramento delle regioni su delete](../legacy/design_decisions.md#2026-06-07--tombstone--azzeramento-delle-regioni-su-delete)
+- [API — NodeType::TOMBSTONE](../legacy/api_changes.md#2026-06-07--nodetypetombstone-aggiunto)
+- [API — delete_node_from_disk MetaRecord& + build_inbound_index](../legacy/api_changes.md#2026-06-07--delete_node_from_disk-const-metarecord--metarecord-build_inbound_index)
+- [API — Graph in_edges + delete_node completata](../legacy/api_changes.md#2026-06-07--graph-membro-in_edges--build_in_edges-delete_node-completata)
+- [API — write_complex su std::ostream& + write_complex_in_freed_slot](../legacy/api_changes.md#2026-06-07--write_complex-su-stdostream--write_complex_in_freed_slot)
+- [API — complex_node_to_record prog_number + zero-pad](../legacy/api_changes.md#2026-06-07--complex_node_to_record-prog_number-incrementatopersistito--zero-pad-complex_prog_digits)
+- [BUG-014 — prog_number non incrementato (fixed)](../legacy/known_bugs.md#2026-05-26--bug-014-prog_number-mai-incrementatopersistito-dopo-write-complex)
 - [Freelist a bin segregati per dimensione esatta + cancellazione nodo](../legacy/design_decisions.md#2026-06-03--freelist-a-bin-segregati-per-dimensione-esatta--cancellazione-nodo)
 - [API — FreeRecord rimossa, tre POD free-offset](../legacy/api_changes.md#2026-06-03--freerecord-rimossa-sostituita-da-tre-pod-free-offset)
 - [API — Graph::delete_node](../legacy/api_changes.md#2026-06-03--nuova-graphdelete_nodeint)
