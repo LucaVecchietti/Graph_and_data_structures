@@ -2,6 +2,10 @@
 #include<string.h>
 #include "map_hash_table.h"
 
+// Internal: defined below, called by hash_map_put when the load factor grows.
+// Forward-declared so the call in hash_map_put is not an implicit declaration.
+static void hash_map_rehash(HashTable *hash_table);
+
 unsigned long hash_function(const char *str) {
     /*
     This function calculates the hash value of a string using the djb2 algorithm.
@@ -31,6 +35,7 @@ void hash_map_put(HashTable *hash_table, const char *key, void *value){
     new_entry->value = value; // Assign the value to the new entry
     new_entry->next = hash_table->buckets[bucket_index]; // Set the next pointer of the new entry to the current head of the bucket's linked list (if any)
     hash_table->buckets[bucket_index] = new_entry; // Update the head of the bucket's linked list to point to the new entry
+    hash_table->size++; // Track the entry count so the load factor below is meaningful (BUG-007)
 
     // Check if the load factor of the hash table exceeds a certain threshold (e.g., 0.75) and rehash if necessary
     if ((float)hash_table->size / hash_table->num_buckets > 0.75) {
@@ -67,6 +72,7 @@ HashTable *init_hash_table(int num_buckets) {
 
     HashTable *hash_table = (HashTable *)malloc(sizeof(HashTable)); // Allocate memory for the hash table
     hash_table->num_buckets = num_buckets; // Set the number of buckets in the hash table
+    hash_table->size = 0; // No entries yet — must be initialised or the load factor is garbage (BUG-007)
     hash_table->buckets = (Entry **)calloc(num_buckets, sizeof(Entry *)); // Allocate memory for the array of bucket pointers and initialize them to NULL
 
     return hash_table; // Return the pointer to the initialized hash table
@@ -94,10 +100,12 @@ void free_hash_table(HashTable *hash_table) {
     free(hash_table); // Free the memory allocated for the hash table structure itself
 }
 
-void hash_map_reash(HashTable *hash_table) {
+static void hash_map_rehash(HashTable *hash_table) {
     /*
     This function rehashes the hash table by creating a new hash table with a larger number of buckets and re-inserting all the existing entries into the new hash table.
     It takes a pointer to the hash table as input and does not return anything.
+    Renamed from the misspelled `hash_map_reash` (BUG-006): hash_map_put calls
+    `hash_map_rehash`, so the definition's name must match or linking fails.
     */
 
     int old_size = hash_table->num_buckets;
@@ -124,4 +132,36 @@ void hash_map_reash(HashTable *hash_table) {
     free(hash_table->buckets); // Free the memory allocated for the old array of bucket pointers
     hash_table->buckets = new_buckets; // Update the pointer to the new array of bucket pointers in the hash table
     hash_table->num_buckets = new_size; // Update the number of buckets in the hash table to the new size
+}
+
+void hash_map_remove(HashTable *hash_table, const char *key) {
+    /*
+    This function removes the entry with the given key from the hash table, if present.
+    It takes a pointer to the hash table and a string key, and does not return anything.
+    Implemented to satisfy the prototype in map_hash_table.h (BUG-008).
+    */
+
+    unsigned long hash_value = hash_function(key); // Calculate the hash value of the key
+
+    int bucket_index = hash_value % hash_table->num_buckets; // Bucket where the key would live
+    Entry *current_entry = hash_table->buckets[bucket_index]; // Head of the bucket's linked list
+    Entry *prev_entry = NULL; // Trailing pointer so we can unlink the matched node
+
+    while (current_entry != NULL) { // Walk the chain looking for the key
+        if (strcmp(current_entry->key, key) == 0) { // Found the entry to remove
+            if (prev_entry == NULL) { // It is the head of the chain
+                hash_table->buckets[bucket_index] = current_entry->next;
+            } else { // It is somewhere in the middle/tail
+                prev_entry->next = current_entry->next;
+            }
+
+            free(current_entry->key); // Free the duplicated key string
+            free(current_entry); // Free the entry itself
+            hash_table->size--; // Keep the entry count in sync (BUG-007)
+            return; // Keys are unique here; nothing more to do
+        }
+        prev_entry = current_entry; // Advance both pointers
+        current_entry = current_entry->next;
+    }
+    // Key not found: nothing to remove.
 }

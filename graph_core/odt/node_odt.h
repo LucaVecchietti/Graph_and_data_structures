@@ -78,26 +78,8 @@ struct RelationEntry
     uint64_t    edge_count;
 };
 
-/**
- * Reconstructs the neighbor list for a node based on its relation list.
- * @param rellist The relation list containing adjacency information.
- * @return A map of relation types to their associated neighbors.
- */
-std::unordered_map<std::string, std::unordered_map<int, EdgeRef>> reconstruct_neighbors(const RelationNodeList &rellist);
-
-/**
- * Creates a node from its POD representation.
- * @param idx The node index.
- * @param record The node record.
- * @param rellist The relation list.
- * @return The reconstructed node.
- */
-template <typename T>
-BaseNode node_form_pod(const NodeIndex &idx, const NodeRecord<T> &record, const RelationNodeList &rellist){
-    Node<T> node;
-    node.data = record.data;
-
-    node.neihborgs = reconstruct_neighbors(rellist);
-
-    return node;
-}
+// NOTE: `reconstruct_neighbors` and `node_form_pod` were removed (BUG-003/BUG-004).
+// They were never called and could not work as declared — neither has access to
+// the on-disk RelationNodeList tail or to edges.dat, so neither could rebuild the
+// adjacency. The real POD→domain reconstruction lives in `read_typed_node`
+// (io/graph_io.h), which reads the streams directly.

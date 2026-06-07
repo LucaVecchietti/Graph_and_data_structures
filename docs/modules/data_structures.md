@@ -6,8 +6,8 @@
 |---|---|
 | Tipo | module |
 | Lingua | en |
-| Ultimo aggiornamento | 2026-05-26 |
-| Commit di riferimento | 9e8b589 |
+| Ultimo aggiornamento | 2026-06-07 |
+| Commit di riferimento | 9966603 |
 | Mirror | — |
 
 > Note: the folder name is `data_tructures` (sic — missing `s`). Do not rename in docs; treat it as the canonical path.
@@ -16,7 +16,7 @@
 
 ## Overview
 
-A generic chained hash table keyed by `const char*`, with `void*` values. Uses the djb2 hash function. Buckets are singly-linked lists of `Entry` nodes. Load factor over `0.75` triggers a doubling rehash (note the typo in the rehash function — see [BUG-006](../legacy/known_bugs.md)).
+A generic chained hash table keyed by `const char*`, with `void*` values. Uses the djb2 hash function. Buckets are singly-linked lists of `Entry` nodes. Load factor over `0.75` triggers a doubling rehash. The internal bugs were fixed 2026-06-07 ([BUG-006](../legacy/known_bugs.md#2026-05-26--bug-006-typo-hash_map_reash) rehash typo, [BUG-007](../legacy/known_bugs.md#2026-05-26--bug-007-hashtablesize-mai-incrementato) `size` tracking, [BUG-008](../legacy/known_bugs.md#2026-05-26--bug-008-hash_map_remove-dichiarata-non-implementata) `hash_map_remove`); the module is still **not linked** into the build.
 
 The table is referenced as a future direction in `node_n_pointers.c` (the prototype graph), where the author wrote a comment about migrating from raw pointer arrays to a hash-table-based adjacency. The C++ rewrite (`graph_core/`) skipped this hash table and went directly to `std::unordered_map`, which is why this file is now orphaned in the build.
 
@@ -51,7 +51,7 @@ See [Hash table standalone in C](../legacy/design_decisions.md#2026-05-26--hash-
 |---|---|---|
 | `buckets` | `Entry**` | Array of `num_buckets` chain heads. |
 | `num_buckets` | `int` | Current bucket count (doubled on rehash). |
-| `size` | `int` | Declared in the struct but **never updated by `hash_map_put` / `hash_map_remove`**. The load-factor check uses `size / num_buckets`, but since `size` is never incremented, the rehash is never triggered in practice. See [BUG-007](../legacy/known_bugs.md). |
+| `size` | `int` | Number of live entries. Initialised to `0` in `init_hash_table`, incremented by `hash_map_put`, decremented by `hash_map_remove` (since 2026-06-07, [BUG-007](../legacy/known_bugs.md#2026-05-26--bug-007-hashtablesize-mai-incrementato) fixed). Drives the load-factor / rehash check. |
 
 ## Funzioni / interfacce esposte
 
@@ -62,19 +62,19 @@ Allocates a `HashTable` and a zero-initialized `buckets` array of length `num_bu
 - Failure mode: no `NULL` check on the allocations; if either fails, the next access will crash.
 
 ### `void hash_map_put(HashTable*, const char* key, void* value)` (`map_hash_table.c:20`)
-Computes `bucket_index = djb2(key) % num_buckets`, allocates a new `Entry`, duplicates `key` via `strdup`, prepends to the bucket's chain. If `size / num_buckets > 0.75`, calls `hash_map_rehash` — **but no such symbol exists**; the function is named `hash_map_reash` at line 97. This is a compile-link bug if the threshold is ever crossed. See [BUG-006](../legacy/known_bugs.md).
+Computes `bucket_index = djb2(key) % num_buckets`, allocates a new `Entry`, duplicates `key` via `strdup`, prepends to the bucket's chain, then increments `size`. If `size / num_buckets > 0.75`, calls `hash_map_rehash` (the internal helper, forward-declared at the top of the `.c`; the misspelling was fixed 2026-06-07, [BUG-006](../legacy/known_bugs.md#2026-05-26--bug-006-typo-hash_map_reash)).
 
 ### `void* hash_map_get(HashTable*, const char* key)` (`map_hash_table.c:41`)
 Linear scan of the bucket chain comparing by `strcmp`. Returns the matching value or `NULL`.
 
-### `void hash_map_remove(HashTable*, const char* key)` (`map_hash_table.h:23`)
-**Declared in the header but not defined in the `.c` file.** See [BUG-008](../legacy/known_bugs.md).
+### `void hash_map_remove(HashTable*, const char* key)` (`map_hash_table.c`)
+Walks the bucket's chain with a trailing `prev` pointer, unlinks the entry whose key matches, frees its `key` and the entry, and decrements `size`. No-op if the key is absent. Implemented 2026-06-07 ([BUG-008](../legacy/known_bugs.md#2026-05-26--bug-008-hash_map_remove-dichiarata-non-implementata) fixed).
 
 ### `void free_hash_table(HashTable*)` (`map_hash_table.c:75`)
 Walks each bucket, frees every entry's `key` and the entry itself, then frees the bucket array and the table.
 
-### `void hash_map_reash(HashTable*)` (`map_hash_table.c:97`)
-Allocates a new bucket array of size `num_buckets * 2`, re-hashes each existing entry, replaces `buckets`, updates `num_buckets`. **Misnamed** — see [BUG-006](../legacy/known_bugs.md).
+### `static void hash_map_rehash(HashTable*)` (`map_hash_table.c`)
+Internal helper (not in the `.h`). Allocates a new bucket array of size `num_buckets * 2`, re-hashes each existing entry, replaces `buckets`, updates `num_buckets`. Renamed from the misspelled `hash_map_reash` 2026-06-07 ([BUG-006](../legacy/known_bugs.md#2026-05-26--bug-006-typo-hash_map_reash) fixed).
 
 ### `unsigned long hash_function(const char*)` (`map_hash_table.c:5`)
 djb2: `hash = ((hash << 5) + hash) + c` starting from `5381`. Internal helper, not exposed in the header.
@@ -111,7 +111,7 @@ new Entry { key = strdup("road"), value = v, next = t->buckets[i] }
 t->buckets[i] = new Entry
     │
     ▼
-if (size / num_buckets > 0.75)  ─▶ hash_map_rehash  ← symbol does not exist
+if (size / num_buckets > 0.75)  ─▶ hash_map_rehash  ← internal helper (renamed, BUG-006)
 ```
 
 ## Dipendenze
@@ -133,4 +133,4 @@ if (size / num_buckets > 0.75)  ─▶ hash_map_rehash  ← symbol does not exis
 - `data_tructures/map_hash_table.h:11` — `HashTable`.
 - `data_tructures/map_hash_table.c:5` — `hash_function` (djb2).
 - `data_tructures/map_hash_table.c:20` — `hash_map_put`.
-- `data_tructures/map_hash_table.c:97` — `hash_map_reash` (misnamed).
+- `data_tructures/map_hash_table.c` — `hash_map_rehash` (static internal helper, renamed from `hash_map_reash`).

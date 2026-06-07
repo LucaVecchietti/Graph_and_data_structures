@@ -258,11 +258,8 @@ JsonMeta read_json_attributes_meta()
  * @param meta The metadata containing information about the graph state.
  * @param node_id The ID of the node whose edges need to be updated.
  */
-void update_node_edges(BaseNode &node, const MetaRecord &meta, uint64_t node_id)
+void update_node_edges(BaseNode &node, MetaRecord &meta, uint64_t node_id)
 {
-    (void)meta; // Reserved for future use (e.g. updating free_count when the
-                // freelist persistence lands; not needed yet).
-
     namespace fs = std::filesystem;
 
     // ---- 1. Read the current relation list of the node ---------------------
@@ -300,24 +297,50 @@ void update_node_edges(BaseNode &node, const MetaRecord &meta, uint64_t node_id)
         old_entries = read_relation_node_list(dat_in);
     }
 
-    // ---- 2. Orphan the OLD regions ----------------------------------------
-    // TODO(freelist follow-up): push these (offset, size) pairs onto the real
-    // freelists (db/relation_lists_freelist.dat, db/edges_freelist.dat) via
-    // write_free_offset — the same path delete_node_from_disk now uses — so
-    // subsequent writes can reuse the holes. For now update_node_edges still
-    // only logs the orphaning, so these regions accumulate as dead bytes in
-    // nodes.dat / edges.dat until this is wired in.
-    logger.info("update_node_edges: orphaning RelationNodeList at offset "
+    // ---- 2. Orphan the OLD regions onto the freelist bins (BUG-017) -------
+    // Push the old RelationNodeList region onto the `rel` bin and each old edge
+    // chunk onto the `edges` bin, zero those bytes (no stale data / no leak),
+    // and bump free_edge_count by the number of orphaned chunks. The rel region
+    // has no dedicated counter — same accounting as delete_node_from_disk. These
+    // bins are not reused yet, so they accumulate, but they are now tracked
+    // rather than silently leaked.
+    {
+        std::ifstream edges_in(fs::path(DB_PATH) / "edges.dat", std::ios::binary);
+        std::fstream edges_io(fs::path(DB_PATH) / "edges.dat", std::ios::binary | std::ios::in | std::ios::out);
+        for (const auto &entry : old_entries)
+        {
+            uint64_t chunk_size = entry.edge_count * sizeof(Edge);
+
+            // Capture the chunk's first edge id (reusable starting id) for the record.
+            uint64_t first_edge_id = 0;
+            if (entry.edge_count > 0 && edges_in)
+            {
+                edges_in.seekg(static_cast<std::streamoff>(entry.edge_offset));
+                Edge first = read_pod<Edge>(edges_in);
+                first_edge_id = first.id;
+            }
+            write_free_offset(BatchOfEdgesFreeOffset{first_edge_id, entry.edge_offset, chunk_size},
+                              freelist_bin_path("edges", chunk_size));
+            if (edges_io) zero_region(edges_io, entry.edge_offset, chunk_size);
+
+            logger.info("update_node_edges: orphaned edge chunk for relation \"" + entry.name
+                        + "\" at offset " + std::to_string(entry.edge_offset)
+                        + " of size " + std::to_string(chunk_size) + " bytes -> edges bin");
+        }
+    }
+
+    write_free_offset(RelationNodeListFreeOffset{node_idx.relation_offset, old_relation_total_size},
+                      freelist_bin_path("rel", old_relation_total_size));
+    {
+        std::fstream dat_io(fs::path(DB_PATH) / "nodes.dat", std::ios::binary | std::ios::in | std::ios::out);
+        if (dat_io) zero_region(dat_io, node_idx.relation_offset, old_relation_total_size);
+    }
+    meta.free_edge_count += old_entries.size();
+
+    logger.info("update_node_edges: orphaned RelationNodeList at offset "
                 + std::to_string(node_idx.relation_offset)
                 + " of size " + std::to_string(old_relation_total_size)
-                + " bytes (nodes.dat)");
-    for (const auto &entry : old_entries)
-    {
-        uint64_t chunk_size = entry.edge_count * sizeof(Edge);
-        logger.info("update_node_edges: orphaning edge chunk for relation \""
-                    + entry.name + "\" at offset " + std::to_string(entry.edge_offset)
-                    + " of size " + std::to_string(chunk_size) + " bytes (edges.dat)");
-    }
+                + " bytes -> rel bin; free_edge_count=" + std::to_string(meta.free_edge_count));
 
     // ---- 3. Write the NEW edge chunks and the NEW relation list ------------
     // Per-relation: append all current edges to edges.dat as one contiguous

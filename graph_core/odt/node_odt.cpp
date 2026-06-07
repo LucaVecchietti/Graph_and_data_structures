@@ -123,14 +123,6 @@ NodeRecord<ComplexHeader> complex_node_to_record(const Node<ComplexRecord> &node
     return record;
 }
 
-/**
- * 
- */
-std::unordered_map<std::string, std::unordered_map<int, EdgeRef>> reconstruct_neighbors(const RelationNodeList &rellist)
-{
-    std::unordered_map<std::string, std::unordered_map<int, EdgeRef>> neighbors;
-    
-    
-
-    return neighbors;
-}
+// reconstruct_neighbors removed (BUG-003): it was an empty stub with no callers.
+// The adjacency is rebuilt by read_typed_node (io/graph_io.h) straight from the
+// streams. See the note in node_odt.h.

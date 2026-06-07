@@ -153,17 +153,18 @@ void Graph::add_edge(int start, int end, std::string type, int weight)
     update_node_edges(*node, meta, start);
 
     // Persistence of the node's edges always happens above (even when the edge
-    // already existed — we just rewrote its save). The meta counters, however,
-    // only advance for a genuinely new edge: next_edge_id is the monotonic id
-    // source (now wired into Edge.id), edge_count tracks live edges. meta.dat is
-    // truncated + rewritten so the counters survive a restart.
+    // already existed — we just rewrote its save). The new-edge counters only
+    // advance for a genuinely new edge: next_edge_id is the monotonic id source
+    // (now wired into Edge.id), edge_count tracks live edges. update_node_edges
+    // also bumps free_edge_count on every call (it orphans the node's old edge
+    // chunks onto the freelist), so meta.dat must be rewritten unconditionally.
     if (is_new_edge)
     {
         in_edges[end].insert(start); // reverse index: `start` now points at `end`
         meta.next_edge_id++;
         meta.edge_count++;
-        write_meta(meta);
     }
+    write_meta(meta);
 }
 
 /**

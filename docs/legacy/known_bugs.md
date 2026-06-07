@@ -14,6 +14,7 @@
 
 ## Indice
 
+- [2026-06-07 — BUG-017: `update_node_edges` orfanizza regioni senza spingerle sulla freelist](#2026-06-07--bug-017-update_node_edges-orfanizza-regioni-senza-spingerle-sulla-freelist)
 - [2026-06-03 — BUG-016: `delete_node` prototipo non aggiorna idx, contatori meta, archi entranti, COMPLEX](#2026-06-03--bug-016-delete_node-prototipo-non-aggiorna-idx-contatori-meta-archi-entranti-complex)
 - [2026-05-30 — BUG-015: `Graph::insert` chiama `std::to_string` su `newNode->data`, incompatibile con `ComplexRecord`](#2026-05-30--bug-015-graphinsert-chiama-stdto_string-su-newnode-data-incompatibile-con-complexrecord)
 - [2026-05-26 — BUG-014: `prog_number` mai incrementato/persistito dopo write COMPLEX](#2026-05-26--bug-014-prog_number-mai-incrementatopersistito-dopo-write-complex)
@@ -33,6 +34,17 @@
 
 ---
 
+### 2026-06-07 — BUG-017: `update_node_edges` orfanizza regioni senza spingerle sulla freelist
+
+- **Stato:** fixed (2026-06-07)
+- **Sintomo:** Ad ogni `add_edge` (e ad ogni rimozione di arco entrante in `delete_node`), `update_node_edges` riscrive l'intera `RelationNodeList` del nodo + i chunk di edge a nuovi offset e patcha `NodeIndex.relation_offset`. Le **vecchie** regioni (la `RelationNodeList` orfana in `nodes.dat` e ogni vecchio chunk di edge in `edges.dat`) restavano byte morti: la funzione le **solo loggava** su `graph_io.log` senza spingerle sui bin della freelist, e `MetaRecord.free_edge_count` non le contava. Risultato: `nodes.dat`/`edges.dat` crescono monotoni ad ogni `add_edge` (leak non recuperabile e non tracciato).
+- **Root cause:** Implementazione a step: la freelist a bin è stata cablata prima solo su `delete_node_from_disk` (lato cancellazione nodo), lasciando il lato `update_node_edges` (riscrittura archi) come TODO esplicito nel codice.
+- **Fix (2026-06-07):** `update_node_edges` ora prende `MetaRecord &` (non più `const`) e, nello step "orphan the OLD regions", spinge la vecchia `RelationNodeList` sul bin `rel_<size>` e ogni vecchio chunk di edge sul bin `edges_<size>` via `write_free_offset`, azzera quei byte (`zero_region`, coerente con `delete_node_from_disk`) e incrementa `meta.free_edge_count` del numero di chunk orfanati (la regione `rel` non ha un contatore dedicato, come per il delete). `Graph::add_edge` ora chiama `write_meta` **incondizionatamente** (prima solo per archi nuovi), perché `free_edge_count` cambia ad ogni chiamata. `graph_core/io/graph_io.cpp` (`update_node_edges`), `graph_core/io/graph_io.h` (firma), `graph_core/graph.cpp` (`add_edge`).
+- **Nota:** i bin `rel`/`edges` non sono ancora **riusati** da nessun writer (il reuse di `insert` tocca solo i bin `nodes`/`complex`): le regioni sono ora **tracciate e azzerate** ma si accumulano finché un reuse di rel/edge non verrà implementato. Lo step push è completo; il lato reuse è il prossimo lavoro naturale della freelist.
+- **Regression guard:** nessuna test suite. Lo smoke test `main.cpp` (Phase 1-4) produce ora bin `rel_*`/`edges_*` non vuoti e `meta.free_edge_count` pari al numero di record in `edges_*` (verifica: 9 record da 24 B in `edges_32.dat` ⇔ `free_edge_count = 9`).
+
+---
+
 ### 2026-06-03 — BUG-016: `delete_node` prototipo non aggiorna idx, contatori meta, archi entranti, COMPLEX
 
 - **Stato:** fixed (2026-06-07)
@@ -47,7 +59,7 @@
   2. **Contatori meta** (`b56e86e`): `delete_node_from_disk` ora prende `MetaRecord &` (non più `const`), aggiorna `node_count--` / `free_count++` / `free_edge_count += chunk`; `Graph::delete_node` chiama `write_meta`. Il ramo reuse di `insert` decrementa `free_count` per mantenerlo veritiero. `Graph::delete_node` decrementa anche `edge_count` (archi uscenti del nodo + entranti rimossi) — prima non veniva mai decrementato.
   3. **Archi entranti** (`1315b00`): indice inverso in-RAM `Graph::in_edges` (`to_id → {from_id}`), ricostruito al load da `build_inbound_index` (scan O(N+E) dei soli nodi vivi) e mantenuto da `add_edge`/`delete_node`. Su delete, per ogni proprietario entrante si rimuove l'arco dall'adiacenza e si ri-persiste via `update_node_edges` → nessun vicino dangling dopo reload. Vedi [decisione](design_decisions.md#2026-06-07--indice-inverso-degli-archi-entranti-in-ram).
   4. **COMPLEX a size variabile** (`9966603`): `delete_node_from_disk` legge lo `ComplexHeader` per la size reale (`16 + type_label_size + json_file_path_size`), spinge la regione sui bin `complex_<size>`, rimuove il file sidecar JSON e ricicla il `prog_number` sulla json free list. Reso possibile dal binning per-tipo via `prog_number` zero-paddato. Vedi [decisione](design_decisions.md#2026-06-07--bin-per-tipo-per-i-record-complex-via-prog_number-zero-paddato).
-- **Regression guard:** nessuna test suite. Lo smoke test `main.cpp` esercita ora il giro completo: Phase 3 (delete di un `int` + reuse) e **Phase 4** (delete del nodo COMPLEX `Athlete` + re-insert con reuse dello slot, riciclo del `prog_number` e rinascita del sidecar). Verifica visuale su `graph.log` / `graph_io.log`, `db/freelist/` (bin `nodes_*`, `complex_*`, `json_prog.dat`), `db/attributes/` e i contatori in `meta.dat`. Limite residuo: `update_node_edges` continua a **solo loggare** i chunk orfanati dei proprietari (non li spinge sui bin), quindi `free_edge_count` non li conta — vedi nota in `graph_io.cpp` e nella [decisione freelist](design_decisions.md#2026-06-03--freelist-a-bin-segregati-per-dimensione-esatta--cancellazione-nodo).
+- **Regression guard:** nessuna test suite. Lo smoke test `main.cpp` esercita ora il giro completo: Phase 3 (delete di un `int` + reuse) e **Phase 4** (delete del nodo COMPLEX `Athlete` + re-insert con reuse dello slot, riciclo del `prog_number` e rinascita del sidecar). Verifica visuale su `graph.log` / `graph_io.log`, `db/freelist/` (bin `nodes_*`, `complex_*`, `json_prog.dat`), `db/attributes/` e i contatori in `meta.dat`. Nota: i chunk orfanati dai proprietari durante l'inbound cleanup sono ora spinti sui bin e contati da `update_node_edges` (vedi [BUG-017](#2026-06-07--bug-017-update_node_edges-orfanizza-regioni-senza-spingerle-sulla-freelist), chiuso lo stesso giorno).
 
 ---
 
@@ -151,21 +163,21 @@
 
 ### 2026-05-26 — BUG-003: `reconstruct_neighbors` non implementata
 
-- **Stato:** open
+- **Stato:** fixed (2026-06-07, rimossa)
 - **Sintomo:** Chiamando `reconstruct_neighbors` (`graph_core/odt/node_odt.cpp:46`) si ottiene sempre una mappa vuota, indipendentemente dal contenuto della `RelationNodeList` passata.
 - **Root cause:** La funzione contiene solo `return neighbors;` su una mappa appena costruita. Il corpo non è mai stato scritto.
-- **Fix:** n/a (open). Va implementata leggendo le `RelationEntry` dalla `RelationNodeList` ricostruita (vedi `read_relation_node_list` in `graph_io.cpp:28` come riferimento per il formato) e, per ciascuna, aprendo `edges.dat` agli offset indicati per costruire la mappa interna. Nota: `read_typed_node` in `graph_io.h:120` fa già questa logica direttamente, senza passare per `reconstruct_neighbors`; quindi al momento la funzione è codice morto.
-- **Regression guard:** nessuno.
+- **Fix (2026-06-07):** rimossa come **codice morto**. La funzione non aveva chiamanti e la sua firma (`const RelationNodeList &`, il solo POD header) non dà accesso né alla coda variabile su disco né a `edges.dat`, quindi non avrebbe potuto ricostruire l'adiacenza nemmeno se implementata: la ricostruzione reale POD→dominio è in `read_typed_node` (`graph_core/io/graph_io.h`), che legge gli stream direttamente. Rimossa la definizione in `graph_core/odt/node_odt.cpp` e la dichiarazione in `node_odt.h` (sostituite da una nota).
+- **Regression guard:** assente per costruzione (codice rimosso); la build pulita di `graph_core` senza riferimenti pendenti è la verifica.
 
 ---
 
 ### 2026-05-26 — BUG-004: typo `neihborgs` in `node_form_pod`
 
-- **Stato:** open
+- **Stato:** fixed (2026-06-07, rimossa)
 - **Sintomo:** Il template `node_form_pod` (`graph_core/odt/node_odt.h:54`) non compila se istanziato: a riga 58 scrive `node.neihborgs = ...` mentre il campo si chiama `neighborgs`. Attualmente non si nota perché nessun chiamante istanzia il template.
 - **Root cause:** Refuso, mai esercitato.
-- **Fix:** n/a (open). Correggere il refuso quando si decide se la funzione serve davvero (è duplicata rispetto a `read_typed_node`, vedi [BUG-003](#2026-05-26--bug-003-reconstruct_neighbors-non-implementata)).
-- **Regression guard:** istanziarlo almeno una volta — un test che includa `node_odt.h` e provi a chiamare `node_form_pod<int>(...)` farebbe emergere il typo a compile-time.
+- **Fix (2026-06-07):** rimosso il template `node_form_pod` insieme a `reconstruct_neighbors` ([BUG-003](#2026-05-26--bug-003-reconstruct_neighbors-non-implementata)). Era dead code mai istanziato, con la stessa limitazione di firma (nessun accesso a coda/`edges.dat`) e duplicato rispetto a `read_typed_node`: anziché correggere solo il refuso `neihborgs`, la funzione è stata eliminata. `graph_core/odt/node_odt.h`.
+- **Regression guard:** codice rimosso; la build pulita di `graph_core` è la verifica.
 
 ---
 
@@ -181,28 +193,28 @@
 
 ### 2026-05-26 — BUG-006: typo `hash_map_reash`
 
-- **Stato:** open
+- **Stato:** fixed (2026-06-07)
 - **Sintomo:** Se la load factor della hash table supera `0.75`, `hash_map_put` chiama `hash_map_rehash(hash_table)` (vedi `data_tructures/map_hash_table.c:37`) — ma la funzione è definita come `hash_map_reash` (manca una `h`) a riga 97. Il programma non compila linkando questo modulo se la chiamata viene istanziata, oppure (se l'ottimizzatore la elimina come dead code) il rehash semplicemente non avviene.
 - **Root cause:** Refuso nel nome della funzione. Mai esercitato perché il modulo non è linkato (vedi anche [decisione](design_decisions.md#2026-05-26--hash-table-standalone-in-c-non-linkata)) e perché [BUG-007](#2026-05-26--bug-007-hashtablesize-mai-incrementato) impedisce comunque di raggiungere la soglia.
-- **Fix:** n/a (open). Rinominare `hash_map_reash` → `hash_map_rehash` sia nella definizione che, se serve, in un prototype nel `.h`.
-- **Regression guard:** nessuno. Una build del modulo come libreria con `-Werror` farebbe emergere l'`implicit declaration` del simbolo mancante.
+- **Fix (2026-06-07):** definizione rinominata `hash_map_reash` → `hash_map_rehash` (ora `static`) in `data_tructures/map_hash_table.c`, con una forward declaration in cima al `.c` così la chiamata in `hash_map_put` non è più una dichiarazione implicita e combacia col nome del call site. Il modulo resta non linkato (vedi [decisione](design_decisions.md#2026-05-26--hash-table-standalone-in-c-non-linkata)).
+- **Regression guard:** compilazione standalone `gcc -c -Wall -Wextra data_tructures/map_hash_table.c` — nessun warning né undefined reference.
 
 ---
 
 ### 2026-05-26 — BUG-007: `HashTable.size` mai incrementato
 
-- **Stato:** open
+- **Stato:** fixed (2026-06-07)
 - **Sintomo:** Il campo `HashTable.size` resta a `0` per tutta la vita della tabella, quindi `(float)size/num_buckets > 0.75` è sempre falso e il rehash non scatta mai, anche se la tabella diventa molto piena.
 - **Root cause:** Né `hash_map_put` né `hash_map_remove` (quest'ultima comunque assente, vedi [BUG-008](#2026-05-26--bug-008-hash_map_remove-dichiarata-non-implementata)) toccano `hash_table->size`. È declared-but-unused.
-- **Fix:** n/a (open). Incrementare `size` in `hash_map_put` *dopo* l'inserimento, decrementarlo in `hash_map_remove` quando implementata.
-- **Regression guard:** nessuno.
+- **Fix (2026-06-07):** `init_hash_table` ora inizializza `hash_table->size = 0` (prima era memoria non inizializzata), `hash_map_put` fa `size++` dopo l'inserimento e prima del controllo di load factor, e la nuova `hash_map_remove` ([BUG-008](#2026-05-26--bug-008-hash_map_remove-dichiarata-non-implementata)) fa `size--`. Il rehash può ora scattare oltre `0.75`. `data_tructures/map_hash_table.c`.
+- **Regression guard:** compilazione standalone con `-Wall -Wextra`.
 
 ---
 
 ### 2026-05-26 — BUG-008: `hash_map_remove` dichiarata, non implementata
 
-- **Stato:** open
+- **Stato:** fixed (2026-06-07)
 - **Sintomo:** `data_tructures/map_hash_table.h:23` dichiara `void hash_map_remove(HashTable*, const char*)`. Il `.c` non la definisce: un caller che la usasse darebbe undefined reference in linking.
 - **Root cause:** Funzione mai scritta.
-- **Fix:** n/a (open). Da implementare se/quando il modulo verrà riportato in build.
-- **Regression guard:** nessuno.
+- **Fix (2026-06-07):** implementata `hash_map_remove` in `data_tructures/map_hash_table.c`: scorre la catena del bucket con un puntatore `prev`, scollega l'entry con la chiave corrispondente, libera `key` ed entry, e decrementa `size` ([BUG-007](#2026-05-26--bug-007-hashtablesize-mai-incrementato)). La dichiarazione nel `.h` ha ora una definizione corrispondente.
+- **Regression guard:** compilazione standalone `gcc -c -Wall -Wextra data_tructures/map_hash_table.c` (nessun undefined reference).
