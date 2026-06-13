@@ -7,14 +7,14 @@
 | Tipo | roadmap |
 | Lingua | en |
 | Ultimo aggiornamento | 2026-06-13 |
-| Commit di riferimento | 9966603 |
+| Commit di riferimento | cb9939c |
 | Mirror | — |
 
 ---
 
 ## In one sentence
 
-An **embedded, single-thread, append-only graph engine with space reclamation**: CRUD on (typed + COMPLEX) nodes and directed weighted edges, immediate persistence, BFS/DFS traversal, and a working node freelist. Missing: a query layer, on-disk durability/versioning, a test suite, and edge-space reuse.
+An **embedded, single-thread, append-only graph engine with space reclamation**: CRUD on (typed + COMPLEX) nodes and directed weighted edges, immediate persistence, BFS/DFS traversal, and a working freelist that reuses node, relation-list and edge-chunk regions. Missing: a query layer, on-disk durability/versioning, and a test suite.
 
 ## ✅ What it can do today
 
@@ -29,7 +29,7 @@ An **embedded, single-thread, append-only graph engine with space reclamation**:
 
 **Traversal & space**
 - `bfs` / `dfs` — policy-based (one template, queue/stack frontier).
-- **Freelist** with exact-size segregated bins: slot+id reuse on `insert` (primitives and COMPLEX **per type**); every freed region (record, relation-list, edge chunk) is pushed onto the bins on `delete_node` and on `add_edge`.
+- **Freelist** with exact-size segregated bins: slot+id reuse on `insert` (primitives and COMPLEX **per type**); every freed region (record, relation-list, edge chunk) is pushed onto the bins on `delete_node` and on `add_edge`, and the `rel`/`edges` bins are **reused** on edge rewrite (since 2026-06-13) — an `add_edge` that overwrites an existing weight reclaims the just-freed relation-list and edge chunks in place, so `nodes.dat`/`edges.dat` do not grow.
 - **Reverse index** of inbound edges in RAM (rebuilt at load, delete in O(deg_in)).
 - Consistent `meta` counters (`node_count`, `edge_count`, `free_count`, `free_edge_count`, monotonic ids).
 
@@ -37,7 +37,7 @@ An **embedded, single-thread, append-only graph engine with space reclamation**:
 
 | Area | State |
 |---|---|
-| Freelist **reuse** | `nodes`/`complex` bins are **reused**; `rel`/`edges` bins are populated and tracked but **not reused yet** → `edges.dat`/`nodes.dat` still grow |
+| Freelist **reuse** | All four bin families are reused: `nodes`/`complex` on `insert`, and `rel`/`edges` on edge rewrite (`update_node_edges`, since 2026-06-13) at exact fit. A weight-overwrite reclaims its holes in place → no growth. **Remaining boundary:** insert-time `write_relation_node_list` for a fresh node still appends, but it writes an empty rel-list + zero edges, so the growth is negligible (not yet full compaction of the insert path) |
 | `add_edge` | Rewrites the **whole node** on every edge (no incremental append) |
 | `traverse` | Does **not** lazy-load: only sees nodes already in RAM (`main.cpp` forces the load with an `add_edge "_load"` trick) |
 | COMPLEX | The JSON attributes are an **opaque string**: no parsing/query over the fields |
@@ -45,7 +45,6 @@ An **embedded, single-thread, append-only graph engine with space reclamation**:
 ## 🔴 TODO — what is missing
 
 **DB features**
-- [ ] **Reuse of the `rel`/`edges` bins** (edge-space compaction) — the natural next freelist step
 - [ ] **Edge attribute payloads (typed / "COMPLEX" edges)** — let a single edge carry a rich payload (a `type_label` + JSON attributes), mirroring the [COMPLEX node design](legacy/design_decisions.md#2026-05-26--storage-sidecar-json-per-nodi-complex). Today an `Edge` only carries `id / weight / to_node / from_node`. Planned shape:
   - **Out-of-line storage**, like COMPLEX nodes: the JSON attributes live in a sidecar file under `db/attributes/`; the edge stores only a reference to it. Reuse the existing machinery — a zero-padded `prog_number`, per-type size-class freelist bins, and the `json_prog.dat` free list for recycling.
   - **Edge-side header** analogous to `ComplexHeader` (e.g. `EdgeHeader { type_label_size, json_file_path_size }` + two length-prefixed strings), with `edge_*` ODT/IO helpers paralleling `complex_node_to_record` / `write_complex` / `read_complex`.

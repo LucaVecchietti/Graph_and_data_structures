@@ -6,14 +6,15 @@
 |---|---|
 | Tipo | legacy-decisions |
 | Lingua | en |
-| Ultimo aggiornamento | 2026-06-07 |
-| Commit di riferimento | 9966603 |
+| Ultimo aggiornamento | 2026-06-13 |
+| Commit di riferimento | cb9939c |
 | Mirror | — |
 
 ---
 
 ## Indice
 
+- [2026-06-13 — Reuse of the rel/edges freelist bins (edge-space compaction)](#2026-06-13--reuse-of-the-reledges-freelist-bins-edge-space-compaction)
 - [2026-06-07 — Bin per-tipo per i record COMPLEX via prog_number zero-paddato](#2026-06-07--bin-per-tipo-per-i-record-complex-via-prog_number-zero-paddato)
 - [2026-06-07 — Indice inverso degli archi entranti in-RAM](#2026-06-07--indice-inverso-degli-archi-entranti-in-ram)
 - [2026-06-07 — Tombstone + azzeramento delle regioni su delete](#2026-06-07--tombstone--azzeramento-delle-regioni-su-delete)
@@ -29,6 +30,25 @@
 - [2026-05-26 — Single-open append su nodes.dat](#2026-05-26--single-open-append-su-nodesdat)
 - [2026-05-26 — POD packed e fragilità ABI](#2026-05-26--pod-packed-e-fragilità-abi)
 - [2026-05-26 — Hash table standalone in C (non linkata)](#2026-05-26--hash-table-standalone-in-c-non-linkata)
+
+---
+
+### 2026-06-13 — Reuse of the rel/edges freelist bins (edge-space compaction)
+
+- **Stato:** active
+- **Contesto:** Dal 2026-06-07 ([BUG-017](known_bugs.md#2026-06-07--bug-017-update_node_edges-orfanizza-regioni-senza-spingerle-sulla-freelist)) `update_node_edges` spinge la vecchia `RelationNodeList` sul bin `rel` e ogni vecchio chunk di edge sul bin `edges`, li azzera e incrementa `free_edge_count` — ma quei bin non venivano **riusati** da nessun writer (il reuse di `insert` toccava solo i bin `nodes`/`complex`). Risultato: ad ogni `add_edge` (incluso un semplice overwrite del peso di un arco già esistente) `nodes.dat`/`edges.dat` crescevano comunque in modo monotono, e le regioni liberate si accumulavano sui bin senza mai rientrare. Era il primo TODO della ROADMAP (edge-space compaction) ed è anche la conseguenza ancora aperta della [decisione freelist 2026-06-03](#2026-06-03--freelist-a-bin-segregati-per-dimensione-esatta--cancellazione-nodo).
+- **Decisione:** Cablare lo **step 3** di `update_node_edges` (scrittura della NUOVA regione relation-list e dei NUOVI chunk di edge) su una strategia **pop-then-append**, simmetrica al reuse di `insert`. Prima di appendere a EOF si tenta un `pop_free_offset` sul bin segregato di dimensione **esatta**: bin `rel` per la regione relation-list di size `sizeof(RelationNodeList) + batch_size`, bin `edges` per ogni chunk di size `edge_count * sizeof(Edge)`. Se il bin restituisce un buco, lo si riusa in place (`seekp` all'offset liberato); altrimenti si appende a fine file come prima. Gli stream `nodes.dat`/`edges.dat` passano da `std::ios::app` a `std::ios::in | std::ios::out`, così `seekp` atterra in place sul reuse e continua a estendere il file sull'append. Lo step 2 (push delle vecchie regioni sui bin + azzeramento) e lo step 4 (patch in-place di `NodeIndex.relation_offset`) restano invariati.
+- **Insight portante (ordering step 2 → step 3):** lo step 2 fa il **push** delle vecchie regioni sui bin, poi lo step 3 fa il **pop**. Su un overwrite del peso, la nuova relation-list e ogni nuovo chunk di edge sono **byte-identici in size** a quelli appena liberati, quindi i bin LIFO segregati per size restituiscono **esattamente** quelle regioni → vero overwrite in place, **zero crescita** del file, e `free_edge_count` round-trippa (gli zeri scritti nello step 2 vengono sovrascritti nello step 3 — innocui). Il fit esatto è garantito dal modello a bin per size già esistente.
+- **Alternative considerate:**
+  - *Pass di compaction offline/standalone* (mark-and-sweep o riscrittura periodica dei file): scartata — più complessa, richiede re-indicizzare i file interi, e non dà alcun vantaggio in place sul caso comune (l'overwrite di un arco), dove il pop-then-append riusa il buco appena liberato senza alcuna crescita.
+  - *Riciclo degli id arco* (riusare `BatchOfEdgesFreeOffset.idx` del chunk poppato): scartata per ora — ogni `Edge` conserva il proprio `EdgeRef.id` (id globale stabile, vedi [decisione 2026-06-02](#2026-06-02--id-arco-globale-sorgente-in-metarecordnext_edge_id-memorizzato-in-edgeref)); il campo `idx` del record poppato viene ignorato.
+- **Conseguenze:**
+  - Solo il pop dal bin `edges` decrementa `meta.free_edge_count` (specularmente allo step 2, che lo incrementa solo per i chunk di edge). Il bin `rel` non ha un contatore dedicato — stessa contabilità di `delete_node_from_disk`.
+  - Reuse **solo a fit esatto** (opportunistico), coerente col modello del node freelist: niente best-fit, niente split, niente slack.
+  - Nessun cambio di POD/schema → **nessun wipe di `db/`** richiesto. Le firme restano invariate (vedi [API change](api_changes.md#2026-06-13--update_node_edges-step-3-append-only--pop-then-append)).
+  - **Boundary residuo:** l'append a insert-time (`write_node` → `write_relation_node_list` per un nodo fresco) continua ad appendere, ma scrive una relation-list **vuota** (header con `batch_size = 0`) + zero edge, quindi la crescita è trascurabile. La compaction copre il percorso di **rewrite** (`update_node_edges`), non l'insert iniziale.
+  - L'indice inverso (`build_inbound_index`) non è toccato: il chunk riusato appartiene al nodo che lo sta riscrivendo, nessun riferimento dangling.
+- **Riferimenti:** `graph_core/io/graph_io.cpp` `update_node_edges` step 3 (`pop_free_offset` su bin `rel`/`edges` + `seekp` in place, stream `in|out`); `main.cpp` Phase 5 (regression guard). Vedi [BUG-017](known_bugs.md#2026-06-07--bug-017-update_node_edges-orfanizza-regioni-senza-spingerle-sulla-freelist) (step push, stessa famiglia) e [Freelist a bin segregati](#2026-06-03--freelist-a-bin-segregati-per-dimensione-esatta--cancellazione-nodo).
 
 ---
 
@@ -61,7 +81,7 @@
   - *Indice inverso in-RAM (scelta)*: uno scan O(N+E) una volta al load, poi delete in O(deg_in); nessun cambio di schema, struttura volatile.
 - **Conseguenze:**
   - Il costruttore di `Graph` ora fa uno scan O(N+E) al load (prima leggeva solo `meta`). Per il prototipo (grafi piccoli) accettabile.
-  - `delete_node` rimuove e ri-persiste i nodi proprietari → nessun vicino dangling dopo reload. I loro **vecchi** chunk vengono orfanati da `update_node_edges`, che dal 2026-06-07 ([BUG-017](known_bugs.md#2026-06-07--bug-017-update_node_edges-orfanizza-regioni-senza-spingerle-sulla-freelist)) li spinge sui bin `rel`/`edges`, li azzera e incrementa `free_edge_count`. I bin non sono ancora **riusati**, quindi le regioni si accumulano ma sono tracciate.
+  - `delete_node` rimuove e ri-persiste i nodi proprietari → nessun vicino dangling dopo reload. I loro **vecchi** chunk vengono orfanati da `update_node_edges`, che dal 2026-06-07 ([BUG-017](known_bugs.md#2026-06-07--bug-017-update_node_edges-orfanizza-regioni-senza-spingerle-sulla-freelist)) li spinge sui bin `rel`/`edges`, li azzera e incrementa `free_edge_count`. I bin non erano ancora **riusati** alla data di questa decisione, quindi le regioni si accumulavano ma erano tracciate. *(Aggiornamento 2026-06-13: lo step 3 di `update_node_edges` ora riusa i bin `rel`/`edges` a fit esatto — vedi [Reuse of the rel/edges freelist bins](#2026-06-13--reuse-of-the-reledges-freelist-bins-edge-space-compaction).)*
   - `edge_count` ora viene davvero decrementato sul delete (prima restava invariato).
 - **Riferimenti:** commit `1315b00`. `graph_core/graph.h` (`in_edges`, `build_in_edges`), `graph_core/graph.cpp` (`Graph::delete_node`, `add_edge`, costruttore), `graph_core/io/graph_io.cpp` / `graph_core/io/graph_io.h` (`build_inbound_index`).
 
@@ -98,7 +118,7 @@
   - Nuova sottocartella `db/freelist/` con un file per classe di size (creata on-demand da `write_free_offset`). Tanti file piccoli, uno per size class.
   - LIFO: l'ultima regione liberata di una data size è la prima riusata. Località temporale, ma nessuna garanzia di compattazione.
   - `delete_node` è un **prototipo**: registra le regioni orfane sui bin ma NON tombstona lo slot in `nodes.idx`, NON aggiorna i contatori `meta` (`node_count`/`free_count` → `meta` resta `const &`), NON rimuove gli archi entranti da altri nodi (vicini dangling), NON gestisce la size variabile del payload COMPLEX (`node_record_payload_size` per COMPLEX ritorna solo `sizeof(ComplexHeader)`). Vedi [BUG-016](known_bugs.md#2026-06-03--bug-016-delete_node-prototipo-non-aggiorna-idx-contatori-meta-archi-entranti-complex).
-  - `update_node_edges` spinge le regioni orfane sui bin `rel`/`edges` dal 2026-06-07 ([BUG-017](known_bugs.md#2026-06-07--bug-017-update_node_edges-orfanizza-regioni-senza-spingerle-sulla-freelist)): non c'è più leak non tracciato su `add_edge`. Resta aperto solo il **riuso** dei bin `rel`/`edges` (oggi il reuse di `insert` tocca solo i bin `nodes`/`complex`).
+  - `update_node_edges` spinge le regioni orfane sui bin `rel`/`edges` dal 2026-06-07 ([BUG-017](known_bugs.md#2026-06-07--bug-017-update_node_edges-orfanizza-regioni-senza-spingerle-sulla-freelist)): non c'è più leak non tracciato su `add_edge`. Dal 2026-06-13 lo step 3 di `update_node_edges` **riusa** anche i bin `rel`/`edges` a fit esatto (pop-then-append): su un overwrite del peso il file non cresce più — vedi [Reuse of the rel/edges freelist bins](#2026-06-13--reuse-of-the-reledges-freelist-bins-edge-space-compaction).
   - `FreeRecord` rimossa dal POD layout (vedi [API change](api_changes.md#2026-06-03--freerecord-rimossa-sostituita-da-tre-pod-free-offset)). I riferimenti "FreeRecord / free_count riservati" nelle decisioni precedenti ([Append-only](#2026-05-26--append-only-data-files-truncated-meta), [Edge persistence](#2026-05-30--edge-persistence-append--obsolete--in-place-index-patch)) vanno letti come superati da questa.
 - **Riferimenti:** commit `ca567e4`. `graph_core/struct/pod_struct.h:182,196,209` (le tre POD), `graph_core/io/graph_io.h:321` (`freelist_bin_path`), `:333` (`write_free_offset`), `:355` (`pop_free_offset`), `:190` (`write_node_in_freed_slot`), `graph_core/io/graph_io.cpp:380` (`delete_node_from_disk`), `graph_core/graph.cpp:163` (`Graph::delete_node`), `graph_core/graph.h:43` (reuse path di `insert`), `graph_core/struct/type_registry.cpp` (`node_record_payload_size`).
 

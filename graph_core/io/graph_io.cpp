@@ -343,26 +343,56 @@ void update_node_edges(BaseNode &node, MetaRecord &meta, uint64_t node_id)
                 + " bytes -> rel bin; free_edge_count=" + std::to_string(meta.free_edge_count));
 
     // ---- 3. Write the NEW edge chunks and the NEW relation list ------------
-    // Per-relation: append all current edges to edges.dat as one contiguous
-    // chunk, capture its edge_offset, then emit the matching tail entry in
-    // the new relation list region in nodes.dat. The new RelationNodeList
-    // POD is written up-front (batch_size is pre-computed via the ODT bridge
-    // node_to_relation_list, which sums 24 + name.size() over all relations).
+    // Pop-then-append (edge-space compaction, ROADMAP): instead of always
+    // appending at EOF, first try to reclaim an EXACT-SIZE freed region from
+    // the segregated bins, else append. Because step 2 just PUSHED the old
+    // rel-list and old edge chunks, a weight-overwrite (new sizes == old sizes)
+    // pops back the very regions just freed (LIFO, size-segregated) → true
+    // in-place overwrite, zero file growth, and free_edge_count round-trips.
+    // The zeros written in step 2 are simply overwritten here in that case —
+    // harmless.
+    //
+    // The new RelationNodeList POD's batch_size is pre-computed via the ODT
+    // bridge node_to_relation_list (sums 24 + name.size() over all relations),
+    // so we know the exact total region size up front to pick the rel bin.
+    RelationNodeList list = node_to_relation_list(node);
+    uint64_t new_relation_total_size = sizeof(RelationNodeList) + list.batch_size;
+
+    // Decide where the new relation-list region lands: reuse an exact-size freed
+    // `rel` region if one exists, else append at EOF (set below from tellp()).
+    auto rel_reuse = pop_free_offset<RelationNodeListFreeOffset>(
+        freelist_bin_path("rel", new_relation_total_size));
+
     uint64_t new_relation_offset = 0;
     {
-        std::ofstream dat_out(fs::path(DB_PATH) / "nodes.dat", std::ios::binary | std::ios::app);
+        // in|out (NOT app): seekp lands in-place for reuse and correctly extends
+        // the file for append on Windows (the "seekp ignored" issue is app-only).
+        std::fstream dat_out(fs::path(DB_PATH) / "nodes.dat",
+                             std::ios::binary | std::ios::in | std::ios::out);
         if (!dat_out)
         {
             logger.error("update_node_edges: failed to open nodes.dat for writing.");
             throw std::runtime_error("update_node_edges: failed to open nodes.dat for writing.");
         }
-        dat_out.seekp(0, std::ios::end);
-        new_relation_offset = dat_out.tellp();
+        if (rel_reuse)
+        {
+            new_relation_offset = rel_reuse->offset; // in-place reuse (exact fit)
+            dat_out.seekp(static_cast<std::streamoff>(new_relation_offset));
+        }
+        else
+        {
+            dat_out.seekp(0, std::ios::end);         // append at EOF
+            new_relation_offset = dat_out.tellp();
+        }
 
-        RelationNodeList list = node_to_relation_list(node);
+        // The reuse fit is exact (the bin is size-segregated), so the POD plus
+        // all tail entries land in exactly new_relation_total_size bytes — no
+        // overrun. Use ONE in|out stream for the POD + every tail entry so the
+        // put pointer advances contiguously (never seek dat_out between entries).
         write_pod(list, dat_out);
 
-        std::ofstream edges_out(fs::path(DB_PATH) / "edges.dat", std::ios::binary | std::ios::app);
+        std::fstream edges_out(fs::path(DB_PATH) / "edges.dat",
+                               std::ios::binary | std::ios::in | std::ios::out);
         if (!edges_out)
         {
             logger.error("update_node_edges: failed to open edges.dat for writing.");
@@ -374,8 +404,28 @@ void update_node_edges(BaseNode &node, MetaRecord &meta, uint64_t node_id)
         // full-node rewrites), so we write that id directly into the Edge POD.
         for (const auto &[rel_type, neighbors] : node.neighborgs)
         {
-            edges_out.seekp(0, std::ios::end);
-            uint64_t edge_offset = edges_out.tellp();
+            uint64_t edge_count = static_cast<uint64_t>(neighbors.size());
+            uint64_t chunk_size = edge_count * sizeof(Edge);
+
+            // Pop-then-append for the edge chunk too: reuse an exact-size freed
+            // `edges` region if available, else append at EOF. Edge ids are NOT
+            // recycled here — ignore e_reuse->idx; each Edge keeps its own
+            // EdgeRef.id.
+            auto e_reuse = pop_free_offset<BatchOfEdgesFreeOffset>(
+                freelist_bin_path("edges", chunk_size));
+            uint64_t edge_offset = 0;
+            if (e_reuse)
+            {
+                edge_offset = e_reuse->offset;
+                edges_out.seekp(static_cast<std::streamoff>(edge_offset));
+                meta.free_edge_count--; // one fewer free edge chunk (only the edges bin has a counter)
+            }
+            else
+            {
+                edges_out.seekp(0, std::ios::end);
+                edge_offset = edges_out.tellp();
+            }
+
             for (const auto &[to_id, ref] : neighbors)
             {
                 Edge edge = edge_to_pod(ref.id, node_id,
@@ -383,7 +433,9 @@ void update_node_edges(BaseNode &node, MetaRecord &meta, uint64_t node_id)
                                        static_cast<uint64_t>(ref.weight));
                 write_pod(edge, edges_out);
             }
-            uint64_t edge_count = static_cast<uint64_t>(neighbors.size());
+
+            // Tail entry goes on the nodes.dat stream, whose put pointer is right
+            // after the POD / previous tail entry — do not seek it between entries.
             write_string(rel_type, dat_out);
             write_offset(edge_offset, dat_out);
             write_offset(edge_count, dat_out);

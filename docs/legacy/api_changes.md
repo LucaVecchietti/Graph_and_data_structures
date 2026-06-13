@@ -6,14 +6,15 @@
 |---|---|
 | Tipo | legacy-api |
 | Lingua | en |
-| Ultimo aggiornamento | 2026-06-07 |
-| Commit di riferimento | 9966603 |
+| Ultimo aggiornamento | 2026-06-13 |
+| Commit di riferimento | cb9939c |
 | Mirror | — |
 
 ---
 
 ## Indice
 
+- [2026-06-13 — `update_node_edges` step 3: append-only → pop-then-append](#2026-06-13--update_node_edges-step-3-append-only--pop-then-append)
 - [2026-06-07 — `NodeType::TOMBSTONE` aggiunto](#2026-06-07--nodetypetombstone-aggiunto)
 - [2026-06-07 — `delete_node_from_disk`: `const MetaRecord&` → `MetaRecord&`; `build_inbound_index`](#2026-06-07--delete_node_from_disk-const-metarecord--metarecord-build_inbound_index)
 - [2026-06-07 — `Graph`: membro `in_edges` + `build_in_edges`; `delete_node` completata](#2026-06-07--graph-membro-in_edges--build_in_edges-delete_node-completata)
@@ -40,6 +41,36 @@
 > Nota: il progetto non ha ancora consumatori esterni, quindi "API pubblica" qui significa: classe `Graph`, POD persistiti su disco (`pod_struct.h`), funzioni esposte nei header pubblici (`io/graph_io.h`, `io/io_utils.h`, `odt/*.h`, `struct/*.h`).
 >
 > Le modifiche ai POD persistiti sono particolarmente sensibili perché rompono il formato su disco — andranno tracciate qui anche se prive di consumatori esterni.
+
+---
+
+### 2026-06-13 — `update_node_edges` step 3: append-only → pop-then-append
+
+- **Motivazione:** Riusare le regioni `rel`/`edges` liberate (edge-space compaction): su un overwrite del peso di un arco esistente, `nodes.dat`/`edges.dat` non devono più crescere in modo monotono. Vedi [decisione](design_decisions.md#2026-06-13--reuse-of-the-reledges-freelist-bins-edge-space-compaction).
+- **Before:**
+  ```cpp
+  void update_node_edges(BaseNode &node, MetaRecord &meta, uint64_t node_id);
+  // step 3: la NUOVA RelationNodeList e ogni NUOVO chunk di edge erano sempre
+  // APPESI a EOF. Stream aperti con std::ios::app.
+  //   std::ofstream dat_out(... nodes.dat, binary | app);  // append-only
+  //   std::ofstream edges_out(... edges.dat, binary | app);
+  // → nodes.dat / edges.dat crescono ad ogni add_edge, anche sul solo overwrite.
+  ```
+- **After:**
+  ```cpp
+  void update_node_edges(BaseNode &node, MetaRecord &meta, uint64_t node_id); // firma INVARIATA
+  // step 3: pop-then-append. Prima di appendere, tenta un riuso a fit esatto dal bin segregato:
+  //   auto rel_reuse = pop_free_offset<RelationNodeListFreeOffset>(
+  //                        freelist_bin_path("rel", sizeof(RelationNodeList) + list.batch_size));
+  //   auto e_reuse   = pop_free_offset<BatchOfEdgesFreeOffset>(
+  //                        freelist_bin_path("edges", edge_count * sizeof(Edge)));
+  //   if (reuse) { seekp(reuse->offset); /* in place */ } else { seekp(0, end); /* append */ }
+  // Stream aperti con std::ios::in | std::ios::out (NON app): seekp atterra in place
+  // sul reuse e continua a estendere il file sull'append.
+  // Solo il pop dal bin edges fa meta.free_edge_count-- (specularmente allo step 2).
+  ```
+- **Note di migrazione:** Firma **invariata** — nessun chiamante (`Graph::add_edge`, inbound cleanup di `Graph::delete_node`) va toccato. Nessun cambio di POD/schema → **nessun wipe di `db/`** richiesto. Effetto osservabile: dopo un `add_edge` che è un **overwrite** del peso (triple `(start, type, end)` già esistente), `nodes.dat`/`edges.dat` restano byte-identici invece di crescere; lo step 2 ha appena liberato regioni di size identica che lo step 3 ripopola in place (LIFO size-segregato). Gli id arco **non** sono riciclati: il `idx` del `BatchOfEdgesFreeOffset` poppato è ignorato, ogni `Edge` mantiene il suo `EdgeRef.id`. L'append a insert-time (`write_relation_node_list`) resta append-only (scrive una relation-list vuota, crescita trascurabile).
+- **Riferimenti:** commit `cb9939c`. `graph_core/io/graph_io.cpp` (`update_node_edges`, step 3); `main.cpp` (Phase 5). Vedi [decisione](design_decisions.md#2026-06-13--reuse-of-the-reledges-freelist-bins-edge-space-compaction) e [BUG-017](known_bugs.md#2026-06-07--bug-017-update_node_edges-orfanizza-regioni-senza-spingerle-sulla-freelist).
 
 ---
 

@@ -126,6 +126,59 @@ int main()
                      "id/prog reuse, db/freelist/complex_*.dat and db/attributes/.\n";
     }
 
+    // ===== Phase 5: edge-space compaction (rel/edges bin reuse) ============
+    // Exercises the NEW pop-then-append path in update_node_edges (step 3):
+    // a repeated weight-overwrite of the SAME (start, end, relation) edge.
+    // Each overwrite pushes the node's old relation-list region + 32-byte edge
+    // chunk onto the size-segregated rel/edges bins, then pops the exact-size
+    // region right back (LIFO) -> true in-place rewrite, ZERO file growth.
+    // On the OLD design every overwrite appended a fresh rel region + chunk,
+    // so nodes.dat / edges.dat would grow by 20x (rel region + 32 bytes).
+    std::cout << "\n=== Phase 5: edge-space compaction (overwrite loop) ===\n";
+    {
+        Graph g;
+
+        // Reuse two nodes that are live after phases 1-4 (both are ints):
+        //   node 0 (value 10) and node 2 (value 30). insert() returns void, so
+        //   we use known-live ids instead of capturing fresh ones. node 0 also
+        //   already owns "road"/"_load" relations, so the overwrite rewrites a
+        //   multi-relation list -> exercises several rel/edges bin push/pops.
+        const int a = 0;
+        const int b = 2;
+
+        // First write of the edge (a NEW edge), then one overwrite to settle
+        // into steady state (the push/pop cycle has run at least once and the
+        // relation-list / edge-chunk sizes are now fixed).
+        g.add_edge(a, b, "ow", 1);
+        g.add_edge(a, b, "ow", 2);
+
+        const fs::path nodes_dat = fs::path(DB_PATH) / "nodes.dat";
+        const fs::path edges_dat = fs::path(DB_PATH) / "edges.dat";
+
+        std::uintmax_t nodes_before = fs::file_size(nodes_dat);
+        std::uintmax_t edges_before = fs::file_size(edges_dat);
+
+        // 20 weight-overwrites of the same edge. If reuse fires, neither file
+        // grows; if it does not, both grow monotonically.
+        for (int w = 3; w < 23; ++w)
+            g.add_edge(a, b, "ow", w);
+
+        std::uintmax_t nodes_after = fs::file_size(nodes_dat);
+        std::uintmax_t edges_after = fs::file_size(edges_dat);
+
+        std::cout << "  nodes.dat: before=" << nodes_before
+                  << " after=" << nodes_after
+                  << (nodes_after == nodes_before ? "  [EQUAL]" : "  [GREW]") << "\n";
+        std::cout << "  edges.dat: before=" << edges_before
+                  << " after=" << edges_after
+                  << (edges_after == edges_before ? "  [EQUAL]" : "  [GREW]") << "\n";
+        std::cout << "  compaction verdict: "
+                  << ((nodes_after == nodes_before && edges_after == edges_before)
+                          ? "PASS (zero growth across 20 overwrites)"
+                          : "FAIL (file grew -> reuse not firing)")
+                  << "\n";
+    }
+
     system("pause");
     return 0;
 }

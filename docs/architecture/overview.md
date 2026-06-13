@@ -6,8 +6,8 @@
 |---|---|
 | Tipo | architecture |
 | Lingua | en |
-| Ultimo aggiornamento | 2026-06-07 |
-| Commit di riferimento | 9966603 |
+| Ultimo aggiornamento | 2026-06-13 |
+| Commit di riferimento | cb9939c |
 | Mirror | — |
 
 ---
@@ -136,7 +136,7 @@ update_node_edges      (graph_core/io/graph_io.cpp)  ← persistence since 2026-
    │ if new edge: meta.next_edge_id++; meta.edge_count++; write_meta()
 ```
 
-Since 2026-05-30, `add_edge` persists. [BUG-001](../legacy/known_bugs.md#2026-05-26--bug-001-add_edge-non-persiste-su-disco) closed. The old `RelationNodeList` and edge chunks are pushed onto the `rel`/`edges` freelist bins and zeroed (since 2026-06-07, [BUG-017](../legacy/known_bugs.md#2026-06-07--bug-017-update_node_edges-orfanizza-regioni-senza-spingerle-sulla-freelist)) — tracked, though those bins are not reused yet. See [Edge persistence design decision](../legacy/design_decisions.md#2026-05-30--edge-persistence-append--obsolete--in-place-index-patch). Since 2026-06-02 each `Edge.id` is globally unique, sourced from `MetaRecord.next_edge_id` and stored in `EdgeRef` ([BUG-002](../legacy/known_bugs.md#2026-05-26--bug-002-edgeid-non-globale-tra-nodi) closed; see [decision](../legacy/design_decisions.md#2026-06-02--id-arco-globale-sorgente-in-metarecordnext_edge_id-memorizzato-in-edgeref)).
+Since 2026-05-30, `add_edge` persists. [BUG-001](../legacy/known_bugs.md#2026-05-26--bug-001-add_edge-non-persiste-su-disco) closed. The old `RelationNodeList` and edge chunks are pushed onto the `rel`/`edges` freelist bins and zeroed (since 2026-06-07, [BUG-017](../legacy/known_bugs.md#2026-06-07--bug-017-update_node_edges-orfanizza-regioni-senza-spingerle-sulla-freelist)); since 2026-06-13 the new regions are written **pop-then-append**, reusing those exact-size holes in place, so a weight-overwrite causes no file growth (see [Reuse of the rel/edges freelist bins](../legacy/design_decisions.md#2026-06-13--reuse-of-the-reledges-freelist-bins-edge-space-compaction)). See [Edge persistence design decision](../legacy/design_decisions.md#2026-05-30--edge-persistence-append--obsolete--in-place-index-patch). Since 2026-06-02 each `Edge.id` is globally unique, sourced from `MetaRecord.next_edge_id` and stored in `EdgeRef` ([BUG-002](../legacy/known_bugs.md#2026-05-26--bug-002-edgeid-non-globale-tra-nodi) closed; see [decision](../legacy/design_decisions.md#2026-06-02--id-arco-globale-sorgente-in-metarecordnext_edge_id-memorizzato-in-edgeref)).
 
 ### Node delete + freelist reuse flow (since 2026-06-03, completed 2026-06-07)
 
@@ -168,7 +168,7 @@ g.insert(value)          ← reuse path (primitives AND COMPLEX)
    │ else: append path (write_node + next_id++)
 ```
 
-Push (`delete_node`) and pop (`insert`) are O(1); each bin holds one fixed size so a pop is always an exact fit. The inbound-edge cleanup uses the in-RAM reverse index `Graph::in_edges` (rebuilt at load by `build_inbound_index`, O(deg_in) per delete). `update_node_edges`' orphaned regions are pushed onto the `rel`/`edges` bins since [BUG-017](../legacy/known_bugs.md#2026-06-07--bug-017-update_node_edges-orfanizza-regioni-senza-spingerle-sulla-freelist) (those bins are tracked but not reused yet). [BUG-016](../legacy/known_bugs.md#2026-06-03--bug-016-delete_node-prototipo-non-aggiorna-idx-contatori-meta-archi-entranti-complex) and [BUG-014](../legacy/known_bugs.md#2026-05-26--bug-014-prog_number-mai-incrementatopersistito-dopo-write-complex) closed. See the decisions on [tombstone](../legacy/design_decisions.md#2026-06-07--tombstone--azzeramento-delle-regioni-su-delete), [reverse index](../legacy/design_decisions.md#2026-06-07--indice-inverso-degli-archi-entranti-in-ram), [COMPLEX binning](../legacy/design_decisions.md#2026-06-07--bin-per-tipo-per-i-record-complex-via-prog_number-zero-paddato) and [freelist](../legacy/design_decisions.md#2026-06-03--freelist-a-bin-segregati-per-dimensione-esatta--cancellazione-nodo).
+Push (`delete_node`) and pop (`insert`) are O(1); each bin holds one fixed size so a pop is always an exact fit. The inbound-edge cleanup uses the in-RAM reverse index `Graph::in_edges` (rebuilt at load by `build_inbound_index`, O(deg_in) per delete). `update_node_edges`' orphaned regions are pushed onto the `rel`/`edges` bins since [BUG-017](../legacy/known_bugs.md#2026-06-07--bug-017-update_node_edges-orfanizza-regioni-senza-spingerle-sulla-freelist), and since 2026-06-13 those bins are also **reused** on edge rewrite (pop-then-append, exact fit) — see [Reuse of the rel/edges freelist bins](../legacy/design_decisions.md#2026-06-13--reuse-of-the-reledges-freelist-bins-edge-space-compaction). [BUG-016](../legacy/known_bugs.md#2026-06-03--bug-016-delete_node-prototipo-non-aggiorna-idx-contatori-meta-archi-entranti-complex) and [BUG-014](../legacy/known_bugs.md#2026-05-26--bug-014-prog_number-mai-incrementatopersistito-dopo-write-complex) closed. See the decisions on [tombstone](../legacy/design_decisions.md#2026-06-07--tombstone--azzeramento-delle-regioni-su-delete), [reverse index](../legacy/design_decisions.md#2026-06-07--indice-inverso-degli-archi-entranti-in-ram), [COMPLEX binning](../legacy/design_decisions.md#2026-06-07--bin-per-tipo-per-i-record-complex-via-prog_number-zero-paddato) and [freelist](../legacy/design_decisions.md#2026-06-03--freelist-a-bin-segregati-per-dimensione-esatta--cancellazione-nodo).
 
 ### Read-back flow
 
