@@ -6,7 +6,7 @@
 |---|---|
 | Tipo | roadmap |
 | Lingua | en |
-| Ultimo aggiornamento | 2026-06-07 |
+| Ultimo aggiornamento | 2026-06-13 |
 | Commit di riferimento | 9966603 |
 | Mirror | — |
 
@@ -46,6 +46,11 @@ An **embedded, single-thread, append-only graph engine with space reclamation**:
 
 **DB features**
 - [ ] **Reuse of the `rel`/`edges` bins** (edge-space compaction) — the natural next freelist step
+- [ ] **Edge attribute payloads (typed / "COMPLEX" edges)** — let a single edge carry a rich payload (a `type_label` + JSON attributes), mirroring the [COMPLEX node design](legacy/design_decisions.md#2026-05-26--storage-sidecar-json-per-nodi-complex). Today an `Edge` only carries `id / weight / to_node / from_node`. Planned shape:
+  - **Out-of-line storage**, like COMPLEX nodes: the JSON attributes live in a sidecar file under `db/attributes/`; the edge stores only a reference to it. Reuse the existing machinery — a zero-padded `prog_number`, per-type size-class freelist bins, and the `json_prog.dat` free list for recycling.
+  - **Edge-side header** analogous to `ComplexHeader` (e.g. `EdgeHeader { type_label_size, json_file_path_size }` + two length-prefixed strings), with `edge_*` ODT/IO helpers paralleling `complex_node_to_record` / `write_complex` / `read_complex`.
+  - **Design tension to resolve first:** `edges.dat` stores **fixed-width 32-byte `Edge` records** in contiguous per-`(node, relation)` chunks, seeked via `edge_offset + i * 32`. A variable-width payload must stay **out-of-line** (the in-chunk `Edge` keeps its fixed size plus a reference — e.g. an attribute id/offset into a separate store — into the sidecar), otherwise the contiguous-chunk + seek model breaks. An "attributes-only-when-present" flag on the edge keeps plain edges at 32 bytes.
+  - **Lifecycle parity:** the edge sidecar must be removed and its `prog_number` recycled when the edge is dropped (on `delete_node` and on a future single-edge delete), exactly as COMPLEX node deletion does today.
 - [ ] **Update** a node's payload in place (today only delete + insert)
 - [ ] **Delete a single edge** (today only via `delete_node`)
 - [ ] Query layer: filters, attribute search, traversal with predicates
