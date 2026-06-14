@@ -41,6 +41,24 @@ After every **Header** will be maximum of **8 lines** of **272 bytes**. Every li
 // name_length: name of the type of relation.
 // name: The neme of the type of relation.
 ```
-We 
+
+### New Methhod to manage Edges
+
+We will improve at the same way the `Edge` struct:
+
+```cpp
+struct Edge
+{
+    uint64_t id;            // Edge  ID
+    int64_t weight;         // Weight of the edge
+    uint64_t to_node;       // Destination node idx on nodes.idx file [ to_node → NodeIndex(id == to_node)]
+    uint64_t from_node;     // Source node idx on nodes.idx file [ from_node → NodeIndex(id == from_node)]
+    uint64_t prev_offset;   // Previouse edge offset of the same node.
+    uint64_t next_offset;   // Next edge offset of the same node.
+};
+```
+
+Edges will not been write in sequence anymore, but they will be write always in append to the file of the edges or where is the first free offset pointed by the free list, like a linked list. 
+This method che perform **insert** in **O(1)** insted of **O(n)** like the previouse one.
 
 This will require a change of the struct of freelists and meta data.
