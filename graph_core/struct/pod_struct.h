@@ -86,7 +86,7 @@ struct NodeRecord
 struct RelationNodeList
 {
     uint64_t type_count;  // Number of distinct relation types this node has.
-    uint64_t batch_size;  // Size in bytes of the variable-width tail that follows
+    uint16_t batch_size;  // Size in bytes of the variable-width tail that follows
                           // this POD (NOT including the 16 bytes of the POD itself).
                           // Two uses:
                           //   1. Read path: after reading the POD, read batch_size
@@ -96,13 +96,18 @@ struct RelationNodeList
                           //      orphaned (e.g. by an in-place update from add_edge),
                           //      the total reclaimable size at `relation_offset` is
                           //      sizeof(RelationNodeList) + batch_size.
+    uint16_t free_bytes;  // Bytes remaning in the batch to append relations. 
+    uint64_t next_offset; // Contain the next offset of the continuation of the relation list if the batch size is non enougth to store all, otherwise is 0.
+                          // Note: The standard dimension of the batch is 4096 + 264 bytes. 
+    uint64_t head;        // 1 if is the first batch of the reletion list. > 1 if is an extention.
+    uint8_t is_deleted;   // 1 if the relation list is deleted so this is a freee offset, 0 otherwise.
     /**
      * After this POD, `type_count` entries are laid out contiguously, each:
      *
-     *   [uint64_t name_length][name bytes][uint64_t edge_offset][uint64_t edge_count]
+     *   [uint64_t edge_offset][uint64_t edge_count][uint8_t name_length][name bytes]
      *
      * Fields per entry:
-     *   - name_length   8 bytes, length prefix written by write_string.
+     *   - name_length   1 bytes, length prefix written by write_string.
      *   - name          name_length bytes, the relation type name (no NUL terminator).
      *   - edge_offset   8 bytes, byte offset into edges.dat where the edges of this
      *                   relation start.
@@ -113,8 +118,8 @@ struct RelationNodeList
      * `batch_size` bytes, i.e. sum of (24 + name_length) over all entries.
      *
      * Example tail with two relations "road" (3 edges) and "train" (5 edges):
-     *   [8: name_length=4][r][o][a][d][8: edge_offset=...][8: edge_count=3]
-     *   [8: name_length=5][t][r][a][i][n][8: edge_offset=...][8: edge_count=5]
+     *   [8: edge_offset=...][8: edge_count=3][1: name_length=4][r][o][a][d]
+     *   [8: edge_offset=...][8: edge_count=5][1: name_length=5][t][r][a][i][n]
      *
      * Note: the application-level cap on name_length is RELATION_TYPE_MAX_SIZE
      * (= 255, enforced by add_edge via costants.h), but the on-disk length prefix
