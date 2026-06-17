@@ -42,7 +42,7 @@ After every **Header** will be maximum of **8 lines** of **272 bytes**. Every li
 // name: The neme of the type of relation.
 ```
 
-### New Methhod to manage Edges
+### New Method to manage Edges
 
 We will improve at the same way the `Edge` struct:
 
@@ -61,4 +61,10 @@ struct Edge
 Edges will not been write in sequence anymore, but they will be write always in append to the file of the edges or where is the first free offset pointed by the free list, like a linked list. 
 This method che perform **insert** in **O(1)** insted of **O(n)** like the previouse one.
 
-This will require a change of the struct of freelists and meta data.
+### 
+
+### IO functions changes
+
+This will require a change of the struct of freelists and meta data:
+ - Now the **size of `Edge` and `NodeRelationList` are standardized** so we can use **single freelist** for both the struct as a stack of free offset.
+ - 
