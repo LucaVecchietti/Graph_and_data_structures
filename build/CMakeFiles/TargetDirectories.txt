@@ -1,4 +1,0 @@
-C:/Users/info/Desktop/Graph_and_data_structures/build/CMakeFiles/graph_core.dir
-C:/Users/info/Desktop/Graph_and_data_structures/build/CMakeFiles/graph.dir
-C:/Users/info/Desktop/Graph_and_data_structures/build/CMakeFiles/edit_cache.dir
-C:/Users/info/Desktop/Graph_and_data_structures/build/CMakeFiles/rebuild_cache.dir
