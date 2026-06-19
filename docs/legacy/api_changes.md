@@ -6,14 +6,18 @@
 |---|---|
 | Tipo | legacy-api |
 | Lingua | en |
-| Ultimo aggiornamento | 2026-06-13 |
-| Commit di riferimento | cb9939c |
+| Ultimo aggiornamento | 2026-06-19 |
+| Commit di riferimento | 0a043f7 |
 | Mirror | — |
 
 ---
 
 ## Indice
 
+- [2026-06-19 — add_edge O(1): `EdgeRef.offset` + `persist_new_edge` / `persist_edge_weight`](#2026-06-19--add_edge-o1-edgerefoffset--persist_new_edge--persist_edge_weight)
+- [2026-06-19 — `RelationNodeList` → `NodeRelationList`: header esteso + tail fixed-width](#2026-06-19--relationnodelist--noderelationlist-header-esteso--tail-fixed-width)
+- [2026-06-19 — `Edge`: aggiunti `prev_offset` / `next_offset` (32 → 48 byte)](#2026-06-19--edge-aggiunti-prev_offset--next_offset-32--48-byte)
+- [2026-06-19 — Firme ODT: `edge_to_pod` (+prev/next), `node_to_relation_list` (+node_id, +head)](#2026-06-19--firme-odt-edge_to_pod-prevnext-node_to_relation_list-node_id-head)
 - [2026-06-13 — `update_node_edges` step 3: append-only → pop-then-append](#2026-06-13--update_node_edges-step-3-append-only--pop-then-append)
 - [2026-06-07 — `NodeType::TOMBSTONE` aggiunto](#2026-06-07--nodetypetombstone-aggiunto)
 - [2026-06-07 — `delete_node_from_disk`: `const MetaRecord&` → `MetaRecord&`; `build_inbound_index`](#2026-06-07--delete_node_from_disk-const-metarecord--metarecord-build_inbound_index)
@@ -41,6 +45,133 @@
 > Nota: il progetto non ha ancora consumatori esterni, quindi "API pubblica" qui significa: classe `Graph`, POD persistiti su disco (`pod_struct.h`), funzioni esposte nei header pubblici (`io/graph_io.h`, `io/io_utils.h`, `odt/*.h`, `struct/*.h`).
 >
 > Le modifiche ai POD persistiti sono particolarmente sensibili perché rompono il formato su disco — andranno tracciate qui anche se prive di consumatori esterni.
+
+---
+
+### 2026-06-19 — add_edge O(1): `EdgeRef.offset` + `persist_new_edge` / `persist_edge_weight`
+
+- **Motivazione:** portare `add_edge` da O(deg) (whole-node rewrite via `update_node_edges`) a **O(1)**, sfruttando il formato fixed-width batch + Edge a lista concatenata. Vedi [decisione](design_decisions.md#2026-06-19--add_edge-in-o1-append--relink--in-place-line-update).
+- **Before:**
+  ```cpp
+  // domain_struct.h
+  struct EdgeRef { uint64_t id; int weight; BaseNode *neighbor; };
+
+  // graph.cpp — ogni add_edge riscrive l'intero nodo
+  node->neighborgs[type][end] = EdgeRef{edge_id, weight, nodes[end]};
+  update_node_edges(*node, meta, start);   // O(deg): riscrive batch + tutti i chunk
+  ```
+- **After:**
+  ```cpp
+  // domain_struct.h — + offset (posizione su disco dell'Edge)
+  struct EdgeRef { uint64_t id; int weight; BaseNode *neighbor; uint64_t offset; };
+
+  // graph_io.h — nuove funzioni O(1)
+  uint64_t persist_new_edge(MetaRecord &meta, uint64_t node_id, const std::string &type,
+                            uint64_t to_id, uint64_t edge_id, int64_t weight); // append+relink, ritorna l'offset
+  void     persist_edge_weight(uint64_t edge_offset, int64_t weight);          // overwrite in place
+
+  // graph.cpp — arco nuovo vs overwrite, entrambi O(1)
+  if (is_new_edge) {
+      uint64_t off = persist_new_edge(meta, start, type, end, edge_id, weight);
+      node->neighborgs[type][end] = EdgeRef{edge_id, weight, nodes[end], off};
+  } else {
+      node->neighborgs[type][end].weight = weight;
+      persist_edge_weight(existing_offset, weight);
+  }
+  ```
+- **Note di migrazione:**
+  - **`EdgeRef` cresce di 8 byte in RAM** (non-POD, mai serializzato direttamente → nessuno schema-break su disco). Tutte le costruzioni `EdgeRef{...}` aggiornate al 4° campo: `read_typed_node` passa l'offset dell'edge appena letto, `add_edge` quello restituito da `persist_new_edge`.
+  - **`add_edge` non chiama più `update_node_edges`** e **non tocca `nodes.idx`** su un arco aggiunto (il batch non si sposta). Firma di `add_edge` invariata.
+  - **`update_node_edges` resta** ma è ora chiamata **solo** dalla pulizia archi entranti di `delete_node`. Comportamento interno cambiato: libera i vecchi archi via chain-walk (`free_edge_chain`, slot da 48 B) invece che per chunk contiguo, e **rinfresca `EdgeRef.offset`** dei nodi mentre li riscrive (così un overwrite O(1) successivo punta al posto giusto). Lo step 3 appende i nuovi chunk a EOF (niente più pop dal bin `edges` per chunk: i bin sono per-edge ora).
+  - **`BatchOfEdgesFreeOffset` ora rappresenta UN edge** (size sempre `sizeof(Edge)` = 48), non un chunk: `delete_node_from_disk` e `update_node_edges` liberano per-edge via `free_edge_chain`. `free_edge_count` conta archi liberi, non chunk.
+  - Nessuno schema-break del formato on-disk (`Edge`/`NodeRelationList` invariati rispetto al 2026-06-19 mattina) → `db/` compatibile con la build di quel formato.
+- **Riferimenti:** commit `0a043f7`. `graph_core/struct/domain_struct.h`, `graph_core/io/graph_io.{h,cpp}` (`persist_new_edge`, `persist_edge_weight`, `free_edge_chain`, `update_node_edges`, `delete_node_from_disk`, `read_typed_node`), `graph_core/graph.cpp` (`add_edge`).
+
+---
+
+### 2026-06-19 — `RelationNodeList` → `NodeRelationList`: header esteso + tail fixed-width
+
+- **Motivazione:** abilitare l'update in place di una singola relazione (riga indirizzabile per indice) e una sola classe di size per il bin `rel` — fondamenta dell'`add_edge` O(1). Vedi [decisione](design_decisions.md#2026-06-19--relation-list-a-batch-fixed-width--edge-a-lista-doppiamente-concatenata).
+- **Before:**
+  ```cpp
+  // pod_struct.h — header 16 byte + tail a larghezza VARIABILE
+  struct RelationNodeList {
+      uint64_t type_count;  // n. tipi di relazione
+      uint16_t batch_size;  // byte della tail variabile (somma di 24 + name_length)
+      uint16_t free_bytes;
+      uint64_t next_offset;
+      uint64_t head;
+      uint8_t  is_deleted;
+  };
+  // tail: type_count entry da [name_length][name][edge_offset][edge_count] (larghezza variabile)
+  ```
+- **After:**
+  ```cpp
+  // pod_struct.h — header 37 byte + tail FISSA da 2176 byte (regione totale 2213, costante)
+  struct NodeRelationList {
+      uint64_t node_id;     // back-reference al nodo proprietario (NUOVO)
+      uint64_t type_count;  // righe relazione usate in QUESTO batch (0..8)
+      uint16_t batch_size;  // tail riservata, COSTANTE = RELATION_BATCH_TAIL (2176)
+      uint16_t free_bytes;  // = batch_size - type_count*272
+      uint64_t next_offset; // offset del batch successivo (0 = ultimo); chaining WIP
+      uint64_t head;        // n. seriale del batch: 1 = primo, 2,3,... = estensioni
+      uint8_t  is_deleted;
+  };
+  // tail: RELATION_BATCH_TAIL byte = max 8 righe FISSE da 272:
+  //   [uint64_t edge_offset][uint64_t edge_count][uint8_t name_length][char name[255]]
+  // le prime type_count righe sono usate, il resto azzerato.
+  ```
+- **Note di migrazione:** **Schema-break del formato on-disk** (l'header cresce e la tail diventa fixed-width) → cancellare `db/`. Il tipo è rinominato `RelationNodeList` → `NodeRelationList` in tutti i siti; `RelationNodeListFreeOffset` (POD del freelist) **mantiene** il nome. La size reclamabile di un batch è ora **costante** `sizeof(NodeRelationList) + batch_size = 2213` byte. Nuove costanti in `costants.h`: `RELATION_NAME_MAX=255`, `RELATION_LINE_SIZE=272`, `RELATION_LINES_PER_BATCH=8`, `RELATION_BATCH_TAIL=2176`. **Limite:** un nodo con >8 tipi di relazione fa lanciare `std::runtime_error` (batch chaining via `next_offset` non ancora implementato). `read_relation_node_list` legge l'header + `type_count` righe fisse e poi salta `free_bytes` per posizionarsi a fine batch.
+- **Riferimenti:** commit `0a043f7`. `graph_core/struct/pod_struct.h`, `graph_core/costants.h`, `graph_core/io/graph_io.{h,cpp}`, `graph_core/odt/node_odt.cpp`.
+
+---
+
+### 2026-06-19 — `Edge`: aggiunti `prev_offset` / `next_offset` (32 → 48 byte)
+
+- **Motivazione:** trasformare il chunk contiguo per `(node, relation)` in una **lista doppiamente concatenata**, così un nuovo arco si aggancia in O(1) (append + relink) invece di riscrivere il chunk. Vedi [decisione](design_decisions.md#2026-06-19--relation-list-a-batch-fixed-width--edge-a-lista-doppiamente-concatenata).
+- **Before:**
+  ```cpp
+  // pod_struct.h — 32 byte
+  struct Edge {
+      uint64_t id;
+      int64_t  weight;
+      uint64_t to_node;
+      uint64_t from_node;
+  };
+  ```
+- **After:**
+  ```cpp
+  // pod_struct.h — 48 byte
+  struct Edge {
+      uint64_t id;
+      int64_t  weight;
+      uint64_t to_node;
+      uint64_t from_node;
+      uint64_t prev_offset; // arco precedente della stessa catena (0 = testa)
+      uint64_t next_offset; // arco successivo della stessa catena (0 = coda)
+  };
+  ```
+- **Note di migrazione:** **Schema-break** (`Edge` 32 → 48 byte): cancellare `db/`. La lettura degli archi di una relazione ora **segue `next_offset`** dalla testa (`edge_offset`) per `edge_count` passi (`read_typed_node`, `build_inbound_index`). In questa fase i chunk sono ancora scritti **contigui** (sia all'insert che nel whole-rewrite di `update_node_edges`), ma con `prev`/`next` valorizzati a formare la catena, quindi il read chain-walk è già corretto. La size dei chunk del freelist `edges` passa da `count*32` a `count*48`.
+- **Riferimenti:** commit `0a043f7`. `graph_core/struct/pod_struct.h` (`Edge`), `graph_core/io/graph_io.h` (`write_edge_chain_at`, edge-read in `read_typed_node`), `graph_core/io/graph_io.cpp` (`build_inbound_index`).
+
+---
+
+### 2026-06-19 — Firme ODT: `edge_to_pod` (+prev/next), `node_to_relation_list` (+node_id, +head)
+
+- **Motivazione:** propagare i nuovi campi POD attraverso il layer ODT.
+- **Before:**
+  ```cpp
+  Edge edge_to_pod(uint64_t idx, uint64_t from, uint64_t to, uint64_t weight);
+  RelationNodeList node_to_relation_list(const BaseNode &node);
+  ```
+- **After:**
+  ```cpp
+  Edge edge_to_pod(uint64_t idx, uint64_t from, uint64_t to, uint64_t weight,
+                   uint64_t prev_offset = 0, uint64_t next_offset = 0);
+  NodeRelationList node_to_relation_list(const BaseNode &node, uint64_t node_id, uint64_t head = 1);
+  ```
+- **Note di migrazione:** `edge_to_pod` ha due parametri **opzionali** (default 0) → i chiamanti che non passano prev/next restano validi; gli helper di scrittura li popolano per formare la catena. `node_to_relation_list` ora **richiede** `node_id` (back-reference del batch) e accetta `head` (default 1); valorizza `batch_size = RELATION_BATCH_TAIL` (costante) e `free_bytes = batch_size - type_count*272` invece della vecchia somma a larghezza variabile. Tutti i chiamanti (`write_relation_node_list`, `update_node_edges`) aggiornati.
+- **Riferimenti:** commit `0a043f7`. `graph_core/odt/edge_odt.{h,cpp}`, `graph_core/odt/node_odt.{h,cpp}`.
 
 ---
 

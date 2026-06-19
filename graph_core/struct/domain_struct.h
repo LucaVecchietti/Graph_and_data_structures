@@ -20,12 +20,18 @@ struct BaseNode; // forward declaration: EdgeRef points back to a neighbor node.
  *  - weight    edge weight.
  *  - neighbor  pointer to the destination BaseNode (nullptr until re-linked after a
  *              load from disk; see read_node).
+ *  - offset    byte offset of this edge's Edge POD in edges.dat. Lets add_edge
+ *              overwrite the weight in place in O(1) (persist_edge_weight) without
+ *              walking the chain. Set on load (read_typed_node), on first append
+ *              (persist_new_edge), and refreshed when update_node_edges relocates
+ *              the node's edges. Meaningless until the edge is persisted.
  */
 struct EdgeRef
 {
     uint64_t id;
     int weight;
     BaseNode *neighbor;
+    uint64_t offset;
 };
 
 /**

@@ -65,6 +65,32 @@ JsonMeta        read_json_attributes_meta();
 
 void            update_node_edges(BaseNode &node, MetaRecord &meta, uint64_t node_id);
 
+/**
+ * O(1) persist of a brand-new edge (start --type--> to_id). The node's relation
+ * batch never moves, so NodeIndex is untouched. Steps:
+ *   1. read relation_offset from nodes.idx, then the batch header + lines to find
+ *      the line for `type` (<= 8 lines → O(1));
+ *   2. allocate the new Edge slot (pop the single-edge `edges` freelist bin, else
+ *      append at EOF of edges.dat);
+ *   3. write the Edge with prev=0, next=current chain head;
+ *   4. patch the OLD head's prev_offset in place (if the relation already existed);
+ *   5. update that relation's fixed-width line in place (edge_offset = new head,
+ *      edge_count + 1) — or, for a brand-new relation type, write a fresh line at
+ *      slot `type_count` and bump type_count / shrink free_bytes in the header.
+ * Throws if the relation type is new and the batch is full (8 types / no free
+ * line) — batch chaining via next_offset is still WIP.
+ * @return the byte offset of the newly-written Edge in edges.dat (store it in EdgeRef.offset).
+ */
+uint64_t        persist_new_edge(MetaRecord &meta, uint64_t node_id, const std::string &type,
+                                 uint64_t to_id, uint64_t edge_id, int64_t weight);
+
+/**
+ * O(1) in-place overwrite of an existing edge's weight: seek to
+ * edge_offset + offsetof(Edge, weight) in edges.dat and write 8 bytes. No
+ * allocation, no relinking, no file growth.
+ */
+void            persist_edge_weight(uint64_t edge_offset, int64_t weight);
+
 void            delete_node_from_disk(uint64_t node_id, MetaRecord &meta);
 
 /**
@@ -437,12 +463,14 @@ BaseNode* read_typed_node(const NodeIndex &node_idx, std::ifstream &dat_in)
             uint64_t off = entry.edge_offset;
             for (uint64_t i = 0; i < entry.edge_count; ++i)
             {
-                edges_in.seekg(static_cast<std::streamoff>(off));
+                uint64_t cur = off; // this edge's own disk offset (kept in EdgeRef.offset)
+                edges_in.seekg(static_cast<std::streamoff>(cur));
                 Edge edge = read_pod<Edge>(edges_in);
                 // neighbor ptr is nullptr — must be re-linked after all nodes are loaded.
-                // edge.id is preserved so a later add_edge overwrite reuses the same id.
+                // edge.id is preserved so a later add_edge overwrite reuses the same id;
+                // cur lets a weight overwrite seek straight to the record in O(1).
                 node->neighborgs[entry.name][static_cast<int>(edge.to_node)] =
-                    EdgeRef{edge.id, static_cast<int>(edge.weight), nullptr};
+                    EdgeRef{edge.id, static_cast<int>(edge.weight), nullptr, cur};
                 off = edge.next_offset;
             }
         }

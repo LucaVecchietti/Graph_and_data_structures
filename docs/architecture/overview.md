@@ -6,8 +6,8 @@
 |---|---|
 | Tipo | architecture |
 | Lingua | en |
-| Ultimo aggiornamento | 2026-06-13 |
-| Commit di riferimento | cb9939c |
+| Ultimo aggiornamento | 2026-06-19 |
+| Commit di riferimento | 0a043f7 |
 | Mirror | — |
 
 ---
@@ -105,9 +105,9 @@ write_node<T>          (graph_core/io/graph_io.h)
    │       write_complex(node.data, json_file_path, dat_out)
    │                                       → ComplexHeader + 2 strings → nodes.dat
    │                                       → JSON payload              → attributes/{prog}_{label}.json
-   │ RelationNodeList header              → nodes.dat
+   │ NodeRelationList batch (2213 B)      → nodes.dat
    │ NodeIndex                            → nodes.idx
-   │ (per-relation edges)                 → edges.dat
+   │ (per-relation edge chains)           → edges.dat
    ▼
 write_meta(meta)       → meta.dat
 ```
@@ -121,22 +121,21 @@ main.cpp
 Graph::add_edge        (graph_core/graph.cpp)
    │ if start/end not in RAM but id < meta.next_id:
    │     read_node(id)   ← lazy load from disk
-   │ id = new edge ? meta.next_edge_id : existing EdgeRef.id
-   │ node->neighborgs[type][end] = EdgeRef{id, weight, ptr}   ← RAM-first
+   │ resolve: new edge (fresh id) vs overwrite (existing EdgeRef.id + .offset)
    ▼
-update_node_edges      (graph_core/io/graph_io.cpp)  ← persistence since 2026-05-30
-   │ read OLD NodeIndex + RelationNodeList        ← identify orphaned regions
-   │ push old RelationNodeList→rel bin, old chunks→edges bin; zero them; free_edge_count += chunks
-   │ append NEW RelationNodeList POD              → nodes.dat
-   │ for each relation in node->neighborgs:
-   │     append edges to edges.dat (fresh chunk)  → captures new edge_offset
-   │     append tail entry [name][off][count]     → nodes.dat
-   │ open nodes.idx (binary | in | out)           ← NOT app: in-place seek
-   │ patch NodeIndex.relation_offset in place     → nodes.idx
-   │ if new edge: meta.next_edge_id++; meta.edge_count++; write_meta()
+NEW edge → persist_new_edge   (graph_core/io/graph_io.cpp)   ← O(1)
+   │ read relation_offset from nodes.idx; find/make the relation line (≤8 → O(1))
+   │ alloc Edge slot: pop edges_48 bin, else append edges.dat
+   │ write Edge {prev=0, next=old_head}; patch old head's prev_offset in place
+   │ update ONE relation line in place (new head + count) — or add a line + header
+   │ (batch never moves → nodes.idx untouched); store returned offset in EdgeRef
+   │ in_edges[end].insert(start); meta.next_edge_id++; meta.edge_count++
+OVERWRITE → persist_edge_weight(EdgeRef.offset, weight)        ← O(1), 8 bytes in place
+   ▼
+write_meta(meta)
 ```
 
-Since 2026-05-30, `add_edge` persists. [BUG-001](../legacy/known_bugs.md#2026-05-26--bug-001-add_edge-non-persiste-su-disco) closed. The old `RelationNodeList` and edge chunks are pushed onto the `rel`/`edges` freelist bins and zeroed (since 2026-06-07, [BUG-017](../legacy/known_bugs.md#2026-06-07--bug-017-update_node_edges-orfanizza-regioni-senza-spingerle-sulla-freelist)); since 2026-06-13 the new regions are written **pop-then-append**, reusing those exact-size holes in place, so a weight-overwrite causes no file growth (see [Reuse of the rel/edges freelist bins](../legacy/design_decisions.md#2026-06-13--reuse-of-the-reledges-freelist-bins-edge-space-compaction)). See [Edge persistence design decision](../legacy/design_decisions.md#2026-05-30--edge-persistence-append--obsolete--in-place-index-patch). Since 2026-06-02 each `Edge.id` is globally unique, sourced from `MetaRecord.next_edge_id` and stored in `EdgeRef` ([BUG-002](../legacy/known_bugs.md#2026-05-26--bug-002-edgeid-non-globale-tra-nodi) closed; see [decision](../legacy/design_decisions.md#2026-06-02--id-arco-globale-sorgente-in-metarecordnext_edge_id-memorizzato-in-edgeref)).
+`add_edge` is **O(1)** since 2026-06-19: a new edge appends + splices at the chain head and rewrites one fixed-width relation line in place; an overwrite writes 8 bytes in place. The relation batch never moves, so `nodes.idx` is untouched and `nodes.dat` does not grow. `add_edge` no longer calls `update_node_edges` (which survives only for `delete_node`'s inbound cleanup). [BUG-001](../legacy/known_bugs.md#2026-05-26--bug-001-add_edge-non-persiste-su-disco) closed; ids stable since 2026-06-02 ([BUG-002](../legacy/known_bugs.md#2026-05-26--bug-002-edgeid-non-globale-tra-nodi)). See the [O(1) add_edge decision](../legacy/design_decisions.md#2026-06-19--add_edge-in-o1-append--relink--in-place-line-update) and the [fixed-width format decision](../legacy/design_decisions.md#2026-06-19--relation-list-a-batch-fixed-width--edge-a-lista-doppiamente-concatenata). See [Edge persistence design decision](../legacy/design_decisions.md#2026-05-30--edge-persistence-append--obsolete--in-place-index-patch). Since 2026-06-02 each `Edge.id` is globally unique, sourced from `MetaRecord.next_edge_id` and stored in `EdgeRef` ([BUG-002](../legacy/known_bugs.md#2026-05-26--bug-002-edgeid-non-globale-tra-nodi) closed; see [decision](../legacy/design_decisions.md#2026-06-02--id-arco-globale-sorgente-in-metarecordnext_edge_id-memorizzato-in-edgeref)).
 
 ### Node delete + freelist reuse flow (since 2026-06-03, completed 2026-06-07)
 
@@ -154,7 +153,7 @@ Graph::delete_node       (graph_core/graph.cpp)
 delete_node_from_disk    (graph_core/io/graph_io.cpp)
    │ read NodeIndex (+ ComplexHeader if COMPLEX → real size, remove sidecar, recycle prog)
    │ push NodeRecord region       → db/freelist/{nodes|complex}_<size>.dat
-   │ push RelationNodeList region → db/freelist/rel_<size>.dat
+   │ push NodeRelationList batch  → db/freelist/rel_<size>.dat (size constant 2213)
    │ push each edge chunk         → db/freelist/edges_<size>.dat
    │ zero the orphaned bytes; tombstone nodes.idx slot (type_id=TOMBSTONE)
    │ meta: node_count--, free_count++, free_edge_count += chunks
@@ -182,8 +181,8 @@ read_typed_node<T>      (graph_core/io/graph_io.h)
    │ seek nodes.dat at NodeIndex.offset
    │ read NodeRecord<T>
    │ seek nodes.dat at NodeIndex.relation_offset
-   │ read RelationNodeList header + entries
-   │ for each entry: read edges from edges.dat
+   │ read NodeRelationList header + fixed-width lines
+   │ for each line: walk the edge chain from edge_offset via next_offset
    │ neighbor pointers left as nullptr  ← must be re-linked later
 ```
 
@@ -217,3 +216,5 @@ main.cpp
 - [Tombstone + azzeramento delle regioni su delete](../legacy/design_decisions.md#2026-06-07--tombstone--azzeramento-delle-regioni-su-delete) — how a deleted slot is marked and its bytes zeroed.
 - [Indice inverso degli archi entranti in-RAM](../legacy/design_decisions.md#2026-06-07--indice-inverso-degli-archi-entranti-in-ram) — how `delete_node` finds and removes inbound edges in O(deg_in).
 - [Bin per-tipo per i record COMPLEX via prog_number zero-paddato](../legacy/design_decisions.md#2026-06-07--bin-per-tipo-per-i-record-complex-via-prog_number-zero-paddato) — how COMPLEX records reuse freed slots.
+- [Relation-list a batch fixed-width + Edge a lista doppiamente concatenata](../legacy/design_decisions.md#2026-06-19--relation-list-a-batch-fixed-width--edge-a-lista-doppiamente-concatenata) — the fixed-width relation batch and edge linked-list format (groundwork for O(1) `add_edge`).
+- [add_edge in O(1): append + relink + in-place line update](../legacy/design_decisions.md#2026-06-19--add_edge-in-o1-append--relink--in-place-line-update) — how `add_edge`/overwrite became O(1) on that format.
