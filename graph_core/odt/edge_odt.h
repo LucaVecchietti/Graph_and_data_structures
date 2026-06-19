@@ -14,4 +14,5 @@
  * The edges are stored as a list of Edge POD structs, which contain the weight and the
  * offset to the destination node. The relation type is stored separately in the RelationNodeList.
  */
-Edge edge_to_pod(uint64_t idx, uint64_t from, uint64_t to, uint64_t weight);
+Edge edge_to_pod(uint64_t idx, uint64_t from, uint64_t to, uint64_t weight,
+                 uint64_t prev_offset = 0, uint64_t next_offset = 0);

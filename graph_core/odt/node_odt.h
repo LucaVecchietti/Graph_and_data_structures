@@ -44,13 +44,16 @@ NodeRecord<T> node_to_record(const Node<T> &node)
 NodeRecord<ComplexHeader> complex_node_to_record(const Node<ComplexRecord> &node, std::string &json_file_path);
 
 /**
- * Translates a typed Node struct to a RelationNodeList POD struct for serialization.
- * The RelationNodeList contains the adjacency information (relation types and neighbor offsets),
- * while the data payload is stored separately in the NodeRecord.
- * @param node The Node to be translated.
- * @return The RelationNodeList containing the adjacency information of the node for serialization.
+ * Translates a typed Node struct to a NodeRelationList batch HEADER for serialization.
+ * The header describes a single fixed-width relation batch (the tail lines are written
+ * by the I/O layer). type_count counts the node's relation types, free_bytes / batch_size
+ * follow the fixed-width layout (see pod_struct.h / costants.h).
+ * @param node    The Node to be translated.
+ * @param node_id Id of the owning node (stored as the batch back-reference).
+ * @param head    Batch serial number (1 for the first/only batch).
+ * @return The NodeRelationList header for serialization.
  */
-RelationNodeList node_to_relation_list(const BaseNode &node);
+NodeRelationList node_to_relation_list(const BaseNode &node, uint64_t node_id, uint64_t head = 1);
 
 /**
  * Translates a NodeRecord POD struct back to a typed Node struct for use in memory.
@@ -80,6 +83,6 @@ struct RelationEntry
 
 // NOTE: `reconstruct_neighbors` and `node_form_pod` were removed (BUG-003/BUG-004).
 // They were never called and could not work as declared — neither has access to
-// the on-disk RelationNodeList tail or to edges.dat, so neither could rebuild the
+// the on-disk NodeRelationList tail or to edges.dat, so neither could rebuild the
 // adjacency. The real POD→domain reconstruction lives in `read_typed_node`
 // (io/graph_io.h), which reads the streams directly.

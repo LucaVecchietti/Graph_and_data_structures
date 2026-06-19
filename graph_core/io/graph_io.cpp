@@ -123,17 +123,15 @@ void read_complex(ComplexRecord &out, std::ifstream &dat_in)
 
 std::vector<RelationEntry> read_relation_node_list(std::ifstream &in)
 {
-    RelationNodeList header = read_pod<RelationNodeList>(in);
+    NodeRelationList header = read_pod<NodeRelationList>(in);
     std::vector<RelationEntry> entries;
     entries.reserve(header.type_count);
     for (uint64_t i = 0; i < header.type_count; ++i)
-    {
-        RelationEntry entry;
-        entry.name        = read_string(in);
-        entry.edge_offset = read_offset(in);
-        entry.edge_count  = read_offset(in);
-        entries.push_back(std::move(entry));
-    }
+        entries.push_back(read_relation_line(in));
+
+    // Skip the unused (zero-filled) remainder of the fixed tail so the stream
+    // sits at the end of this batch region.
+    in.seekg(static_cast<std::streamoff>(header.free_bytes), std::ios::cur);
     return entries;
 }
 
@@ -288,8 +286,8 @@ void update_node_edges(BaseNode &node, MetaRecord &meta, uint64_t node_id)
             throw std::runtime_error("update_node_edges: failed to open nodes.dat for reading.");
         }
         dat_in.seekg(static_cast<std::streamoff>(node_idx.relation_offset));
-        RelationNodeList old_header = read_pod<RelationNodeList>(dat_in);
-        old_relation_total_size = sizeof(RelationNodeList) + old_header.batch_size;
+        NodeRelationList old_header = read_pod<NodeRelationList>(dat_in);
+        old_relation_total_size = sizeof(NodeRelationList) + old_header.batch_size;
 
         // read_relation_node_list expects the stream positioned at the POD
         // start, so rewind before delegating to it for the tail entries.
@@ -355,8 +353,14 @@ void update_node_edges(BaseNode &node, MetaRecord &meta, uint64_t node_id)
     // The new RelationNodeList POD's batch_size is pre-computed via the ODT
     // bridge node_to_relation_list (sums 24 + name.size() over all relations),
     // so we know the exact total region size up front to pick the rel bin.
-    RelationNodeList list = node_to_relation_list(node);
-    uint64_t new_relation_total_size = sizeof(RelationNodeList) + list.batch_size;
+    NodeRelationList list = node_to_relation_list(node, node_id);
+    uint64_t new_relation_total_size = sizeof(NodeRelationList) + list.batch_size;
+
+    // Single-batch only for now (chaining via next_offset is WIP).
+    if (list.type_count > RELATION_LINES_PER_BATCH)
+        throw std::runtime_error("update_node_edges: node " + std::to_string(node_id)
+                                 + " has more than " + std::to_string(RELATION_LINES_PER_BATCH)
+                                 + " relation types (batch chaining not yet implemented).");
 
     // Decide where the new relation-list region lands: reuse an exact-size freed
     // `rel` region if one exists, else append at EOF (set below from tellp()).
@@ -385,10 +389,10 @@ void update_node_edges(BaseNode &node, MetaRecord &meta, uint64_t node_id)
             new_relation_offset = dat_out.tellp();
         }
 
-        // The reuse fit is exact (the bin is size-segregated), so the POD plus
-        // all tail entries land in exactly new_relation_total_size bytes — no
-        // overrun. Use ONE in|out stream for the POD + every tail entry so the
-        // put pointer advances contiguously (never seek dat_out between entries).
+        // The reuse fit is exact (every batch is one size class now), so the POD
+        // plus the full fixed tail land in exactly new_relation_total_size bytes —
+        // no overrun. Use ONE in|out stream for the POD + every line so the put
+        // pointer advances contiguously (never seek dat_out between lines).
         write_pod(list, dat_out);
 
         std::fstream edges_out(fs::path(DB_PATH) / "edges.dat",
@@ -401,7 +405,11 @@ void update_node_edges(BaseNode &node, MetaRecord &meta, uint64_t node_id)
 
         // Each edge carries its own globally-unique id in EdgeRef.id (assigned
         // from MetaRecord.next_edge_id by add_edge and preserved across these
-        // full-node rewrites), so we write that id directly into the Edge POD.
+        // full-node rewrites), so write_edge_chain_at writes that id directly.
+        // NOTE: this is still the whole-node rewrite path. The O(1) append+relink
+        // exploit of the new linked-list / fixed-width format is the next phase;
+        // here we only re-emit the same data in the new on-disk layout.
+        uint64_t used = 0;
         for (const auto &[rel_type, neighbors] : node.neighborgs)
         {
             uint64_t edge_count = static_cast<uint64_t>(neighbors.size());
@@ -423,23 +431,20 @@ void update_node_edges(BaseNode &node, MetaRecord &meta, uint64_t node_id)
             else
             {
                 edges_out.seekp(0, std::ios::end);
-                edge_offset = edges_out.tellp();
+                edge_offset = static_cast<uint64_t>(edges_out.tellp());
             }
 
-            for (const auto &[to_id, ref] : neighbors)
-            {
-                Edge edge = edge_to_pod(ref.id, node_id,
-                                       static_cast<uint64_t>(to_id),
-                                       static_cast<uint64_t>(ref.weight));
-                write_pod(edge, edges_out);
-            }
+            // Write this relation's edges as a doubly-linked contiguous run.
+            write_edge_chain_at(edges_out, edge_offset, node_id, neighbors);
 
-            // Tail entry goes on the nodes.dat stream, whose put pointer is right
-            // after the POD / previous tail entry — do not seek it between entries.
-            write_string(rel_type, dat_out);
-            write_offset(edge_offset, dat_out);
-            write_offset(edge_count, dat_out);
+            // Fixed-width line on the nodes.dat stream; its put pointer is right
+            // after the POD / previous line — do not seek it between lines.
+            write_relation_line(dat_out, edge_count == 0 ? 0 : edge_offset, edge_count, rel_type);
+            ++used;
         }
+
+        // Zero-fill the rest of the fixed tail so the region is exactly 2213 bytes.
+        pad_relation_tail(dat_out, used);
     }
 
     // ---- 4. Patch NodeIndex.relation_offset in-place -----------------------
@@ -504,8 +509,8 @@ void delete_node_from_disk(uint64_t node_id, MetaRecord &meta)
             throw std::runtime_error("delete_node_from_disk: failed to open nodes.dat for reading.");
         }
         dat_in.seekg(static_cast<std::streamoff>(node_idx.relation_offset));
-        RelationNodeList header = read_pod<RelationNodeList>(dat_in);
-        relation_list_total_size = sizeof(RelationNodeList) + header.batch_size;
+        NodeRelationList header = read_pod<NodeRelationList>(dat_in);
+        relation_list_total_size = sizeof(NodeRelationList) + header.batch_size;
 
         // read_relation_node_list expects the stream at the POD start, so rewind before delegating.
         dat_in.seekg(static_cast<std::streamoff>(node_idx.relation_offset));
@@ -688,12 +693,15 @@ std::unordered_map<int, std::unordered_set<int>> build_inbound_index(uint64_t ne
 
         for (const auto &entry : entries)
         {
-            edges_in.clear();
-            edges_in.seekg(static_cast<std::streamoff>(entry.edge_offset));
+            // Walk the edge linked list from its head, hopping by next_offset.
+            uint64_t off = entry.edge_offset;
             for (uint64_t i = 0; i < entry.edge_count; ++i)
             {
+                edges_in.clear();
+                edges_in.seekg(static_cast<std::streamoff>(off));
                 Edge e = read_pod<Edge>(edges_in);
                 in_edges[static_cast<int>(e.to_node)].insert(static_cast<int>(e.from_node));
+                off = e.next_offset;
             }
         }
     }

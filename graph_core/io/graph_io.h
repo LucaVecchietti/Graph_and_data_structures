@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <vector>
 #include <string>
+#include <cstring>
 #include <optional>
 #include <unordered_map>
 #include <unordered_set>
@@ -80,6 +81,79 @@ std::unordered_map<int, std::unordered_set<int>> build_inbound_index(uint64_t ne
 // work uniformly with NodeFreeOffset, RelationNodeListFreeOffset and
 // BatchOfEdgesFreeOffset without a per-type declaration here.
 
+// ---- Fixed-width relation-batch helpers ─────────────────────────────
+//
+// A relation batch tail is RELATION_BATCH_TAIL bytes of fixed-width lines (see
+// pod_struct.h / costants.h). These helpers keep the on-disk line layout in one
+// place so the read and write paths cannot drift.
+
+/**
+ * Writes one fixed-width relation line (RELATION_LINE_SIZE bytes) at the stream's
+ * current put position: [edge_offset][edge_count][name_length][name padded to 255].
+ */
+inline void write_relation_line(std::ostream &out, uint64_t edge_offset, uint64_t edge_count, const std::string &name)
+{
+    write_offset(edge_offset, out);
+    write_offset(edge_count, out);
+    uint8_t name_len = static_cast<uint8_t>(name.size());
+    out.write(reinterpret_cast<const char *>(&name_len), 1);
+    char namebuf[RELATION_NAME_MAX] = {0};            // zero-padded fixed-width name field
+    std::memcpy(namebuf, name.data(), name.size());
+    out.write(namebuf, RELATION_NAME_MAX);
+}
+
+/**
+ * Reads one fixed-width relation line written by write_relation_line into a
+ * RelationEntry (name trimmed to its real length).
+ */
+inline RelationEntry read_relation_line(std::ifstream &in)
+{
+    RelationEntry e;
+    e.edge_offset = read_offset(in);
+    e.edge_count  = read_offset(in);
+    uint8_t name_len = 0;
+    in.read(reinterpret_cast<char *>(&name_len), 1);
+    char namebuf[RELATION_NAME_MAX];
+    in.read(namebuf, RELATION_NAME_MAX);
+    e.name.assign(namebuf, name_len);
+    return e;
+}
+
+/**
+ * Zero-fills the remainder of a batch tail after `used_lines` used lines, so the
+ * region is always exactly sizeof(NodeRelationList) + RELATION_BATCH_TAIL bytes
+ * (one freelist size class; unused lines read back as zeros).
+ */
+inline void pad_relation_tail(std::ostream &out, uint64_t used_lines)
+{
+    uint64_t pad = RELATION_BATCH_TAIL - used_lines * RELATION_LINE_SIZE;
+    if (pad == 0) return;
+    std::vector<char> zeros(static_cast<size_t>(pad), 0);
+    out.write(zeros.data(), static_cast<std::streamsize>(pad));
+}
+
+/**
+ * Writes a single (node, relation) edge set as a doubly-linked, contiguous Edge
+ * run. The stream put pointer MUST already sit at `base` (the head edge offset);
+ * the run occupies neighbors.size() * sizeof(Edge) bytes from there. prev/next
+ * offsets chain the edges so a future insert can splice in O(1). No-op if empty.
+ */
+inline void write_edge_chain_at(std::ostream &edges_out, uint64_t base, uint64_t from_node,
+                                const std::unordered_map<int, EdgeRef> &neighbors)
+{
+    uint64_t n = static_cast<uint64_t>(neighbors.size());
+    uint64_t i = 0;
+    for (const auto &[to_id, ref] : neighbors)
+    {
+        uint64_t prev = (i == 0)     ? 0 : base + (i - 1) * sizeof(Edge);
+        uint64_t next = (i == n - 1) ? 0 : base + (i + 1) * sizeof(Edge);
+        Edge edge = edge_to_pod(ref.id, from_node, static_cast<uint64_t>(to_id),
+                                static_cast<uint64_t>(ref.weight), prev, next);
+        write_pod(edge, edges_out);
+        ++i;
+    }
+}
+
 // ---- Template definitions ───────────────────────────────────────────
 
 /**
@@ -106,7 +180,14 @@ uint64_t write_node_record(const Node<T> &node)
 template <typename T>
 uint64_t write_relation_node_list(const Node<T> &node, uint64_t node_id, std::ofstream &out)
 {
-    RelationNodeList list = node_to_relation_list(node);
+    NodeRelationList list = node_to_relation_list(node, node_id);
+
+    // Single-batch only for now: chaining a 2nd batch via next_offset is WIP.
+    if (list.type_count > RELATION_LINES_PER_BATCH)
+        throw std::runtime_error("write_relation_node_list: node " + std::to_string(node_id)
+                                 + " has more than " + std::to_string(RELATION_LINES_PER_BATCH)
+                                 + " relation types (batch chaining not yet implemented).");
+
     uint64_t offset = out.tellp();
     write_pod(list, out);
 
@@ -114,21 +195,21 @@ uint64_t write_relation_node_list(const Node<T> &node, uint64_t node_id, std::of
     if (!edges_out) throw std::runtime_error("Failed to open edges file for writing.");
 
     // Used by the initial node insert, when node.neighborgs is normally empty
-    // (edges are attached later via add_edge). Each edge is written with its own
-    // EdgeRef.id rather than a per-node-local counter.
+    // (edges are attached later via add_edge). Each relation's edges are written
+    // as a doubly-linked contiguous run; the line stores the head edge offset.
+    uint64_t used = 0;
     for (const auto &[rel_type, neighbors] : node.neighborgs)
     {
-        uint64_t edge_offset = edges_out.tellp();
-        for (const auto &[to_id, ref] : neighbors)
-        {
-            Edge edge = edge_to_pod(ref.id, node_id, static_cast<uint64_t>(to_id), static_cast<uint64_t>(ref.weight));
-            write_pod(edge, edges_out);
-        }
-        uint64_t edge_count = static_cast<uint64_t>(neighbors.size());
-        write_string(rel_type, out);
-        write_offset(edge_offset, out);
-        write_offset(edge_count, out);
+        edges_out.seekp(0, std::ios::end);
+        uint64_t edge_offset = static_cast<uint64_t>(edges_out.tellp());
+        write_edge_chain_at(edges_out, edge_offset, node_id, neighbors);
+        write_relation_line(out, neighbors.empty() ? 0 : edge_offset,
+                            static_cast<uint64_t>(neighbors.size()), rel_type);
+        ++used;
     }
+
+    // Pad the rest of the fixed tail so the batch region is always 2213 bytes.
+    pad_relation_tail(out, used);
     return offset;
 }
 
@@ -350,14 +431,19 @@ BaseNode* read_typed_node(const NodeIndex &node_idx, std::ifstream &dat_in)
 
         for (const auto &entry : entries)
         {
-            edges_in.seekg(static_cast<std::streamoff>(entry.edge_offset));
+            // Follow the edge linked list from its head (entry.edge_offset),
+            // hopping by next_offset. edge_count bounds the walk (the chain may be
+            // contiguous now, but next_offset makes the read robust to O(1) splices).
+            uint64_t off = entry.edge_offset;
             for (uint64_t i = 0; i < entry.edge_count; ++i)
             {
+                edges_in.seekg(static_cast<std::streamoff>(off));
                 Edge edge = read_pod<Edge>(edges_in);
                 // neighbor ptr is nullptr — must be re-linked after all nodes are loaded.
                 // edge.id is preserved so a later add_edge overwrite reuses the same id.
                 node->neighborgs[entry.name][static_cast<int>(edge.to_node)] =
                     EdgeRef{edge.id, static_cast<int>(edge.weight), nullptr};
+                off = edge.next_offset;
             }
         }
     }

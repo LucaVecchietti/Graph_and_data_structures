@@ -79,51 +79,50 @@ struct NodeRecord
 #pragma pack(pop)
 
 /**
- *  Relation list struct POD of the Node - hold the typpes and the relatives offsets of the node
+ *  Relation list struct POD of the Node — the FIXED-WIDTH-BATCH header.
+ *
+ *  A node's relation list is stored as one or more equal-size BATCHES. Each batch
+ *  is this 37-byte POD header followed by a fixed RELATION_BATCH_TAIL-byte (= 2176)
+ *  tail of up to RELATION_LINES_PER_BATCH (= 8) fixed-width lines. The whole region
+ *  is therefore always sizeof(NodeRelationList) + RELATION_BATCH_TAIL = 2213 bytes,
+ *  regardless of how many lines are actually used. Two payoffs:
+ *    1. A single relation line can be located by index and rewritten IN PLACE
+ *       (O(1) seek-write) — the foundation of O(1) add_edge.
+ *    2. Every batch is the same on-disk size, so the relation freelist needs only
+ *       ONE size class/bin instead of one per variable tail length.
+ *  A node with more than 8 relation types chains a second batch via next_offset
+ *  (head 1 -> 2 -> 3 ...). (Batch chaining traversal is WIP — see ROADMAP.)
  */
-
 #pragma pack(push, 1)
-struct RelationNodeList
+struct NodeRelationList
 {
-    uint64_t type_count;  // Number of distinct relation types this node has.
-    uint16_t batch_size;  // Size in bytes of the variable-width tail that follows
-                          // this POD (NOT including the 16 bytes of the POD itself).
-                          // Two uses:
-                          //   1. Read path: after reading the POD, read batch_size
-                          //      more bytes in one shot to grab the whole tail
-                          //      without per-entry seeks.
-                          //   2. Freelist: when this RelationNodeList region is
-                          //      orphaned (e.g. by an in-place update from add_edge),
-                          //      the total reclaimable size at `relation_offset` is
-                          //      sizeof(RelationNodeList) + batch_size.
-    uint16_t free_bytes;  // Bytes remaning in the batch to append relations. 
-    uint64_t next_offset; // Contain the next offset of the continuation of the relation list if the batch size is non enougth to store all, otherwise is 0.
-                          // Note: The standard dimension of the batch is 4096 + 264 bytes. 
-    uint64_t head;        // 1 if is the first batch of the reletion list. > 1 if is an extention.
-    uint8_t is_deleted;   // 1 if the relation list is deleted so this is a freee offset, 0 otherwise.
+    uint64_t node_id;     // Id of the owning node (back-reference, also aids recovery).
+    uint64_t type_count;  // Number of relation-type LINES actually used in THIS batch (0..8).
+    uint16_t batch_size;  // Reserved tail size in bytes. Constant RELATION_BATCH_TAIL (= 2176):
+                          // the tail is always written full-width (unused lines zero-filled), so
+                          // the total reclaimable region at the batch offset is
+                          // sizeof(NodeRelationList) + batch_size = 2213 bytes — one freelist size class.
+    uint16_t free_bytes;  // Free tail bytes = batch_size - type_count * RELATION_LINE_SIZE.
+                          // Multiple of RELATION_LINE_SIZE (272); min 0, max 2176.
+    uint64_t next_offset; // Offset in nodes.dat of the next batch of this list, or 0 if this is the last.
+    uint64_t head;        // Batch serial number: 1 = first batch of the list, 2,3,... = extensions.
+    uint8_t  is_deleted;  // 1 if this batch is a freed offset, 0 if live.
     /**
-     * After this POD, `type_count` entries are laid out contiguously, each:
+     * After this POD, RELATION_BATCH_TAIL bytes of fixed-width lines follow. The
+     * first `type_count` lines are used; the rest are zero-filled. Each line is
+     * RELATION_LINE_SIZE (= 272) bytes:
      *
-     *   [uint64_t edge_offset][uint64_t edge_count][uint8_t name_length][name bytes]
+     *   [uint64_t edge_offset][uint64_t edge_count][uint8_t name_length][char name[255]]
      *
-     * Fields per entry:
-     *   - name_length   1 bytes, length prefix written by write_string.
-     *   - name          name_length bytes, the relation type name (no NUL terminator).
-     *   - edge_offset   8 bytes, byte offset into edges.dat where the edges of this
-     *                   relation start.
-     *   - edge_count    8 bytes, number of consecutive Edge POD records belonging
-     *                   to this (node, relation) pair starting at edge_offset.
+     * Fields per line:
+     *   - edge_offset   8 bytes, byte offset into edges.dat of the HEAD edge of this
+     *                   (node, relation) pair's edge linked list (0 if no edges).
+     *   - edge_count    8 bytes, number of edges in that linked list.
+     *   - name_length   1 byte, actual length of the relation name (<= 255).
+     *   - name          255 bytes, the relation name padded with NULs to full width.
      *
-     * Per-entry size on disk = 24 + name_length bytes. The whole tail is
-     * `batch_size` bytes, i.e. sum of (24 + name_length) over all entries.
-     *
-     * Example tail with two relations "road" (3 edges) and "train" (5 edges):
-     *   [8: edge_offset=...][8: edge_count=3][1: name_length=4][r][o][a][d]
-     *   [8: edge_offset=...][8: edge_count=5][1: name_length=5][t][r][a][i][n]
-     *
-     * Note: the application-level cap on name_length is RELATION_TYPE_MAX_SIZE
-     * (= 255, enforced by add_edge via costants.h), but the on-disk length prefix
-     * is `uint64_t`, not `uint8_t` — the format itself permits up to 2^64-1.
+     * Fixed line width means line i lives at tail_offset + i * RELATION_LINE_SIZE,
+     * so updating one relation's edge_offset/edge_count is a direct seek-write.
      */
 };
 #pragma pack(pop)
@@ -134,10 +133,15 @@ struct RelationNodeList
 #pragma pack(push, 1)
 struct Edge
 {
-    uint64_t id;      // Edge  ID
-    int64_t weight;   // Weight of the edge
-    uint64_t to_node; // Destination node idx on nodes.idx file [ to_node → NodeIndex(id == to_node)]
+    uint64_t id;        // Edge  ID
+    int64_t weight;     // Weight of the edge
+    uint64_t to_node;   // Destination node idx on nodes.idx file [ to_node → NodeIndex(id == to_node)]
     uint64_t from_node; // Source node idx on nodes.idx file [ from_node → NodeIndex(id == from_node)]
+    uint64_t prev_offset; // Offset in edges.dat of the previous edge of the SAME (node, relation)
+                          // chain, or 0 if this edge is the head. Edges of one relation form a
+                          // doubly-linked list so a new edge is spliced in O(1) (append + relink)
+                          // instead of rewriting the whole chunk.
+    uint64_t next_offset; // Offset in edges.dat of the next edge of the same chain, or 0 if tail.
 };
 #pragma pack(pop)
 
@@ -200,15 +204,16 @@ struct NodeFreeOffset
 #pragma pack(pop)
 
 /**
- * Freelist record for a reclaimed RelationNodeList region in nodes.dat (the POD
- * header + its variable-width tail). Persisted to db/relation_lists_freelist.dat.
- * No id is tracked: a relation list has no standalone id, only its byte region.
+ * Freelist record for a reclaimed NodeRelationList batch region in nodes.dat (the
+ * POD header + its fixed RELATION_BATCH_TAIL tail). Persisted to the single rel
+ * size bin. No id is tracked: a relation batch has no standalone id, only its byte
+ * region. Every batch is the same size (2213 bytes), so there is one rel size class.
  */
 #pragma pack(push, 1)
 struct RelationNodeListFreeOffset
 {
-    uint64_t offset; // free offset in nodes.dat (start of the orphaned RelationNodeList)
-    uint64_t size;   // size in bytes of the free region = sizeof(RelationNodeList) + batch_size
+    uint64_t offset; // free offset in nodes.dat (start of the orphaned NodeRelationList batch)
+    uint64_t size;   // size in bytes of the free region = sizeof(NodeRelationList) + batch_size
 };
 #pragma pack(pop)
 
