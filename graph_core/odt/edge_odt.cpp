@@ -11,12 +11,15 @@
  * The edges are stored as a list of Edge POD structs, which contain the weight and the
  * offset to the destination node. The relation type is stored separately in the RelationNodeList.
  */
-Edge edge_to_pod(uint64_t idx, uint64_t from, uint64_t to, uint64_t weight)
+Edge edge_to_pod(uint64_t idx, uint64_t from, uint64_t to, uint64_t weight,
+                 uint64_t prev_offset, uint64_t next_offset)
 {
     Edge edge;
     edge.id = idx; // Unique ID for the edge, can be generated based on from/to or a global counter
     edge.weight = weight;
     edge.to_node = to; // Offset to the destination node's record in the nodes.idx file
     edge.from_node = from; // Offset to the source node's record in the nodes.idx file
+    edge.prev_offset = prev_offset; // previous edge of the same (node, relation) chain (0 = head)
+    edge.next_offset = next_offset; // next edge of the same chain (0 = tail)
     return edge;
 }

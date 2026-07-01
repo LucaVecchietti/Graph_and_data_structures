@@ -29,22 +29,23 @@ namespace {
  * while the data payload is stored separately in the NodeRecord.
  */
 
- RelationNodeList node_to_relation_list(const BaseNode &node)
+ NodeRelationList node_to_relation_list(const BaseNode &node, uint64_t node_id, uint64_t head)
  {
-     // Pre-compute the size of the variable-width tail that will be written
-     // immediately after this POD by the I/O layer. Per-entry layout is
-     //   [uint64_t name_length][name bytes][uint64_t edge_offset][uint64_t edge_count]
-     // so each entry contributes 24 + name_length bytes.
-     uint64_t batch_size = 0;
-     for (const auto &[rel_type, neighbors] : node.neighborgs)
-     {
-         (void)neighbors;
-         batch_size += 3 * sizeof(uint64_t) + rel_type.size();
-     }
+     // Fixed-width batch: the tail is always written full-width (RELATION_BATCH_TAIL
+     // bytes), with the first `type_count` lines used and the rest zero-filled. So
+     // batch_size is the CONSTANT reserved tail, and free_bytes is what is left after
+     // the used lines. This makes every batch the same on-disk size — one freelist
+     // size class — and lets a single relation line be rewritten in place.
+     uint64_t type_count = node.neighborgs.size();
 
-     RelationNodeList list;
-     list.type_count = node.neighborgs.size(); // Count the number of relation types
-     list.batch_size = batch_size;             // Size in bytes of the tail (see pod_struct.h)
+     NodeRelationList list;
+     list.node_id     = node_id;
+     list.type_count  = type_count;
+     list.batch_size  = RELATION_BATCH_TAIL;
+     list.free_bytes  = static_cast<uint16_t>(RELATION_BATCH_TAIL - type_count * RELATION_LINE_SIZE);
+     list.next_offset = 0;     // single-batch for now; chaining is WIP (see ROADMAP)
+     list.head        = head;  // 1 = first batch
+     list.is_deleted  = 0;
      return list;
  }
 

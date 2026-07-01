@@ -6,8 +6,8 @@
 |---|---|
 | Tipo | module |
 | Lingua | en |
-| Ultimo aggiornamento | 2026-06-13 |
-| Commit di riferimento | cb9939c |
+| Ultimo aggiornamento | 2026-06-19 |
+| Commit di riferimento | 0a043f7 |
 | Mirror | — |
 
 ---
@@ -22,7 +22,7 @@
 graph_core/
 ├── graph.h                     Graph class (header-only templates + declarations)
 ├── graph.cpp                   Graph non-template implementation
-├── costants.h                  Compile-time constants (RELATION_TYPE_MAX_SIZE, DB_PATH)
+├── costants.h                  Compile-time constants (RELATION_TYPE_MAX_SIZE, fixed-width batch sizes, DB_PATH)
 ├── logger.h                    Header-only file logger
 ├── struct/
 │   ├── domain_struct.h         BaseNode (type-erased) + Node<T> (typed payload)
@@ -31,7 +31,7 @@ graph_core/
 │   ├── type_registry.h         Compile-time C++ type ↔ NodeType mapping (+ node_record_payload_size decl)
 │   └── type_registry.cpp       node_record_payload_size (out-of-line, non-template)
 ├── odt/
-│   ├── node_odt.h/cpp          Domain Node<T> ↔ POD NodeRecord/RelationNodeList/NodeIndex
+│   ├── node_odt.h/cpp          Domain Node<T> ↔ POD NodeRecord/NodeRelationList/NodeIndex
 │   └── edge_odt.h/cpp          Edge POD builder
 └── io/
     ├── graph_io.h/cpp          High-level read/write of nodes, edges, meta
@@ -66,6 +66,10 @@ File + stderr logger. Constructor opens the log file in append mode and throws `
 | Name | Type | Value | Purpose |
 |---|---|---|---|
 | `RELATION_TYPE_MAX_SIZE` | `constexpr uint8_t` | `255` | Max length of a relation-type string in `add_edge`. |
+| `RELATION_NAME_MAX` | `constexpr uint8_t` | `255` | Fixed name-field width per relation line (name zero-padded to this). |
+| `RELATION_LINE_SIZE` | `constexpr uint16_t` | `272` | Size of one fixed-width relation line: `8 (edge_offset) + 8 (edge_count) + 1 (name_length) + 255 (name)`. |
+| `RELATION_LINES_PER_BATCH` | `constexpr uint8_t` | `8` | Max relation lines per batch. Exceeding it (a 9th relation type) throws — chaining is WIP. |
+| `RELATION_BATCH_TAIL` | `constexpr uint16_t` | `2176` | Reserved tail bytes per batch (`RELATION_LINE_SIZE * RELATION_LINES_PER_BATCH`). Always written full-width (unused lines zeroed) → every batch is one size class. |
 | `DB_PATH` | `constexpr std::string_view` | `"../db"` | Root directory of the on-disk store (relative to the build run dir). |
 | `META_FILE_PATH` | `constexpr std::string_view` | `"../db/meta.dat"` | Path to the meta file. Declared but currently unused — `write_meta`/`read_meta` still compose the path inline from `DB_PATH`. |
 | `JSON_ATTR_META_PATH` | `constexpr std::string_view` | `"../db/attributes/attributes_meta.dat"` | Path to the `JsonMeta` POD used to track unique JSON sidecar names. |
@@ -79,6 +83,7 @@ RAM-side description of one outgoing edge. Inner value type of the adjacency map
 | `id` | `uint64_t` | Globally-unique edge id. Source of truth is `MetaRecord.next_edge_id`; assigned once when the edge is first added, then preserved across the full-node rewrites of `update_node_edges`. On disk it is `Edge.id`. |
 | `weight` | `int` | Edge weight. |
 | `neighbor` | `BaseNode*` | Pointer to the destination node. `nullptr` until re-linked after a load from disk (`read_node` leaves it unset). |
+| `offset` | `uint64_t` | Byte offset of this edge's `Edge` POD in `edges.dat` (added 2026-06-19). Lets `add_edge` overwrite the weight in O(1) (`persist_edge_weight`) without walking the chain. Set on load (`read_typed_node`), on append (`persist_new_edge`), and refreshed by `update_node_edges` when it relocates the node's edges. |
 
 ### `struct BaseNode` (`struct/domain_struct.h`)
 Type-erased base. Holds only the adjacency map:
@@ -102,28 +107,36 @@ Fixed-width entry stored in `nodes.idx`.
 |---|---|---|
 | `id` | `uint64_t` | Node id (matches the in-memory key). |
 | `offset` | `uint64_t` | Byte offset into `nodes.dat` where the `NodeRecord<T>` starts. |
-| `relation_offset` | `uint64_t` | Byte offset into `nodes.dat` where the `RelationNodeList` for this node starts. |
+| `relation_offset` | `uint64_t` | Byte offset into `nodes.dat` where the `NodeRelationList` (first batch) for this node starts. |
 | `type_id` | `NodeType` | Dispatch tag used by `read_node` to pick the right `read_typed_node<T>`. |
 
 ### `template<class T> struct NodeRecord` (POD, packed) (`struct/pod_struct.h`)
 Just `T data;`. `T` must be trivially copyable (asserted at use site).
 
-### `struct RelationNodeList` (POD, packed) (`struct/pod_struct.h`)
-Header for the adjacency list of a node. 16 bytes since 2026-05-30 (was 8 — see [API change](../legacy/api_changes.md#2026-05-30--relationnodelist-aggiunto-il-campo-batch_size)).
+### `struct NodeRelationList` (POD, packed) (`struct/pod_struct.h`)
+Header of one **fixed-width relation batch**. 37 bytes; renamed from `RelationNodeList` and reshaped 2026-06-19 (see the [decision](../legacy/design_decisions.md#2026-06-19--relation-list-a-batch-fixed-width--edge-a-lista-doppiamente-concatenata) and [API change](../legacy/api_changes.md#2026-06-19--relationnodelist--noderelationlist-header-esteso--tail-fixed-width)). The header is followed by a **fixed `RELATION_BATCH_TAIL` (2176) byte** tail, so the whole batch region is always **2213 bytes**.
 | Field | Type | Purpose |
 |---|---|---|
-| `type_count` | `uint64_t` | Number of distinct relation types this node has. |
-| `batch_size` | `uint64_t` | Size in bytes of the variable-width tail that follows the POD (does NOT include the 16 bytes of the POD itself). Two uses: read the tail in one shot, and record the reclaimable size when the region is orphaned by `update_node_edges`. |
+| `node_id` | `uint64_t` | Owning node id (back-reference). |
+| `type_count` | `uint64_t` | Number of relation lines actually used in this batch (0..8). |
+| `batch_size` | `uint16_t` | Reserved tail size in bytes — constant `RELATION_BATCH_TAIL` (2176). Reclaimable region = `sizeof(NodeRelationList) + batch_size = 2213`. |
+| `free_bytes` | `uint16_t` | Free tail bytes = `batch_size - type_count * RELATION_LINE_SIZE` (multiple of 272). |
+| `next_offset` | `uint64_t` | Offset of the next batch in `nodes.dat`, or 0 if last. Chaining (>8 types) is WIP. |
+| `head` | `uint64_t` | Batch serial number: 1 = first batch, 2,3,… = extensions. |
+| `is_deleted` | `uint8_t` | 1 if the batch is a freed region, 0 if live. |
 
-Per-relation entries `[uint64_t name_length][name bytes][uint64_t edge_offset][uint64_t edge_count]` are written **immediately after** the POD by `write_relation_node_list` (on insert) or `update_node_edges` (on edge update). The variable-width tail is not part of the struct itself; its total size equals `batch_size`.
+The tail holds up to `RELATION_LINES_PER_BATCH` (8) **fixed-width** lines `[uint64_t edge_offset][uint64_t edge_count][uint8_t name_length][char name[255]]`, the first `type_count` used and the rest zero-filled. Line `i` lives at `tail + i * RELATION_LINE_SIZE`, so a single relation's `edge_offset`/`edge_count` can be rewritten in place. Lines are written by `write_relation_node_list` (insert) / `update_node_edges` (edge update) via the shared `write_relation_line` / `pad_relation_tail` helpers; `edge_offset` points at the **head** of that relation's edge linked list.
 
 ### `struct Edge` (POD, packed) (`struct/pod_struct.h`)
+48 bytes since 2026-06-19 (was 32 — added the two chain pointers; see [API change](../legacy/api_changes.md#2026-06-19--edge-aggiunti-prev_offset--next_offset-32--48-byte)). Edges of one `(node, relation)` pair form a **doubly-linked list**.
 | Field | Type | Purpose |
 |---|---|---|
 | `id` | `uint64_t` | Globally-unique edge id, sourced from `MetaRecord.next_edge_id` (since 2026-06-02 — [BUG-002](../legacy/known_bugs.md#2026-05-26--bug-002-edgeid-non-globale-tra-nodi) fixed). Written from `EdgeRef.id`. |
 | `weight` | `int64_t` | Edge weight. |
 | `to_node` | `uint64_t` | Destination node id. |
 | `from_node` | `uint64_t` | Source node id. |
+| `prev_offset` | `uint64_t` | Offset of the previous edge of the same `(node, relation)` chain, or 0 if head. |
+| `next_offset` | `uint64_t` | Offset of the next edge of the same chain, or 0 if tail. |
 
 ### `struct MetaRecord` (POD, packed) (`struct/pod_struct.h`)
 | Field | Type | Purpose |
@@ -147,18 +160,18 @@ Three records describing a reclaimable on-disk region, pushed onto the size-segr
 | `offset` | `uint64_t` | Start of the orphaned `NodeRecord` in `nodes.dat`. |
 | `size` | `uint64_t` | Byte size of the free region (selects the bin). |
 
-**`struct RelationNodeListFreeOffset`** — a freed `RelationNodeList` region (header + variable-width tail) in `nodes.dat`. No id: a relation list has no standalone id, only its byte region.
+**`struct RelationNodeListFreeOffset`** — a freed `NodeRelationList` batch region (header + fixed tail) in `nodes.dat`. No id: a relation batch has no standalone id, only its byte region. (The POD keeps its name; only the relation-list struct it describes was renamed.)
 | Field | Type | Purpose |
 |---|---|---|
-| `offset` | `uint64_t` | Start of the orphaned `RelationNodeList` in `nodes.dat`. |
-| `size` | `uint64_t` | `sizeof(RelationNodeList) + batch_size`. |
+| `offset` | `uint64_t` | Start of the orphaned `NodeRelationList` batch in `nodes.dat`. |
+| `size` | `uint64_t` | `sizeof(NodeRelationList) + batch_size` — constant 2213 since 2026-06-19, so one size class. |
 
-**`struct BatchOfEdgesFreeOffset`** — a freed contiguous chunk of `Edge` records in `edges.dat` (all edges of one `(node, relation)` pair).
+**`struct BatchOfEdgesFreeOffset`** — a freed **single** `Edge` slot in `edges.dat`. Since 2026-06-19 edges are a linked list (no longer contiguous), so they are freed/reused one at a time; `size` is always `sizeof(Edge)` (48) → one `edges_48` bin. (The struct keeps its name and three fields.)
 | Field | Type | Purpose |
 |---|---|---|
-| `idx` | `uint64_t` | Id of the first edge of the batch (reusable edge-id starting point). |
-| `offset` | `uint64_t` | Start of the orphaned chunk in `edges.dat`. |
-| `size` | `uint64_t` | `edge_count * sizeof(Edge)`. |
+| `idx` | `uint64_t` | The freed edge's id (ignored on reuse — each new `Edge` keeps its own id). |
+| `offset` | `uint64_t` | Start of the orphaned 48-byte `Edge` in `edges.dat`. |
+| `size` | `uint64_t` | `sizeof(Edge)` (48). |
 
 ### `struct ComplexHeader` (POD, packed) (`struct/pod_struct.h`)
 Header for `COMPLEX` nodes on disk.
@@ -202,7 +215,7 @@ Concept-style policies. Each provides:
 The traversal algorithm in `Graph::traverse` is identical; only the policy changes.
 
 ### `struct RelationEntry` (`io/graph_io.h`)
-In-memory form of one relation-type entry parsed from `RelationNodeList` tail. Fields: `std::string name; uint64_t edge_offset; uint64_t edge_count;`.
+In-memory form of one relation-type entry parsed from a `NodeRelationList` tail line. Fields: `std::string name; uint64_t edge_offset; uint64_t edge_count;`.
 
 ### `class Graph` (`graph.h`)
 **Members:**
@@ -251,12 +264,13 @@ Fully deletes a node (added 2026-06-03, completed 2026-06-07 — [BUG-016](../le
 ### `void Graph::add_edge(int start, int end, std::string type = "", int weight = 1)` (`graph.cpp:53`)
 1. Rejects `type` longer than `RELATION_TYPE_MAX_SIZE` (throws `std::invalid_argument`).
 2. For each endpoint not in RAM: if id `< meta.next_id`, `read_node` from disk and cache; else throw `std::out_of_range`.
-3. Resolves the edge id and whether it is new: a brand-new `(start, type, end)` triple consumes a fresh id from `meta.next_edge_id`; an existing triple reuses the id already stored in its `EdgeRef` (only the weight is overwritten). Decided **before** the mutation in step 4.
-4. Inserts `EdgeRef{id, weight, end_ptr}` into `start->neighborgs[type][end]` (RAM-first).
-5. Calls `update_node_edges(*start_node, meta, start)` to persist the new state — runs on every call, even for an overwrite.
-6. Only for a genuinely new edge: increments `meta.next_edge_id` and `meta.edge_count`, then `write_meta(meta)`.
+3. Resolves the edge id and whether it is new: a brand-new `(start, type, end)` triple consumes a fresh id from `meta.next_edge_id`; an existing triple reuses the id **and disk offset** already stored in its `EdgeRef` (only the weight is overwritten).
+4. **O(1) persist (since 2026-06-19):**
+   - **New edge:** `persist_new_edge(meta, start, type, end, edge_id, weight)` appends/reuses one `Edge`, splices it at the relation's chain head, and updates that one fixed-width relation line in place (the batch never moves → `nodes.idx` untouched). The returned disk offset is stored into `EdgeRef{id, weight, end_ptr, offset}`; then `in_edges[end].insert(start)`, `meta.next_edge_id++`, `meta.edge_count++`.
+   - **Overwrite:** updates the in-RAM `EdgeRef.weight`/`.neighbor` and calls `persist_edge_weight(existing_offset, weight)` — an in-place 8-byte write.
+5. `write_meta(meta)` unconditionally (a new edge moves counters; a reuse pop inside `persist_new_edge` may move `free_edge_count`).
 
-**Side effects on disk (since 2026-05-30):** writes a new `RelationNodeList` to `nodes.dat` and a fresh contiguous chunk per relation to `edges.dat`, patches `NodeIndex.relation_offset` in `nodes.idx` in place. `meta.dat` is rewritten on every call (since 2026-06-07 `update_node_edges` bumps `free_edge_count`; a new edge also bumps `next_edge_id`/`edge_count`). The previously persisted `RelationNodeList` region and edge chunks are pushed onto the `rel`/`edges` freelist bins and zeroed (since 2026-06-07, [BUG-017](../legacy/known_bugs.md#2026-06-07--bug-017-update_node_edges-orfanizza-regioni-senza-spingerle-sulla-freelist)); since 2026-06-13 the new regions are written **pop-then-append**, reusing those exact-size holes in place — so an `add_edge` that **overwrites** an existing weight leaves `nodes.dat`/`edges.dat` byte-identical (no growth). See [BUG-001 fixed](../legacy/known_bugs.md#2026-05-26--bug-001-add_edge-non-persiste-su-disco), [BUG-002 fixed](../legacy/known_bugs.md#2026-05-26--bug-002-edgeid-non-globale-tra-nodi), the [Edge persistence design decision](../legacy/design_decisions.md#2026-05-30--edge-persistence-append--obsolete--in-place-index-patch) and [Reuse of the rel/edges freelist bins](../legacy/design_decisions.md#2026-06-13--reuse-of-the-reledges-freelist-bins-edge-space-compaction).
+**Side effects on disk (O(1) path, since 2026-06-19):** a new edge writes one `Edge` to `edges.dat` (append or a reused 48 B slot), patches the old chain head's `prev_offset` in place, and rewrites one relation line (+ the header for a brand-new relation type) in place — `nodes.dat` does not grow, `edges.dat` grows by ≤48 B, `nodes.idx` is **not** touched. An overwrite writes 8 bytes in place (no growth). `add_edge` no longer calls `update_node_edges`. See the [O(1) add_edge decision](../legacy/design_decisions.md#2026-06-19--add_edge-in-o1-append--relink--in-place-line-update), [BUG-001 fixed](../legacy/known_bugs.md#2026-05-26--bug-001-add_edge-non-persiste-su-disco), [BUG-002 fixed](../legacy/known_bugs.md#2026-05-26--bug-002-edgeid-non-globale-tra-nodi).
 
 ### `template<class Policy, class NodeFn, class EdgeFn> void Graph::traverse(int start, const std::string& type, NodeFn on_node, EdgeFn on_edge)` (`graph.h:76`)
 Generic graph traversal. Maintains `visited` and a `Policy::Frontier`. On visit, calls `on_node(idx)` and pushes to the frontier. On each pop, iterates the node's neighbors for the requested `type`, calls `on_edge(from, to, weight)` for every edge, and visits unvisited targets. Missing node or missing relation → silently skipped.
@@ -271,22 +285,24 @@ Thin wrappers selecting `BFSPolicy` / `DFSPolicy`.
 | `void write_node_index(uint64_t record_offset, uint64_t relation_offset, NodeType, std::ofstream&, const MetaRecord&)` | Builds and writes a `NodeIndex` to `nodes.idx`. `idx.id = meta.next_id`. |
 | `void write_complex(const ComplexRecord&, const std::string &json_file_path, std::ostream&)` | Writes the COMPLEX payload to `nodes.dat` (`ComplexHeader` built from current string sizes + two length-prefixed strings: `type_label` and `json_file_path`) and writes `record.json_attributes` to the sidecar file at `JSON_ATTR_PATH / json_file_path`. Takes `std::ostream&` (not `std::ofstream&`) since 2026-06-07 so it can also write **in place** on a `std::fstream` (reuse path). Throws `runtime_error` if the sidecar cannot be opened. |
 | `void read_complex(ComplexRecord&, std::ifstream&)` | Reads the COMPLEX payload (header + two length-prefixed strings) from `nodes.dat` and slurps the sidecar JSON file under `JSON_ATTR_PATH` into `out.json_attributes`. Throws `runtime_error` if the sidecar is missing. Called by the `if constexpr` COMPLEX branch of `read_typed_node<T>`. |
-| `void update_node_edges(BaseNode&, MetaRecord&, uint64_t node_id)` | Persists the current `neighborgs` of an already-on-disk node to `nodes.dat` / `edges.dat` and patches `NodeIndex.relation_offset` in `nodes.idx` in place. Since 2026-06-07 ([BUG-017](../legacy/known_bugs.md#2026-06-07--bug-017-update_node_edges-orfanizza-regioni-senza-spingerle-sulla-freelist)) step 2 pushes the OLD relation-list region onto the `rel` bin and each old edge chunk onto the `edges` bin, zeroes those bytes, and bumps `meta.free_edge_count` (hence the non-`const` `MetaRecord&`). Since 2026-06-13 step 3 writes the NEW regions **pop-then-append**: it pops an exact-size `rel`/`edges` hole and reuses it in place (streams opened `in\|out`, not `app`), else appends at EOF — so a weight-overwrite reclaims the just-freed regions and the files do not grow; each `edges` pop decrements `free_edge_count` (edge ids are not recycled). See [Reuse of the rel/edges freelist bins](../legacy/design_decisions.md#2026-06-13--reuse-of-the-reledges-freelist-bins-edge-space-compaction). Single source of in-place mutation; called by `Graph::add_edge` and by `Graph::delete_node`'s inbound cleanup. |
+| `uint64_t persist_new_edge(MetaRecord&, uint64_t node_id, const std::string& type, uint64_t to_id, uint64_t edge_id, int64_t weight)` | **O(1) add of a new edge (since 2026-06-19).** Reads `relation_offset` from `nodes.idx`, finds/creates the relation line in the batch (≤8 → O(1)), allocates the `Edge` slot (pop the 48 B `edges` bin else append to `edges.dat`), writes it with `prev=0, next=` current head, patches the old head's `prev_offset` in place, and updates that one relation line in place (or writes a fresh line + bumps `type_count`/`free_bytes` in the header for a new relation type). The batch never moves → `nodes.idx` untouched. Returns the new edge's `edges.dat` offset. Throws if the batch is full (8 types — chaining WIP). |
+| `void persist_edge_weight(uint64_t edge_offset, int64_t weight)` | **O(1) weight overwrite (since 2026-06-19):** seek `edge_offset + offsetof(Edge, weight)` in `edges.dat`, write 8 bytes. No allocation/relink/growth. |
+| `void update_node_edges(BaseNode&, MetaRecord&, uint64_t node_id)` | Whole-node rewrite of an already-on-disk node's relations. **Since 2026-06-19 used ONLY by `Graph::delete_node`'s inbound cleanup** (`add_edge` now takes the O(1) `persist_*` path). Step 2 frees the OLD edges by chain-walk (`free_edge_chain`, per-edge 48 B slots onto the `edges` bin, zeroed) and pushes the old batch onto the `rel` bin (hence the non-`const` `MetaRecord&`). Step 3 reuses an exact-size `rel` hole in place (pop-then-append, streams `in\|out`) and appends fresh contiguous edge runs at EOF, **refreshing each `EdgeRef.offset`** as it writes (so a later O(1) overwrite seeks correctly after relocation). Step 4 patches `NodeIndex.relation_offset` in place. Throws if >8 relation types. |
 | `NodeIndex read_node_index(std::ifstream&)` | Reads one `NodeIndex` from the current stream position. |
-| `std::vector<RelationEntry> read_relation_node_list(std::ifstream&)` | Reads the `RelationNodeList` header and its variable-width tail. |
+| `std::vector<RelationEntry> read_relation_node_list(std::ifstream&)` | Reads the `NodeRelationList` header + its `type_count` fixed-width lines (`read_relation_line`), then skips the unused tail (`free_bytes`) to land at the batch end. |
 | `void write_meta(const MetaRecord&)` | Truncates and rewrites `meta.dat`. |
 | `MetaRecord read_meta()` | Reads `meta.dat`. |
 | `void write_json_attributes_meta(const JsonMeta&)` | Truncates and rewrites `db/attributes/attributes_meta.dat`. |
 | `JsonMeta read_json_attributes_meta()` | Reads the `JsonMeta` POD; lazy-creates the file with `prog_number = 0` if missing. Throws on empty/unreadable file. |
 | `template<T> uint64_t write_node_record(const Node<T>&)` | Appends a `NodeRecord<T>` to `nodes.dat`. Returns the offset. |
-| `template<T> uint64_t write_relation_node_list(const Node<T>&, uint64_t node_id, std::ofstream& out)` | Appends `RelationNodeList` header (with `batch_size` populated via `node_to_relation_list`) + tail to `out` (already-open `nodes.dat`), and appends each edge to `edges.dat`. Returns the byte offset where the relation list was written. |
+| `template<T> uint64_t write_relation_node_list(const Node<T>&, uint64_t node_id, std::ofstream& out)` | Appends a `NodeRelationList` batch to `out` (already-open `nodes.dat`): header (via `node_to_relation_list`) + the used fixed-width lines + zero-filled tail (`pad_relation_tail`), full 2213-byte region. Writes each relation's edges to `edges.dat` as a doubly-linked chain (`write_edge_chain_at`). For a fresh node `neighborgs` is empty → an empty batch. Returns the batch offset. Throws if >8 relation types. |
 | `template<T> void write_node(const Node<T>&, const MetaRecord&)` | Composes the three writes for a full node persist (record + relations + index). Dispatches the record write via `if constexpr (node_type_of_v<T> == NodeType::COMPLEX)`: primitives go through `node_to_record` + `write_pod`, `COMPLEX` goes through `complex_node_to_record` + `write_complex`. Compiles since 2026-05-30 ([BUG-010](../legacy/known_bugs.md) fixed). |
 | `BaseNode* read_node(uint64_t id)` | Reads `NodeIndex` at `id * sizeof(NodeIndex)` in `nodes.idx`, dispatches on `type_id` to the right `read_typed_node<T>` (incl. `COMPLEX` → `read_typed_node<ComplexRecord>`). A `TOMBSTONE` tag throws `"node id N is tombstoned (deleted)"`; an unknown tag throws `"Unknown NodeType"`. |
 | `template<T> NodeRecord<T> read_node_record(std::ifstream&)` | Reads one `NodeRecord<T>`. |
 | `template<T> BaseNode* read_typed_node(const NodeIndex&, std::ifstream& dat_in)` | Builds a fresh `Node<T>` on the heap with data + neighbors (neighbor pointers left `nullptr`). |
 | `void delete_node_from_disk(uint64_t node_id, MetaRecord& meta)` | Orphans the node's regions (NodeRecord, RelationNodeList, each edge chunk) onto the size bins via `write_free_offset`, **zeroes** those byte regions (`zero_region`), **tombstones** the `nodes.idx` slot (`type_id = TOMBSTONE`, offsets zeroed), and updates the counters (`node_count--`, `free_count++`, `free_edge_count += chunks`). `meta` is taken by non-`const` ref since 2026-06-07 (caller does `write_meta`). For COMPLEX: reads the on-disk `ComplexHeader` for the real record size → `complex_<size>` bin, `remove()`s the JSON sidecar, and recycles its `prog_number` onto the json free list. Throws `runtime_error` on file-open failure. |
-| `template<T> void write_node_in_freed_slot(const Node<T>&, uint64_t node_id, uint64_t record_offset)` | Reuse-path counterpart of `write_node`: writes `NodeRecord<T>` **in place** at the freed `record_offset` in `nodes.dat`, the `NodeIndex` **in place** at the freed id slot in `nodes.idx`, and **appends** the (empty) `RelationNodeList` at end-of-`nodes.dat`. Never instantiated for COMPLEX (variable on-disk size). |
-| `void write_complex_in_freed_slot(const Node<ComplexRecord>&, uint64_t node_id, uint64_t record_offset)` (inline) | COMPLEX counterpart of `write_node_in_freed_slot`. Writes `ComplexHeader` + two strings **in place** at the freed `record_offset` (exact-fit slot) via `complex_node_to_record` + `write_complex` (which also writes the sidecar and assigns the `prog_number`), appends the empty `RelationNodeList`, and writes the `NodeIndex` (`type_id = COMPLEX`) in place. Added 2026-06-07. |
+| `template<T> void write_node_in_freed_slot(const Node<T>&, uint64_t node_id, uint64_t record_offset)` | Reuse-path counterpart of `write_node`: writes `NodeRecord<T>` **in place** at the freed `record_offset` in `nodes.dat`, the `NodeIndex` **in place** at the freed id slot in `nodes.idx`, and **appends** the (empty) `NodeRelationList` batch at end-of-`nodes.dat`. Never instantiated for COMPLEX (variable on-disk size). |
+| `void write_complex_in_freed_slot(const Node<ComplexRecord>&, uint64_t node_id, uint64_t record_offset)` (inline) | COMPLEX counterpart of `write_node_in_freed_slot`. Writes `ComplexHeader` + two strings **in place** at the freed `record_offset` (exact-fit slot) via `complex_node_to_record` + `write_complex` (which also writes the sidecar and assigns the `prog_number`), appends the empty `NodeRelationList` batch, and writes the `NodeIndex` (`type_id = COMPLEX`) in place. Added 2026-06-07. |
 | `std::unordered_map<int, std::unordered_set<int>> build_inbound_index(uint64_t next_id)` | Scans every live node (skips `TOMBSTONE`) and follows its relation chunks to build the reverse index `to_node → {from_node}`. O(N+E). Only live nodes' chunks are read, so zeroed/freed edges are never counted. Used by `Graph::build_in_edges` at load. Added 2026-06-07. |
 | `uint64_t complex_record_on_disk_size(uint64_t type_label_len)` (inline) | On-disk size of a COMPLEX record as a pure function of `type_label` length: `sizeof(ComplexHeader) + L + (COMPLEX_PROG_DIGITS + 1 + L + 5)`. Used to pick the `complex_<size>` bin on insert. Added 2026-06-07. |
 | `std::filesystem::path json_freelist_path()` (inline) | Path of the json free list `db/freelist/json_prog.dat` (LIFO stack of freed `prog_number`s). Added 2026-06-07. |
@@ -311,9 +327,9 @@ Thin wrappers selecting `BFSPolicy` / `DFSPolicy`.
 |---|---|
 | `template<T> NodeRecord<T> node_to_record(const Node<T>&)` (`node_odt.h:22`) | Copies `node.data` into a `NodeRecord<T>`. Asserts POD. |
 | `NodeRecord<ComplexHeader> complex_node_to_record(const Node<ComplexRecord>&, std::string &json_file_path)` (`node_odt.cpp`) | COMPLEX-specific ODT bridge. Decides the `prog_number`: pops a recycled one from the json free list, else consumes `JsonMeta.prog_number` and persists `+1` (BUG-014 fix). Composes the out-param `json_file_path` as `{prog_number:020}_{type_label}.json` — **zero-padded to `COMPLEX_PROG_DIGITS`** so the record size is constant per type. Builds a `ComplexHeader` from `type_label.size()` and `json_file_path.size()` and returns it wrapped in `NodeRecord<ComplexHeader>` (currently unused by `write_node`, which rebuilds the header inside `write_complex` from the same inputs). |
-| `RelationNodeList node_to_relation_list(const BaseNode&)` (`node_odt.cpp:27`) | Fills `type_count` and `batch_size`. `batch_size` is computed as `Σ (3 * sizeof(uint64_t) + name.size())` over all relations in `node.neighborgs` — see [API change](../legacy/api_changes.md#2026-05-30--relationnodelist-aggiunto-il-campo-batch_size). The variable-width tail itself is written separately by `write_relation_node_list` (on insert) or by `update_node_edges` (on edge update). |
-| `NodeIndex node_to_node_index(uint64_t id, uint64_t record_offset, uint64_t relation_offset)` (`node_odt.cpp:39`) | Builder for `NodeIndex` (currently unused — `write_node_index` builds the struct inline). |
-| `Edge edge_to_pod(uint64_t idx, uint64_t from, uint64_t to, uint64_t weight)` (`edge_odt.h:17`) | Plain struct-builder for `Edge`. |
+| `NodeRelationList node_to_relation_list(const BaseNode&, uint64_t node_id, uint64_t head = 1)` (`node_odt.cpp`) | Builds a fixed-width batch header: `node_id`, `type_count = neighborgs.size()`, `batch_size = RELATION_BATCH_TAIL` (constant), `free_bytes = batch_size - type_count*272`, `next_offset = 0`, `head`, `is_deleted = 0`. The tail lines are written separately by `write_relation_node_list` / `update_node_edges`. Signature gained `node_id`/`head` on 2026-06-19 — see [API change](../legacy/api_changes.md#2026-06-19--firme-odt-edge_to_pod-prevnext-node_to_relation_list-node_id-head). |
+| `NodeIndex node_to_node_index(uint64_t id, uint64_t record_offset, uint64_t relation_offset)` (`node_odt.cpp`) | Builder for `NodeIndex` (currently unused — `write_node_index` builds the struct inline). |
+| `Edge edge_to_pod(uint64_t idx, uint64_t from, uint64_t to, uint64_t weight, uint64_t prev_offset = 0, uint64_t next_offset = 0)` (`edge_odt.h`) | Plain struct-builder for `Edge`. Gained the two optional chain offsets on 2026-06-19. |
 
 `reconstruct_neighbors` and `node_form_pod` were **removed** as dead code 2026-06-07 ([BUG-003](../legacy/known_bugs.md#2026-05-26--bug-003-reconstruct_neighbors-non-implementata) / [BUG-004](../legacy/known_bugs.md#2026-05-26--bug-004-typo-neihborgs-in-node_form_pod)): no callers, and their signatures had no access to the on-disk tail or `edges.dat`. The real POD→domain reconstruction is `read_typed_node` (`io/graph_io.h`).
 
@@ -346,17 +362,16 @@ Thin wrappers selecting `BFSPolicy` / `DFSPolicy`.
 ### Node layout on disk (for one inserted node)
 
 ```
-nodes.idx                       nodes.dat                              edges.dat
-┌──────────────┐                ┌───────────────────────────┐         ┌──────────┐
-│ NodeIndex #0 │ ─ offset ───▶  │ NodeRecord<T> for node 0  │         │ Edge     │
-├──────────────┤                ├───────────────────────────┤   ┌──▶  │ Edge     │
-│ NodeIndex #1 │ ─ relation_    │ RelationNodeList header   │   │     │ ...      │
-├──────────────┤   offset ──▶   │ [name][edge_off][count]   │ ──┘     └──────────┘
-│ ...          │                │ [name][edge_off][count]   │
-└──────────────┘                │ ...                       │
-                                │ NodeRecord<T> for node 1  │
-                                │ ...                       │
-                                └───────────────────────────┘
+nodes.idx                       nodes.dat                                edges.dat
+┌──────────────┐                ┌─────────────────────────────┐         ┌──────────────┐
+│ NodeIndex #0 │ ─ offset ───▶  │ NodeRecord<T> for node 0    │         │ Edge (head)  │◀┐
+├──────────────┤                ├─────────────────────────────┤   ┌──▶  │   next_off ─▶│ │
+│ NodeIndex #1 │ ─ relation_    │ NodeRelationList header(37) │   │     │ Edge         │ │ chain per
+├──────────────┤   offset ──▶   │ line0: edge_off│count│name  │ ──┘     │   prev_off ──┼─┘ (node,rel)
+│ ...          │                │ line1..7 (fixed 272, padded)│         │ ...          │
+└──────────────┘                │ NodeRecord<T> for node 1    │         └──────────────┘
+                                │ ...                         │  batch = 2213 bytes (fixed)
+                                └─────────────────────────────┘  edge_off → chain head
 ```
 
 ## Dipendenze
@@ -371,6 +386,12 @@ No third-party libraries. No dependency on `data_tructures/`.
 
 ## Voci legacy collegate
 
+- [add_edge in O(1): append + relink + in-place line update](../legacy/design_decisions.md#2026-06-19--add_edge-in-o1-append--relink--in-place-line-update)
+- [API — add_edge O(1): EdgeRef.offset + persist_new_edge / persist_edge_weight](../legacy/api_changes.md#2026-06-19--add_edge-o1-edgerefoffset--persist_new_edge--persist_edge_weight)
+- [Relation-list a batch fixed-width + Edge a lista doppiamente concatenata](../legacy/design_decisions.md#2026-06-19--relation-list-a-batch-fixed-width--edge-a-lista-doppiamente-concatenata)
+- [API — RelationNodeList → NodeRelationList: header esteso + tail fixed-width](../legacy/api_changes.md#2026-06-19--relationnodelist--noderelationlist-header-esteso--tail-fixed-width)
+- [API — Edge: prev_offset / next_offset](../legacy/api_changes.md#2026-06-19--edge-aggiunti-prev_offset--next_offset-32--48-byte)
+- [API — Firme ODT: edge_to_pod / node_to_relation_list](../legacy/api_changes.md#2026-06-19--firme-odt-edge_to_pod-prevnext-node_to_relation_list-node_id-head)
 - [Reuse of the rel/edges freelist bins (edge-space compaction)](../legacy/design_decisions.md#2026-06-13--reuse-of-the-reledges-freelist-bins-edge-space-compaction)
 - [API — update_node_edges step 3: append-only → pop-then-append](../legacy/api_changes.md#2026-06-13--update_node_edges-step-3-append-only--pop-then-append)
 - [BUG-017 — update_node_edges freelist push/reuse](../legacy/known_bugs.md#2026-06-07--bug-017-update_node_edges-orfanizza-regioni-senza-spingerle-sulla-freelist)
@@ -424,14 +445,17 @@ No third-party libraries. No dependency on `data_tructures/`.
 - `graph_core/graph.h:43` — `insert<T>` template.
 - `graph_core/graph.h:76` — `traverse<Policy, ...>` template.
 - `graph_core/graph.cpp:57` — `add_edge` (resolves edge id, bumps `next_edge_id`/`edge_count`).
-- `graph_core/struct/domain_struct.h:24` — `EdgeRef` (RAM-side edge: `id`, `weight`, `neighbor`).
+- `graph_core/struct/domain_struct.h:24` — `EdgeRef` (RAM-side edge: `id`, `weight`, `neighbor`, `offset`).
+- `graph_core/io/graph_io.h` / `graph_core/io/graph_io.cpp` — `persist_new_edge`, `persist_edge_weight` (O(1) add/overwrite), `free_edge_chain` (per-edge reclaim).
 - `graph_core/struct/domain_struct.h:35` — `BaseNode` (`neighborgs` value type now `EdgeRef`).
 - `graph_core/struct/domain_struct.h:58` — `ComplexRecord`.
 - `graph_core/struct/pod_struct.h:136` — `MetaRecord` (48 bytes: 3 node + 3 edge counters).
 - `graph_core/struct/pod_struct.h:182,196,209` — `NodeFreeOffset`, `RelationNodeListFreeOffset`, `BatchOfEdgesFreeOffset` (freelist free-offset PODs; replaced `FreeRecord`).
 - `graph_core/struct/pod_struct.h:16` — `NodeType` (incl. `COMPLEX = 255`).
 - `graph_core/struct/pod_struct.h:41` — `NodeIndex`.
-- `graph_core/struct/pod_struct.h:78` — `RelationNodeList` (now 16 bytes: `type_count` + `batch_size`).
+- `graph_core/struct/pod_struct.h` — `NodeRelationList` (37-byte header + fixed 2176-byte tail = 2213-byte batch; renamed from `RelationNodeList` 2026-06-19).
+- `graph_core/struct/pod_struct.h` — `Edge` (48 bytes: `id`, `weight`, `to_node`, `from_node`, `prev_offset`, `next_offset`).
+- `graph_core/costants.h` — `RELATION_NAME_MAX`, `RELATION_LINE_SIZE`, `RELATION_LINES_PER_BATCH`, `RELATION_BATCH_TAIL`.
 - `graph_core/struct/pod_struct.h:134` — `ComplexHeader` (field `json_file_path_size`).
 - `graph_core/struct/pod_struct.h:148` — `JsonMeta`.
 - `graph_core/struct/functions_policies.h:12` — `BFSPolicy`.

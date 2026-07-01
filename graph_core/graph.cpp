@@ -122,8 +122,12 @@ void Graph::add_edge(int start, int end, std::string type, int weight)
     // meta.next_edge_id; an existing one keeps the id it already has — we only
     // overwrite its weight. Resolved BEFORE the mutation below, which would
     // otherwise create the entry.
+    // Resolve whether this is a new edge or a weight overwrite, and (for an
+    // overwrite) capture the existing edge's id + disk offset. Both O(1) persist
+    // paths below need the disk offset; a new edge gets a fresh id.
     bool is_new_edge = true;
     uint64_t edge_id = meta.next_edge_id;
+    uint64_t existing_offset = 0;
     {
         auto rel_it = node->neighborgs.find(type);
         if (rel_it != node->neighborgs.end())
@@ -132,38 +136,40 @@ void Graph::add_edge(int start, int end, std::string type, int weight)
             if (edge_it != rel_it->second.end())
             {
                 is_new_edge = false;
-                edge_id = edge_it->second.id; // preserve the existing edge's id
+                edge_id = edge_it->second.id;           // preserve the existing edge's id
+                existing_offset = edge_it->second.offset; // its Edge record in edges.dat
             }
         }
     }
 
-    // Mutate the in-RAM adjacency map FIRST, then persist. update_node_edges
-    // reads node->neighborgs to produce the new on-disk state, so the new edge
-    // must be visible to it. If the persist throws, the in-RAM state is ahead
-    // of disk for the rest of the process lifetime — but the process tipically
-    // dies on the exception anyway, and a restart re-reads the (old) state
-    // from disk so no permanent inconsistency.
-    node->neighborgs[type][end] = EdgeRef{edge_id, weight, nodes[end]};
-
-    // Edge persistence: rewrite the relation list + edge chunks at fresh
-    // offsets in nodes.dat / edges.dat and patch NodeIndex.relation_offset
-    // in-place. Each edge is written with its own EdgeRef.id (no longer a
-    // per-node-local counter). The OLD regions become orphaned bytes (see TODO
-    // inside the function — freelist persistence is the planned reclaim mechanism).
-    update_node_edges(*node, meta, start);
-
-    // Persistence of the node's edges always happens above (even when the edge
-    // already existed — we just rewrote its save). The new-edge counters only
-    // advance for a genuinely new edge: next_edge_id is the monotonic id source
-    // (now wired into Edge.id), edge_count tracks live edges. update_node_edges
-    // also bumps free_edge_count on every call (it orphans the node's old edge
-    // chunks onto the freelist), so meta.dat must be rewritten unconditionally.
     if (is_new_edge)
     {
+        // O(1) append + relink: write the new Edge (reusing a freed slot or
+        // appending), splice it at the relation's chain head, and update that one
+        // fixed-width relation line in place. The relation batch never moves, so
+        // NodeIndex is untouched. Persist FIRST so we can store the returned disk
+        // offset in the EdgeRef (needed for a future O(1) weight overwrite).
+        uint64_t edge_off = persist_new_edge(meta, static_cast<uint64_t>(start), type,
+                                             static_cast<uint64_t>(end), edge_id,
+                                             static_cast<int64_t>(weight));
+        node->neighborgs[type][end] = EdgeRef{edge_id, weight, nodes[end], edge_off};
+
         in_edges[end].insert(start); // reverse index: `start` now points at `end`
         meta.next_edge_id++;
         meta.edge_count++;
     }
+    else
+    {
+        // O(1) in-place weight overwrite: no allocation, no relink, no growth.
+        EdgeRef &ref = node->neighborgs[type][end];
+        ref.weight = weight;
+        ref.neighbor = nodes[end]; // re-link in case it was nullptr after a disk load
+        persist_edge_weight(existing_offset, static_cast<int64_t>(weight));
+    }
+
+    // next_edge_id / edge_count advance only for a genuinely new edge; a reuse pop
+    // inside persist_new_edge may also change free_edge_count — so rewrite meta.dat
+    // unconditionally.
     write_meta(meta);
 }
 

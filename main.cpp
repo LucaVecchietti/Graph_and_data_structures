@@ -179,6 +179,41 @@ int main()
                   << "\n";
     }
 
+    // ===== Phase 6: multi-edge chain on one relation (O(1) add + reload) ===
+    // Regression guard for the O(1) add_edge path (persist_new_edge): several
+    // edges under the SAME (node, relation) form a doubly-linked chain spliced at
+    // the head, and a mid-chain weight overwrite (persist_edge_weight) must survive
+    // a reload. The previous phases only ever put one edge per relation, so they
+    // never exercised the chain walk on read / the prev_offset relink on write.
+    std::cout << "\n=== Phase 6: multi-edge chain (same relation) ===\n";
+    {
+        Graph g;
+
+        g.insert(100); // id 4
+        g.insert(200); // id 5
+        g.insert(300); // id 6
+        g.insert(400); // id 7
+
+        // node 4 --link--> {5, 6, 7}: a 3-edge chain under one relation.
+        g.add_edge(4, 5, "link", 51);
+        g.add_edge(4, 6, "link", 61);
+        g.add_edge(4, 7, "link", 71);
+
+        // Overwrite a MID-chain weight (the splice put 6 in the middle of the list).
+        g.add_edge(4, 6, "link", 999);
+
+        std::cout << "before reload, BFS from 4 on \"link\" (expect 5/w51, 6/w999, 7/w71):\n";
+        run_bfs(g, 4, "link");
+    }
+    {
+        Graph g; // reload: rebuild the chain from disk by walking next_offset.
+
+        g.add_edge(4, 5, "_load"); // force node 4 back into RAM (lazy-load via add_edge)
+
+        std::cout << "after reload, BFS from 4 on \"link\" (must match: 5/w51, 6/w999, 7/w71):\n";
+        run_bfs(g, 4, "link");
+    }
+
     system("pause");
     return 0;
 }

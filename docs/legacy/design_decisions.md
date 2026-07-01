@@ -6,14 +6,16 @@
 |---|---|
 | Tipo | legacy-decisions |
 | Lingua | en |
-| Ultimo aggiornamento | 2026-06-13 |
-| Commit di riferimento | cb9939c |
+| Ultimo aggiornamento | 2026-06-19 |
+| Commit di riferimento | 0a043f7 |
 | Mirror | — |
 
 ---
 
 ## Indice
 
+- [2026-06-19 — add_edge in O(1): append + relink + in-place line update](#2026-06-19--add_edge-in-o1-append--relink--in-place-line-update)
+- [2026-06-19 — Relation-list a batch fixed-width + Edge a lista doppiamente concatenata](#2026-06-19--relation-list-a-batch-fixed-width--edge-a-lista-doppiamente-concatenata)
 - [2026-06-13 — Reuse of the rel/edges freelist bins (edge-space compaction)](#2026-06-13--reuse-of-the-reledges-freelist-bins-edge-space-compaction)
 - [2026-06-07 — Bin per-tipo per i record COMPLEX via prog_number zero-paddato](#2026-06-07--bin-per-tipo-per-i-record-complex-via-prog_number-zero-paddato)
 - [2026-06-07 — Indice inverso degli archi entranti in-RAM](#2026-06-07--indice-inverso-degli-archi-entranti-in-ram)
@@ -30,6 +32,55 @@
 - [2026-05-26 — Single-open append su nodes.dat](#2026-05-26--single-open-append-su-nodesdat)
 - [2026-05-26 — POD packed e fragilità ABI](#2026-05-26--pod-packed-e-fragilità-abi)
 - [2026-05-26 — Hash table standalone in C (non linkata)](#2026-05-26--hash-table-standalone-in-c-non-linkata)
+
+---
+
+### 2026-06-19 — add_edge in O(1): append + relink + in-place line update
+
+- **Stato:** active
+- **Contesto:** Il formato fixed-width batch + Edge a lista concatenata ([decisione precedente](#2026-06-19--relation-list-a-batch-fixed-width--edge-a-lista-doppiamente-concatenata)) era stato congelato lasciando `add_edge` ancora come **whole-node rewrite** (`update_node_edges` riscriveva l'intero batch + tutti i chunk di edge ad ogni arco → O(deg)). Questa decisione sfrutta finalmente il formato per portare `add_edge` a **O(1)**.
+- **Decisione:**
+  - **Arco nuovo → `persist_new_edge` (append + relink):** (1) legge `relation_offset` da `nodes.idx` e l'header + le righe del batch per trovare la riga del `type` (≤8 righe → O(1)); (2) alloca lo slot del nuovo `Edge` (pop dal bin `edges` a slot singolo, altrimenti append a EOF di `edges.dat`); (3) scrive l'`Edge` con `prev=0`, `next=` testa corrente della catena; (4) patcha in place il `prev_offset` della vecchia testa; (5) aggiorna **in place** la sola riga della relazione (nuovo `edge_offset` = nuova testa, `edge_count+1`) — oppure, per un tipo di relazione **nuovo**, scrive una riga fresca allo slot `type_count` e incrementa `type_count` / decrementa `free_bytes` nell'header. **Il batch non si sposta mai → `NodeIndex` non viene toccato.** Restituisce l'offset su disco del nuovo edge.
+  - **Overwrite del peso → `persist_edge_weight` (in place):** seek a `edge_offset + offsetof(Edge, weight)` e scrive 8 byte. Nessuna allocazione, nessun relink, nessuna crescita file.
+  - **`EdgeRef` guadagna `offset`** (posizione su disco dell'`Edge`): valorizzato al load (`read_typed_node`), all'append (`persist_new_edge`), e **rinfrescato** da `update_node_edges` quando rilo­calizza gli archi del nodo. È ciò che rende l'overwrite O(1) senza walk della catena.
+  - **`update_node_edges` resta solo per la pulizia degli archi entranti in `delete_node`** (rimozione di archi → whole-rewrite del nodo proprietario, non sul percorso caldo). Ora libera i vecchi archi via chain-walk (`free_edge_chain`, slot da 48 B individuali) e rinfresca `EdgeRef.offset` mentre riscrive.
+  - **Freelist a slot di edge singoli:** gli archi non sono più contigui (lo splice O(1) li sparpaglia), quindi si liberano/riusano **uno alla volta** (record da 48 B nel bin `edges`). Con `rel` costante a 2213 e `edges` costante a 48, ogni struct ha **un solo bin per dimensione** — chiude il punto "freelist a bin singolo" lasciato aperto dalla decisione del formato.
+- **Alternative considerate:**
+  - *Tenere `update_node_edges` (whole-rewrite) anche per `add_edge`*: semplice ma O(deg) per arco — proprio ciò che si voleva eliminare.
+  - *Non memorizzare `EdgeRef.offset`, trovare l'edge per `id` via walk sulla catena per l'overwrite*: O(deg) per overwrite. Lo `offset` in RAM lo rende O(1) a costo di 8 byte/arco in RAM e dell'obbligo di rinfrescarlo quando `update_node_edges` rilocalizza.
+  - *Riusare gli id arco dal bin `edges` (pop `idx`)*: scartata — ogni `Edge` mantiene il proprio id globale stabile ([decisione 2026-06-02](#2026-06-02--id-arco-globale-sorgente-in-metarecordnext_edge_id-memorizzato-in-edgeref)); `idx` del record poppato è ignorato.
+- **Conseguenze:**
+  - `add_edge` ora **non sposta il batch né patcha `relation_offset`**: `nodes.idx` non è toccato sull'aggiunta di un arco (lo era invece nel vecchio `update_node_edges`). `nodes.dat` non cresce su un arco aggiunto (riga aggiornata in place nel batch già allocato); `edges.dat` cresce di 48 B per arco nuovo (o riusa uno slot liberato), 0 su overwrite.
+  - `free_edge_count` ora conta **archi** liberi (slot da 48 B), non più "chunk". `free_edge_chain` lo incrementa per arco; `persist_new_edge` lo decrementa su un pop.
+  - **Vincolo di coerenza:** `EdgeRef.offset` in RAM deve restare allineato al disco. `update_node_edges` lo rinfresca quando rilocalizza; finché è l'unico a spostare archi, l'invariante regge.
+  - **Boundary residuo:** il batch chaining per >8 tipi di relazione resta WIP — `persist_new_edge` lancia se il batch è pieno.
+  - Risolve i punti (1) `add_edge` O(1) e (2) freelist a bin singolo elencati nel *Boundary residuo* della [decisione del formato](#2026-06-19--relation-list-a-batch-fixed-width--edge-a-lista-doppiamente-concatenata).
+- **Riferimenti:** commit `0a043f7` (working tree). `graph_core/struct/domain_struct.h` (`EdgeRef.offset`), `graph_core/io/graph_io.{h,cpp}` (`persist_new_edge`, `persist_edge_weight`, `free_edge_chain`, `update_node_edges`, `delete_node_from_disk`, edge-read in `read_typed_node`), `graph_core/graph.cpp` (`add_edge`); `main.cpp` Phase 5 (zero-growth regression guard). Vedi [API change](api_changes.md#2026-06-19--add_edge-o1-edgerefoffset--persist_new_edge--persist_edge_weight).
+
+---
+
+### 2026-06-19 — Relation-list a batch fixed-width + Edge a lista doppiamente concatenata
+
+- **Stato:** active (formato congelato in questa fase; l'exploit O(1) di `add_edge`, il freelist a bin singolo e il chaining dei batch sono lavoro della fase successiva — vedi *Conseguenze → Boundary residuo*)
+- **Contesto:** `add_edge` è **O(deg)**: `update_node_edges` riscrive l'**intera** relation-list del nodo + **tutti** i chunk di edge ad ogni arco aggiunto (anche per un solo arco nuovo). Il design [Edge persistence 2026-05-30](#2026-05-30--edge-persistence-append--obsolete--in-place-index-patch) aveva già valutato e **scartato** la linked-list di edge (per non rompere il formato `Edge` e restare sui "chunk contigui per `(node, relation)`"), accettando la write-amplification. Obiettivo di questo lavoro: portare l'inserimento arco a **O(1)**. Serve un formato che (a) permetta di aggiornare la riga di **una** relazione senza riscrivere le altre, e (b) permetta di agganciare un nuovo arco senza riscrivere il chunk.
+- **Decisione (questa fase = solo il formato on-disk + il write path di insert):**
+  - **`RelationNodeList` → `NodeRelationList`**, header da **37 byte** (`node_id`, `type_count`, `batch_size`, `free_bytes`, `next_offset`, `head`, `is_deleted`) seguito da una **tail a larghezza fissa** `RELATION_BATCH_TAIL = 2176` byte = fino a `RELATION_LINES_PER_BATCH = 8` righe da `RELATION_LINE_SIZE = 272` byte. La regione totale di un batch è **costante a 2213 byte**, indipendente dal numero di relazioni usate (le righe inutilizzate sono azzerate). Riga: `[uint64_t edge_offset][uint64_t edge_count][uint8_t name_length][char name[255]]`. La larghezza fissa rende la riga `i` indirizzabile a `tail + i*272` → **update in place O(1)** di una relazione; e rende ogni batch **un'unica classe di size** → il bin `rel` del freelist ne ha una sola.
+  - **`Edge` + `prev_offset` + `next_offset`** (32 → **48 byte**): gli archi di una coppia `(node, relation)` formano una **lista doppiamente concatenata**, così un nuovo arco si aggancia in O(1) (append + relink della testa) invece di riscrivere il chunk contiguo. Il read path segue `next_offset` dalla testa (`edge_offset`) per `edge_count` passi — robusto agli splice non contigui.
+  - Helper di formato condivisi (`write_relation_line` / `read_relation_line` / `pad_relation_tail` / `write_edge_chain_at`) centralizzano il layout così read e write non divergono.
+- **Alternative considerate:**
+  - *Tail a larghezza variabile aggiornata in place* (il formato pre-2026-06-19): impossibile aggiornare una relazione senza spostare la coda del file o senza padding; ed era la radice dell'O(deg). Scartata.
+  - *Pre-allocazione a capacità fissa per `(node, relation)` nel file edge*: spreco e file primario gonfiato su fanout skewed (già scartata nel 2026-05-30). La linked-list dà lo stesso O(1) senza pre-riservare slot.
+  - *Tenere la linked-list ma con tail relation-list ancora variabile*: lascerebbe l'aggiunta di un **nuovo tipo** di relazione O(deg-types); la tail fixed-width la rende O(1) in place.
+- **Conseguenze:**
+  - **Schema-break del formato on-disk** (`NodeRelationList` e `Edge` cambiano layout): qualunque `db/` pre-esistente va cancellato. `main.cpp` fa già `remove_all(DB_PATH)` ad ogni run.
+  - **Costo spazio fisso:** ogni nodo paga **~2.2 KB** di batch relation-list (tail sempre piena), anche con poche relazioni — il prezzo dell'indirizzamento in place. `Edge` cresce del 50% (32 → 48 byte).
+  - **Cap di 8 relazioni per nodo** finché il chaining dei batch (`next_offset`, `head` 1→2→3) non è implementato: `write_relation_node_list` / `update_node_edges` lanciano `std::runtime_error` oltre le 8.
+  - **Boundary residuo (fase successiva):**
+    1. ~~`add_edge` non è ancora O(1)~~ — **risolto 2026-06-19** ([add_edge in O(1)](#2026-06-19--add_edge-in-o1-append--relink--in-place-line-update)): `persist_new_edge` (append+relink+riga in place) e `persist_edge_weight` (overwrite in place). `update_node_edges` resta solo per la pulizia degli archi entranti in `delete_node`.
+    2. ~~Freelist a bin singolo per tipo~~ — **risolto 2026-06-19**: gli archi si liberano/riusano come slot singoli da 48 B (`edges`), il batch come 2213 (`rel`) → un bin per dimensione.
+    3. **Batch chaining** per >8 tipi — ancora WIP (`persist_new_edge` lancia se il batch è pieno).
+  - Il read path (`read_typed_node`, `build_inbound_index`) e `delete_node_from_disk` sono già adeguati al nuovo formato.
+- **Riferimenti:** commit `0a043f7` (working tree). `graph_core/struct/pod_struct.h` (`NodeRelationList`, `Edge`), `graph_core/costants.h` (`RELATION_LINE_SIZE`/`RELATION_LINES_PER_BATCH`/`RELATION_BATCH_TAIL`/`RELATION_NAME_MAX`), `graph_core/odt/node_odt.cpp` (`node_to_relation_list`), `graph_core/odt/edge_odt.cpp` (`edge_to_pod`), `graph_core/io/graph_io.h` (helper di formato + `write_relation_node_list` + edge-read chain in `read_typed_node`), `graph_core/io/graph_io.cpp` (`read_relation_node_list`, `update_node_edges`, `build_inbound_index`, `delete_node_from_disk`); `main.cpp` (smoke test). Supera la scelta "linked-list scartata" di [Edge persistence 2026-05-30](#2026-05-30--edge-persistence-append--obsolete--in-place-index-patch); il freelist a bin singolo evolve [Freelist a bin segregati 2026-06-03](#2026-06-03--freelist-a-bin-segregati-per-dimensione-esatta--cancellazione-nodo).
 
 ---
 
