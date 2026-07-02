@@ -14,15 +14,15 @@ Names misspelled in source that MUST be preserved — renaming silently breaks u
 
 - Directory **`data_tructures/`** (no `s`).
 - Header **`costants.h`** (no `n`).
-- Field **`neighborgs`** on `BaseNode`.
-- Also present in bugs/dead code: `neihborgs` (BUG-004), `hash_map_reash` (legacy C prototype).
+- Field **`neighborgs`** on `BaseNode` (`domain_struct.h:44`).
+- In legacy/dead code: `hash_map_reash` (misnamed, see [[legacy-c-prototypes]]).
 
 ## Relations
 
 - **relates-to** → [[architecture-overview]]
 - **relates-to** → [[build-and-run]]
-- **part-of** → [[Index]]
+- **relates-to** → [[legacy-c-prototypes]]
 
 ## Sources
 
-- `graph_core/costants.h`, `graph_core/struct/domain_struct.h`, `data_tructures/`
+- `graph_core/costants.h`, `graph_core/struct/domain_struct.h:44`, `data_tructures/`

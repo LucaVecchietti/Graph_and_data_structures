@@ -2,6 +2,13 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Answering rules (MCP stack)
+
+Answer using the MCP/knowledge stack, in this order:
+1. **`.claude/knowledge/`** — the project knowledge graph; always check it first for anything about this codebase.
+2. **Context7** (`ctx7`) — for libraries, frameworks, SDKs, CLI tools, and general coding/API information.
+3. **Local `docs/`** — the canonical project documentation, as the fallback for project-specific detail.
+
 ## Build & Run
 
 C++17 project built with CMake + Ninja. Targets Windows with the MSYS2 `ucrt64` toolchain (g++ 16+); `C:\msys64\ucrt64\bin` must be on PATH.

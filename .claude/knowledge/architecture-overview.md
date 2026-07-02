@@ -1,31 +1,35 @@
 ---
 node: architecture-overview
-title: Three-Layer Architecture (Domain / POD / ODT)
+title: Layered Architecture (Domain / POD / ODT / I/O)
 type: domain
 tags: [architecture, layering]
 updated: 2026-07-01
 ---
 
-# Three-Layer Architecture
+# Layered Architecture
 
-The project deliberately keeps RAM shape and disk shape apart so they can evolve independently. Three layers live inside `graph_core/`.
+Everything lives under `graph_core/`, split so the RAM shape and the disk shape can evolve independently. `Graph` orchestrates; four layers do the work.
 
 ## Facts
 
-- **Domain** (`struct/domain_struct.h`) — `BaseNode` (type-erased, holds the adjacency map) + `template<class T> Node : BaseNode` (typed payload). Adjacency is `unordered_map<string relation, unordered_map<int neighbor_id, pair<int weight, BaseNode*>>>`.
-- **POD** (`struct/pod_struct.h`) — packed (`#pragma pack(push,1)`) on-disk records: `NodeIndex`, `NodeRecord<T>`, `NodeRelationList`, `Edge` (with `prev_offset`/`next_offset`), `MetaRecord`, WIP `ComplexHeader`. No magic/version/checksum; host-byte-order-dependent, ABI-fragile.
-- **ODT** (`odt/`) — Object Data Transfer: the *only* layer allowed to convert between Domain and POD. Functions: `node_to_record`, `node_to_relation_list`, `reconstruct_neighbors`, `edge_to_pod`.
-- `T` maps to its on-disk `NodeType` tag via compile-time `node_type_of<T>` in `struct/type_registry.h`. Valid payloads: `int, float, double, char, bool` (and WIP `ComplexRecord`).
+- **Domain** ([[graph-core]], `struct/domain_struct.h`) — RAM structs: `BaseNode` (type-erased adjacency) + `Node<T>` + `EdgeRef` + `ComplexRecord`.
+- **POD** ([[pod-layout]], `struct/pod_struct.h`) — packed on-disk records (`#pragma pack(push,1)`).
+- **ODT** ([[odt-layer]], `odt/`) — the ONLY layer allowed to convert Domain↔POD.
+- **I/O** ([[persistence-io]], `io/`) — read/write paths, freelists, tombstoning.
+- `Graph` (`graph.{h,cpp}`) owns the in-RAM map and drives persistence on every mutation.
+- On-disk format is **packed, host-byte-order-dependent, with NO magic / version / checksum** — ABI-fragile. `main.cpp:24` wipes `db/` each run because a stale layout would silently corrupt reads.
 
 ## Relations
 
+- **part-of** → [[Index]]
 - **contains** → [[graph-core]]
+- **contains** → [[pod-layout]]
+- **contains** → [[odt-layer]]
 - **contains** → [[persistence-io]]
 - **relates-to** → [[glossary-load-bearing-typos]]
-- **part-of** → [[Index]]
+- **relates-to** → [[legacy-c-prototypes]]
 - **documented-in** → docs/architecture/overview.md
 
 ## Sources
 
-- `graph_core/struct/domain_struct.h`, `graph_core/struct/pod_struct.h`
-- `graph_core/odt/`, `graph_core/struct/type_registry.h`
+- `graph_core/graph.h`, `graph_core/struct/`, `graph_core/odt/`, `graph_core/io/`
