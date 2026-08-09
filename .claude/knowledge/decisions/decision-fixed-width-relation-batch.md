@@ -47,11 +47,13 @@ list. Shared format helpers (`write_relation_line`, `read_relation_line`, `pad_r
 - A constant batch size collapses the `rel` freelist to a single size class, and the scattered
   splice collapses `edges` to a single 48-byte class.
 - Left open at the time: exploiting the format for an O(1) `add_edge`, resolved by
-  [[decision-o1-add-edge]]; and batch chaining beyond 8 relation types, still open.
+  [[decision-o1-add-edge]]; and batch chaining beyond 8 relation types, resolved on 2026-08-09
+  by [[decision-relation-batch-chaining]] without touching the layout - `next_offset` and
+  `head` were already in the header for exactly that.
 
 ## Links
 
 - specifies [[relation-batch]] - the format this decision froze
 - specifies [[edge-record]] - the chained 48-byte edge
 - superseded by [[decision-o1-add-edge]] - which exploits this format for the O(1) write path
-- causes [[eight-relation-types-cap]] - the residual boundary it left open
+- relates to [[decision-relation-batch-chaining]] - closes the last boundary it left open

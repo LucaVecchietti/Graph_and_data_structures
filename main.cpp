@@ -214,6 +214,75 @@ int main()
         run_bfs(g, 4, "link");
     }
 
+    // ===== Phase 7: relation-batch chaining (> 8 relation types) ===========
+    // Regression guard for the relation batch CHAIN. A batch holds at most
+    // RELATION_LINES_PER_BATCH (8) fixed-width lines; beyond that persist_new_edge
+    // allocates a further batch and links it via next_offset (head 1 -> 2 -> 3...).
+    // This phase drives a hub node past two batch boundaries (17 relation types =>
+    // 8 + 8 + 1) and checks the three paths that must agree on the chain:
+    //   - persist_new_edge      : new line in the last batch / brand-new batch
+    //   - read_relation_node_list: walk next_offset on reload (all 17 relations back)
+    //   - update_node_edges      : whole-chain rewrite (delete_node inbound cleanup)
+    std::cout << "\n=== Phase 7: relation-batch chaining (17 relation types) ===\n";
+    const int hub = 8;          // next_id is 8 after phases 1-6
+    const int first_target = 9; // targets are ids 9..25
+    const int rel_types = 17;
+
+    // Counts the edges a BFS from `hub` finds on each of rel_0..rel_(count-1).
+    auto count_hub_edges = [](Graph &g, int start, int count) {
+        int seen = 0;
+        for (int i = 0; i < count; ++i)
+            g.bfs(start, "rel_" + std::to_string(i),
+                  [](int) {}, [&](int, int, int) { ++seen; });
+        return seen;
+    };
+
+    {
+        Graph g;
+
+        g.insert(1000);                                   // id 8  — the hub
+        for (int i = 0; i < rel_types; ++i)
+            g.insert(2000 + i);                           // ids 9..25 — one target per relation
+
+        // 17 distinct relation types on ONE node: the 9th and the 17th each force a
+        // brand-new batch, so the chain ends up 3 batches long.
+        for (int i = 0; i < rel_types; ++i)
+            g.add_edge(hub, first_target + i, "rel_" + std::to_string(i), 100 + i);
+
+        int seen = count_hub_edges(g, hub, rel_types);
+        std::cout << "  before reload, edges over 17 relations: " << seen
+                  << (seen == rel_types ? "  [PASS]" : "  [FAIL]") << "\n";
+    }
+    {
+        Graph g; // reload: read_relation_node_list must hop next_offset across 3 batches
+
+        g.add_edge(hub, first_target, "_load"); // lazy-load the hub back into RAM
+
+        int seen = count_hub_edges(g, hub, rel_types);
+        std::cout << "  after reload,  edges over 17 relations: " << seen
+                  << (seen == rel_types ? "  [PASS]" : "  [FAIL]") << "\n";
+    }
+    {
+        // Delete the LAST target (id 25, reachable only via rel_16, the lone line of
+        // the 3rd batch). The hub is its only inbound owner, so delete_node drives
+        // update_node_edges on the hub: the whole 3-batch chain is freed onto the rel
+        // bin and rewritten (16 rel_* + "_load" = 17 types => 3 batches again).
+        Graph g;
+        g.delete_node(first_target + rel_types - 1); // id 25
+    }
+    {
+        Graph g; // reload after the chain rewrite
+
+        g.add_edge(hub, first_target, "_load"); // lazy-load the hub (existing relation: weight overwrite)
+
+        int seen = count_hub_edges(g, hub, rel_types - 1); // rel_0..rel_15 survive
+        int gone = count_hub_edges(g, hub, rel_types) - seen;
+        std::cout << "  after chain rewrite, edges over rel_0..rel_15: " << seen
+                  << (seen == rel_types - 1 ? "  [PASS]" : "  [FAIL]") << "\n";
+        std::cout << "  rel_16 (target deleted) must be empty: " << gone
+                  << (gone == 0 ? "  [PASS]" : "  [FAIL]") << "\n";
+    }
+
     system("pause");
     return 0;
 }

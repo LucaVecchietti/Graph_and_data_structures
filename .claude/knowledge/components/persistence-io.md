@@ -33,12 +33,20 @@ Move bytes between POD records and the files under `db/`: `nodes.dat`, `nodes.id
 - `read_node`/`read_typed_node` read the record, then the relation batch, then walk each
   edge chain by `next_offset`, bounded by the line's `edge_count`. Adjacency is rebuilt;
   only the `EdgeRef.neighbor` pointers are left `nullptr`.
+- `read_relation_node_list` reads a node's WHOLE relation chain, hopping batch `next_offset`
+  until 0 and bounded by `RELATION_MAX_BATCHES`. Its optional `batch_offsets` out-param
+  reports every batch visited - the reclaim paths need one freelist record per batch, and
+  `NodeIndex` only records where the chain starts. See [[decision-relation-batch-chaining]].
 - O(1) edge operations: `persist_new_edge` allocates a slot (freelist pop or append),
   splices at the chain head, patches the old head's `prev_offset` and updates one
-  fixed-width relation line in place. `persist_edge_weight` is an 8-byte in-place write.
+  fixed-width relation line in place. If the relation type is new and the last batch of the
+  chain is full, it allocates a batch and links it with one 8-byte write to `next_offset`.
+  `persist_edge_weight` is an 8-byte in-place write.
 - `update_node_edges` is the whole-node rewrite path, now used only for the inbound cleanup
-  in `delete_node`. It pushes the old regions onto the [[freelist]] bins and pops
+  in `delete_node`. It pushes every old batch and edge onto the [[freelist]] bins and pops
   exact-size bins for the new ones, which is what makes a weight overwrite cost zero growth.
+  For a multi-batch chain it decides where every batch lands before writing any of them,
+  because each `next_offset` needs the following batch's offset.
 - `build_inbound_index` does an O(N+E) scan of live slots (skipping tombstones) to rebuild
   [[in-edges-index]] at load.
 - `nodes.idx` is fixed-width, so id lookup is `seekg(id * sizeof(NodeIndex))`.
@@ -54,6 +62,7 @@ Move bytes between POD records and the files under `db/`: `nodes.dat`, `nodes.id
 ## Links
 
 - part of [[graph-core-architecture]] - the I/O layer
+- implements [[decision-relation-batch-chaining]] - the chain walk and the batch allocation live here
 - depends on [[odt-layer]] - receives PODs already translated from domain structs
 - depends on [[pod-layout]] - the record layouts it reads and writes
 - depends on [[type-registry]] - dispatches on `NodeType` and on-disk payload sizes

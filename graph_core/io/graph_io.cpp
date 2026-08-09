@@ -157,17 +157,46 @@ void read_complex(ComplexRecord &out, std::ifstream &dat_in)
     out.json_attributes = buf.str();
 }
 
-std::vector<RelationEntry> read_relation_node_list(std::ifstream &in)
+/**
+ * Reads a whole relation-list CHAIN starting at the stream's current get position.
+ * See graph_io.h for the contract (including the optional batch_offsets out-param).
+ */
+std::vector<RelationEntry> read_relation_node_list(std::ifstream &in, std::vector<uint64_t> *batch_offsets)
 {
-    NodeRelationList header = read_pod<NodeRelationList>(in);
     std::vector<RelationEntry> entries;
-    entries.reserve(header.type_count);
-    for (uint64_t i = 0; i < header.type_count; ++i)
-        entries.push_back(read_relation_line(in));
+    uint64_t batch_off = static_cast<uint64_t>(in.tellg());
 
-    // Skip the unused (zero-filled) remainder of the fixed tail so the stream
-    // sits at the end of this batch region.
-    in.seekg(static_cast<std::streamoff>(header.free_bytes), std::ios::cur);
+    for (uint32_t visited = 0;; ++visited)
+    {
+        // The format has no checksum: a corrupted next_offset must not spin forever.
+        if (visited >= RELATION_MAX_BATCHES)
+        {
+            logger.error("read_relation_node_list: relation chain exceeds "
+                         + std::to_string(RELATION_MAX_BATCHES) + " batches at offset "
+                         + std::to_string(batch_off) + " — corrupted next_offset?");
+            throw std::runtime_error("read_relation_node_list: relation batch chain too long (corrupted next_offset?).");
+        }
+
+        if (batch_offsets) batch_offsets->push_back(batch_off);
+
+        NodeRelationList header = read_pod<NodeRelationList>(in);
+        for (uint64_t i = 0; i < header.type_count; ++i)
+            entries.push_back(read_relation_line(in));
+
+        if (header.next_offset == 0)
+        {
+            // Last batch: skip its unused (zero-filled) tail remainder so the stream
+            // sits at the end of the chain's last batch region.
+            in.seekg(static_cast<std::streamoff>(header.free_bytes), std::ios::cur);
+            break;
+        }
+
+        // Hop to the next batch of the chain (batches need not be contiguous).
+        batch_off = header.next_offset;
+        in.clear();
+        in.seekg(static_cast<std::streamoff>(batch_off));
+    }
+
     return entries;
 }
 
@@ -301,27 +330,54 @@ uint64_t persist_new_edge(MetaRecord &meta, uint64_t node_id, const std::string 
         relation_offset = read_node_index(idx_in).relation_offset;
     }
 
-    // ---- 2. read the batch header + lines, locate the relation line --------
-    NodeRelationList header;
-    int found = -1;            // line index of `type`, or -1 if a brand-new relation
-    uint64_t old_head = 0;     // current chain head of that relation (0 if none)
+    // ---- 2. walk the batch chain, locate the relation line -----------------
+    // The list is a chain of fixed-width batches (next_offset, head 1->2->3...), so
+    // the search hops from batch to batch. It stops early on a hit; otherwise it runs
+    // to the LAST batch, which is where a brand-new relation type will be placed
+    // (append-only: lines 0..type_count-1 of a batch are used, never a hole).
+    int found = -1;               // line index of `type` INSIDE found_batch_off, or -1
+    uint64_t found_batch_off = 0; // batch holding that line
+    uint64_t old_head = 0;        // current chain head of that relation (0 if none)
     uint64_t old_count = 0;
-    const uint64_t tail_off = relation_offset + sizeof(NodeRelationList);
+    NodeRelationList last_header; // header of the last batch of the chain
+    uint64_t last_batch_off = relation_offset;
     {
         std::ifstream dat_in(fs::path(DB_PATH) / "nodes.dat", std::ios::binary);
         if (!dat_in) throw std::runtime_error("persist_new_edge: failed to open nodes.dat for reading.");
-        dat_in.seekg(static_cast<std::streamoff>(relation_offset));
-        header = read_pod<NodeRelationList>(dat_in);
-        for (uint64_t i = 0; i < header.type_count; ++i)
+
+        uint64_t off = relation_offset;
+        for (uint32_t visited = 0;; ++visited)
         {
-            RelationEntry e = read_relation_line(dat_in); // sequential after the header
-            if (e.name == type)
+            if (visited >= RELATION_MAX_BATCHES)
             {
-                found     = static_cast<int>(i);
-                old_head  = e.edge_offset;
-                old_count = e.edge_count;
-                break;
+                logger.error("persist_new_edge: node " + std::to_string(node_id)
+                             + " relation chain exceeds " + std::to_string(RELATION_MAX_BATCHES)
+                             + " batches — corrupted next_offset?");
+                throw std::runtime_error("persist_new_edge: relation batch chain too long (corrupted next_offset?).");
             }
+
+            dat_in.clear();
+            dat_in.seekg(static_cast<std::streamoff>(off));
+            NodeRelationList h = read_pod<NodeRelationList>(dat_in);
+
+            for (uint64_t i = 0; i < h.type_count; ++i)
+            {
+                RelationEntry e = read_relation_line(dat_in); // sequential after the header
+                if (e.name == type)
+                {
+                    found           = static_cast<int>(i);
+                    found_batch_off = off;
+                    old_head        = e.edge_offset;
+                    old_count       = e.edge_count;
+                    break;
+                }
+            }
+
+            last_header    = h;
+            last_batch_off = off;
+
+            if (found >= 0 || h.next_offset == 0) break;
+            off = h.next_offset;
         }
     }
 
@@ -360,40 +416,80 @@ uint64_t persist_new_edge(MetaRecord &meta, uint64_t node_id, const std::string 
     }
 
     // ---- 5. update the relation line (and header, for a new relation) in place ----
+    bool new_batch = false;
     {
         std::fstream dat(fs::path(DB_PATH) / "nodes.dat", std::ios::binary | std::ios::in | std::ios::out);
         if (!dat) throw std::runtime_error("persist_new_edge: failed to open nodes.dat for in-place update.");
 
         if (found >= 0)
         {
-            // Existing relation: only head offset + count change (first 16 bytes of the line).
-            dat.seekp(static_cast<std::streamoff>(tail_off + static_cast<uint64_t>(found) * RELATION_LINE_SIZE));
+            // Existing relation: only head offset + count change (first 16 bytes of the
+            // line), inside whichever batch of the chain holds that line.
+            dat.seekp(static_cast<std::streamoff>(found_batch_off + sizeof(NodeRelationList)
+                                                  + static_cast<uint64_t>(found) * RELATION_LINE_SIZE));
             write_offset(new_off, dat);
             write_offset(old_count + 1, dat);
         }
-        else
+        else if (last_header.type_count < RELATION_LINES_PER_BATCH)
         {
-            // New relation type: needs a free line in this batch (chaining is WIP).
-            if (header.type_count >= RELATION_LINES_PER_BATCH || header.free_bytes < RELATION_LINE_SIZE)
-                throw std::runtime_error("persist_new_edge: node " + std::to_string(node_id)
-                                         + " relation batch full (" + std::to_string(RELATION_LINES_PER_BATCH)
-                                         + " types) — batch chaining not yet implemented.");
-
-            uint64_t slot = header.type_count;
-            dat.seekp(static_cast<std::streamoff>(tail_off + slot * RELATION_LINE_SIZE));
+            // New relation type, and the last batch of the chain still has a free line:
+            // fill slot `type_count` and bump the header in place. The batch never moves,
+            // so NodeIndex stays untouched.
+            uint64_t slot = last_header.type_count;
+            dat.seekp(static_cast<std::streamoff>(last_batch_off + sizeof(NodeRelationList)
+                                                  + slot * RELATION_LINE_SIZE));
             write_relation_line(dat, new_off, 1, type);
 
-            header.type_count += 1;
-            header.free_bytes -= RELATION_LINE_SIZE;
-            dat.seekp(static_cast<std::streamoff>(relation_offset));
-            write_pod(header, dat);
+            last_header.type_count += 1;
+            last_header.free_bytes -= RELATION_LINE_SIZE;
+            dat.seekp(static_cast<std::streamoff>(last_batch_off));
+            write_pod(last_header, dat);
+        }
+        else
+        {
+            // New relation type and the last batch is FULL: chain a fresh batch. It is
+            // allocated on its own (exact-size `rel` bin pop, else append at EOF), gets
+            // the next serial in `head`, and is linked in with a single 8-byte in-place
+            // write to the previous batch's next_offset. NodeIndex still never moves.
+            new_batch = true;
+            const uint64_t region = relation_batch_region_size();
+
+            uint64_t new_batch_off;
+            auto reuse = pop_free_offset<RelationNodeListFreeOffset>(freelist_bin_path("rel", region));
+            if (reuse)
+            {
+                new_batch_off = reuse->offset;                 // exact fit: every batch is one size class
+                dat.seekp(static_cast<std::streamoff>(new_batch_off));
+            }
+            else
+            {
+                // in|out (NOT app): seekp to EOF + write correctly extends the file.
+                dat.seekp(0, std::ios::end);
+                new_batch_off = static_cast<uint64_t>(dat.tellp());
+            }
+
+            // Full region in one contiguous run: header + the single line + zero tail.
+            write_pod(relation_batch_header(node_id, 1, last_header.head + 1, 0), dat);
+            write_relation_line(dat, new_off, 1, type);
+            pad_relation_tail(dat, 1);
+
+            // Link it: patch only next_offset of the previously-last batch.
+            dat.seekp(static_cast<std::streamoff>(last_batch_off + offsetof(NodeRelationList, next_offset)));
+            write_offset(new_batch_off, dat);
+
+            logger.info("persist_new_edge: node " + std::to_string(node_id)
+                        + " relation batch full — chained batch head "
+                        + std::to_string(last_header.head + 1) + " at nodes.dat offset "
+                        + std::to_string(new_batch_off)
+                        + (reuse ? " (reused rel bin region)" : " (appended)"));
         }
     }
 
     logger.info("persist_new_edge: node " + std::to_string(node_id) + " --" + type + "--> "
                 + std::to_string(to_id) + " edge id " + std::to_string(edge_id)
                 + " at edges.dat offset " + std::to_string(new_off)
-                + (found >= 0 ? " (existing relation)" : " (new relation line)"));
+                + (found >= 0 ? " (existing relation)"
+                              : (new_batch ? " (new relation line, new batch)" : " (new relation line)")));
     return new_off;
 }
 
@@ -438,8 +534,11 @@ void update_node_edges(BaseNode &node, MetaRecord &meta, uint64_t node_id)
         node_idx = read_node_index(idx_in);
     }
 
+    // Every batch of the OLD chain is orphaned by this update, so collect their
+    // offsets while reading: NodeIndex only records where the chain starts.
+    const uint64_t region = relation_batch_region_size();
     std::vector<RelationEntry> old_entries;
-    uint64_t old_relation_total_size = 0; // sizeof(POD) + batch_size of the OLD list
+    std::vector<uint64_t> old_batch_offsets;
     {
         std::ifstream dat_in(fs::path(DB_PATH) / "nodes.dat", std::ios::binary);
         if (!dat_in)
@@ -448,55 +547,44 @@ void update_node_edges(BaseNode &node, MetaRecord &meta, uint64_t node_id)
             throw std::runtime_error("update_node_edges: failed to open nodes.dat for reading.");
         }
         dat_in.seekg(static_cast<std::streamoff>(node_idx.relation_offset));
-        NodeRelationList old_header = read_pod<NodeRelationList>(dat_in);
-        old_relation_total_size = sizeof(NodeRelationList) + old_header.batch_size;
-
-        // read_relation_node_list expects the stream positioned at the POD
-        // start, so rewind before delegating to it for the tail entries.
-        dat_in.seekg(static_cast<std::streamoff>(node_idx.relation_offset));
-        old_entries = read_relation_node_list(dat_in);
+        old_entries = read_relation_node_list(dat_in, &old_batch_offsets);
     }
 
     // ---- 2. Orphan the OLD regions onto the freelist bins -------------------
     // Free each old relation's edges by walking its chain (edges are no longer
     // contiguous, so free_edge_chain pushes each 48-byte slot onto the single-edge
-    // `edges` bin, zeroes it, and bumps free_edge_count). Then push the old batch
-    // region onto the `rel` bin and zero it.
+    // `edges` bin, zeroes it, and bumps free_edge_count). Then push EVERY batch of
+    // the old chain onto the `rel` bin (one record per batch — all the same size
+    // class) and zero them.
     for (const auto &entry : old_entries)
         free_edge_chain(entry.edge_offset, entry.edge_count, meta);
 
-    write_free_offset(RelationNodeListFreeOffset{node_idx.relation_offset, old_relation_total_size},
-                      freelist_bin_path("rel", old_relation_total_size));
+    for (uint64_t batch_off : old_batch_offsets)
+        write_free_offset(RelationNodeListFreeOffset{batch_off, region}, freelist_bin_path("rel", region));
     {
         std::fstream dat_io(fs::path(DB_PATH) / "nodes.dat", std::ios::binary | std::ios::in | std::ios::out);
-        if (dat_io) zero_region(dat_io, node_idx.relation_offset, old_relation_total_size);
+        if (dat_io)
+            for (uint64_t batch_off : old_batch_offsets)
+                zero_region(dat_io, batch_off, region);
     }
 
-    logger.info("update_node_edges: orphaned RelationNodeList at offset "
+    logger.info("update_node_edges: orphaned " + std::to_string(old_batch_offsets.size())
+                + " relation batch(es) of " + std::to_string(region) + " bytes starting at offset "
                 + std::to_string(node_idx.relation_offset)
-                + " of size " + std::to_string(old_relation_total_size)
-                + " bytes -> rel bin; free_edge_count=" + std::to_string(meta.free_edge_count));
+                + " -> rel bin; free_edge_count=" + std::to_string(meta.free_edge_count));
 
-    // ---- 3. Write the NEW relation batch and the NEW edge runs -------------
-    // The relation batch is reclaimed pop-then-append: every batch is one size
-    // class (2213 B), and step 2 just freed this node's old batch onto the `rel`
-    // bin, so the pop returns that very region → in-place rewrite, no nodes.dat
-    // growth. The edge runs are appended fresh at EOF (the old, possibly-scattered
-    // edges were freed per-edge in step 2 and are reused later by persist_new_edge).
-    NodeRelationList list = node_to_relation_list(node, node_id);
-    uint64_t new_relation_total_size = sizeof(NodeRelationList) + list.batch_size;
+    // ---- 3. Write the NEW relation chain and the NEW edge runs -------------
+    // The batches are reclaimed pop-then-append: every batch is one size class
+    // (2213 B), and step 2 just freed this node's whole old chain onto the `rel`
+    // bin, so the pops return those very regions → in-place rewrite, no nodes.dat
+    // growth (the chain can only need MORE batches than it had if this call grew
+    // the node's relation types, which the shrink-only caller never does). The
+    // edge runs are appended fresh at EOF (the old, possibly-scattered edges were
+    // freed per-edge in step 2 and are reused later by persist_new_edge).
+    const uint64_t n_types   = static_cast<uint64_t>(node.neighborgs.size());
+    const uint64_t n_batches = relation_batch_count(n_types);
 
-    // Single-batch only for now (chaining via next_offset is WIP).
-    if (list.type_count > RELATION_LINES_PER_BATCH)
-        throw std::runtime_error("update_node_edges: node " + std::to_string(node_id)
-                                 + " has more than " + std::to_string(RELATION_LINES_PER_BATCH)
-                                 + " relation types (batch chaining not yet implemented).");
-
-    // Decide where the new relation-list region lands: reuse an exact-size freed
-    // `rel` region if one exists, else append at EOF (set below from tellp()).
-    auto rel_reuse = pop_free_offset<RelationNodeListFreeOffset>(
-        freelist_bin_path("rel", new_relation_total_size));
-
+    std::vector<uint64_t> new_batch_offsets(n_batches, 0);
     uint64_t new_relation_offset = 0;
     {
         // in|out (NOT app): seekp lands in-place for reuse and correctly extends
@@ -508,22 +596,28 @@ void update_node_edges(BaseNode &node, MetaRecord &meta, uint64_t node_id)
             logger.error("update_node_edges: failed to open nodes.dat for writing.");
             throw std::runtime_error("update_node_edges: failed to open nodes.dat for writing.");
         }
-        if (rel_reuse)
-        {
-            new_relation_offset = rel_reuse->offset; // in-place reuse (exact fit)
-            dat_out.seekp(static_cast<std::streamoff>(new_relation_offset));
-        }
-        else
-        {
-            dat_out.seekp(0, std::ios::end);         // append at EOF
-            new_relation_offset = dat_out.tellp();
-        }
 
-        // The reuse fit is exact (every batch is one size class now), so the POD
-        // plus the full fixed tail land in exactly new_relation_total_size bytes —
-        // no overrun. Use ONE in|out stream for the POD + every line so the put
-        // pointer advances contiguously (never seek dat_out between lines).
-        write_pod(list, dat_out);
+        // 3a. Decide where EVERY batch lands before writing any of them: each
+        //     next_offset must point at the following batch, and the batches of one
+        //     chain need not be contiguous (each is its own freelist pop). Appended
+        //     batches are handed successive EOF+k*region slots — probing EOF again
+        //     would return the same offset twice, since nothing is written yet.
+        dat_out.seekp(0, std::ios::end);
+        uint64_t append_cursor = static_cast<uint64_t>(dat_out.tellp());
+        for (uint64_t b = 0; b < n_batches; ++b)
+        {
+            auto reuse = pop_free_offset<RelationNodeListFreeOffset>(freelist_bin_path("rel", region));
+            if (reuse)
+            {
+                new_batch_offsets[b] = reuse->offset; // in-place reuse (exact fit)
+            }
+            else
+            {
+                new_batch_offsets[b] = append_cursor;
+                append_cursor += region;
+            }
+        }
+        new_relation_offset = new_batch_offsets[0];
 
         std::fstream edges_out(fs::path(DB_PATH) / "edges.dat",
                                std::ios::binary | std::ios::in | std::ios::out);
@@ -533,41 +627,52 @@ void update_node_edges(BaseNode &node, MetaRecord &meta, uint64_t node_id)
             throw std::runtime_error("update_node_edges: failed to open edges.dat for writing.");
         }
 
-        // This is the whole-node rewrite path (used only by delete_node's inbound
-        // cleanup now — add_edge takes the O(1) persist_new_edge path). Each
-        // relation's edges are re-laid as a fresh CONTIGUOUS doubly-linked run
-        // appended at EOF (the old, possibly-scattered chain was already freed in
-        // step 2). As we write each edge we REFRESH its RAM EdgeRef.offset, so a
-        // later O(1) weight overwrite seeks to the right place after relocation.
-        // Each Edge keeps its own EdgeRef.id.
-        uint64_t used = 0;
-        for (auto &[rel_type, neighbors] : node.neighborgs)
+        // 3b. This is the whole-node rewrite path (used only by delete_node's inbound
+        //     cleanup now — add_edge takes the O(1) persist_new_edge path). Each
+        //     relation's edges are re-laid as a fresh CONTIGUOUS doubly-linked run
+        //     appended at EOF (the old, possibly-scattered chain was already freed in
+        //     step 2). As we write each edge we REFRESH its RAM EdgeRef.offset, so a
+        //     later O(1) weight overwrite seeks to the right place after relocation.
+        //     Each Edge keeps its own EdgeRef.id.
+        //     The reuse fit is exact, so header + full fixed tail land in exactly
+        //     `region` bytes — no overrun. dat_out is seeked ONLY at batch boundaries;
+        //     inside a batch its put pointer must advance contiguously.
+        auto rel_it = node.neighborgs.begin();
+        for (uint64_t b = 0; b < n_batches; ++b)
         {
-            uint64_t edge_count = static_cast<uint64_t>(neighbors.size());
+            const uint64_t lines = relation_lines_in_batch(n_types, b);
+            const uint64_t next  = (b + 1 < n_batches) ? new_batch_offsets[b + 1] : 0;
 
-            edges_out.seekp(0, std::ios::end);
-            uint64_t base = static_cast<uint64_t>(edges_out.tellp());
+            dat_out.seekp(static_cast<std::streamoff>(new_batch_offsets[b]));
+            write_pod(relation_batch_header(node_id, lines, b + 1, next), dat_out);
 
-            uint64_t i = 0;
-            for (auto &[to_id, ref] : neighbors)
+            for (uint64_t i = 0; i < lines; ++i, ++rel_it)
             {
-                uint64_t prev = (i == 0)               ? 0 : base + (i - 1) * sizeof(Edge);
-                uint64_t next = (i == edge_count - 1)  ? 0 : base + (i + 1) * sizeof(Edge);
-                Edge e = edge_to_pod(ref.id, node_id, static_cast<uint64_t>(to_id),
-                                     static_cast<uint64_t>(ref.weight), prev, next);
-                write_pod(e, edges_out);
-                ref.offset = base + i * sizeof(Edge); // refresh RAM offset after relocation
-                ++i;
+                const std::string &rel_type = rel_it->first;
+                auto &neighbors             = rel_it->second;
+                uint64_t edge_count         = static_cast<uint64_t>(neighbors.size());
+
+                edges_out.seekp(0, std::ios::end);
+                uint64_t base = static_cast<uint64_t>(edges_out.tellp());
+
+                uint64_t k = 0;
+                for (auto &[to_id, ref] : neighbors)
+                {
+                    uint64_t prev = (k == 0)               ? 0 : base + (k - 1) * sizeof(Edge);
+                    uint64_t next_e = (k == edge_count - 1) ? 0 : base + (k + 1) * sizeof(Edge);
+                    Edge e = edge_to_pod(ref.id, node_id, static_cast<uint64_t>(to_id),
+                                         static_cast<uint64_t>(ref.weight), prev, next_e);
+                    write_pod(e, edges_out);
+                    ref.offset = base + k * sizeof(Edge); // refresh RAM offset after relocation
+                    ++k;
+                }
+
+                write_relation_line(dat_out, edge_count == 0 ? 0 : base, edge_count, rel_type);
             }
 
-            // Fixed-width line on the nodes.dat stream; its put pointer is right
-            // after the POD / previous line — do not seek it between lines.
-            write_relation_line(dat_out, edge_count == 0 ? 0 : base, edge_count, rel_type);
-            ++used;
+            // Zero-fill the rest of the fixed tail so each region is exactly 2213 bytes.
+            pad_relation_tail(dat_out, lines);
         }
-
-        // Zero-fill the rest of the fixed tail so the region is exactly 2213 bytes.
-        pad_relation_tail(dat_out, used);
     }
 
     // ---- 4. Patch NodeIndex.relation_offset in-place -----------------------
@@ -591,7 +696,9 @@ void update_node_edges(BaseNode &node, MetaRecord &meta, uint64_t node_id)
     }
 
     logger.info("update_node_edges: node " + std::to_string(node_id)
-                + " relation_offset patched to " + std::to_string(new_relation_offset));
+                + " relation_offset patched to " + std::to_string(new_relation_offset)
+                + " (" + std::to_string(n_batches) + " batch(es) for "
+                + std::to_string(n_types) + " relation type(s))");
 }
 
 void delete_node_from_disk(uint64_t node_id, MetaRecord &meta)
@@ -618,12 +725,13 @@ void delete_node_from_disk(uint64_t node_id, MetaRecord &meta)
                 + "relation_offset=" + std::to_string(node_idx.relation_offset) + ", "
                 + "type_id=" + std::to_string(static_cast<uint8_t>(node_idx.type_id)));
 
-    // 2. Read the RelationNodeList of the node to be deleted to obtain the offsets and sizes of its edge chunks.
-    //    We read the POD header first to capture batch_size (the exact on-disk size of the variable-width tail),
-    //    then rewind and parse the per-relation entries. The total reclaimable size of the relation-list region
-    //    is sizeof(RelationNodeList) + batch_size — same accounting used by update_node_edges.
+    // 2. Read the relation list of the node to be deleted to obtain the offsets and sizes of its edge chunks.
+    //    The list is a CHAIN of fixed-width batches, so we also collect the offset of every batch: each one is
+    //    an independently-reclaimable region of relation_batch_region_size() bytes (a single `rel` size class),
+    //    and NodeIndex only records where the chain starts.
     std::vector<RelationEntry> relation_entries;
-    uint64_t relation_list_total_size = 0;
+    std::vector<uint64_t> relation_batch_offsets;
+    const uint64_t relation_batch_region = relation_batch_region_size();
     {
         std::ifstream dat_in(std::filesystem::path(DB_PATH) / "nodes.dat", std::ios::binary);
         if (!dat_in)
@@ -632,15 +740,12 @@ void delete_node_from_disk(uint64_t node_id, MetaRecord &meta)
             throw std::runtime_error("delete_node_from_disk: failed to open nodes.dat for reading.");
         }
         dat_in.seekg(static_cast<std::streamoff>(node_idx.relation_offset));
-        NodeRelationList header = read_pod<NodeRelationList>(dat_in);
-        relation_list_total_size = sizeof(NodeRelationList) + header.batch_size;
-
-        // read_relation_node_list expects the stream at the POD start, so rewind before delegating.
-        dat_in.seekg(static_cast<std::streamoff>(node_idx.relation_offset));
-        relation_entries = read_relation_node_list(dat_in);
+        relation_entries = read_relation_node_list(dat_in, &relation_batch_offsets);
     }
 
-    logger.debug("delete_node_from_disk: read " + std::to_string(relation_entries.size()) + " relation entries for node " + std::to_string(node_id));
+    logger.debug("delete_node_from_disk: read " + std::to_string(relation_entries.size())
+                 + " relation entries for node " + std::to_string(node_id)
+                 + " across " + std::to_string(relation_batch_offsets.size()) + " batch(es)");
 
     // 3. Determine the orphaned NodeRecord size and the freelist bin prefix.
     //    Primitives have a fixed size from the type tag. COMPLEX is variable: its
@@ -690,36 +795,42 @@ void delete_node_from_disk(uint64_t node_id, MetaRecord &meta)
                 + std::to_string(node_idx.offset)
                 + " of size " + std::to_string(record_size) + " bytes (nodes.dat)");
 
-    logger.info("delete_node_from_disk: orphaning RelationNodeList at offset "
-                + std::to_string(node_idx.relation_offset)
-                + " of size " + std::to_string(relation_list_total_size) + " bytes (nodes.dat)");
+    logger.info("delete_node_from_disk: orphaning " + std::to_string(relation_batch_offsets.size())
+                + " relation batch(es) of " + std::to_string(relation_batch_region)
+                + " bytes, chain starting at offset " + std::to_string(node_idx.relation_offset) + " (nodes.dat)");
 
-    // 4. Build the free-offset records for the NodeRecord region and the relation batch.
-    //    The node's edges are reclaimed separately by free_edge_chain (step 5b), which
-    //    walks each relation's linked list and frees the individual 48-byte slots.
+    // 4. Build the free-offset record for the NodeRecord region. The relation batches are
+    //    pushed one by one below (every batch of the chain is its own free region of the
+    //    same size class). The node's edges are reclaimed separately by free_edge_chain
+    //    (step 5b), which walks each relation's linked list and frees the 48-byte slots.
     NodeFreeOffset record_free_offset{node_id, node_idx.offset, record_size};
-    RelationNodeListFreeOffset relation_list_free_offset{node_idx.relation_offset, relation_list_total_size};
 
     logger.info("delete_node_from_disk: adding NodeRecord free offset to freelist: idx=" + std::to_string(record_free_offset.idx) + ", offset=" + std::to_string(record_free_offset.offset) + ", size=" + std::to_string(record_free_offset.size));
-    logger.info("delete_node_from_disk: adding RelationNodeList free offset to freelist: offset=" + std::to_string(relation_list_free_offset.offset) + ", size=" + std::to_string(relation_list_free_offset.size));
 
-    // 5a. Push the NodeRecord region + relation batch onto their EXACT-SIZE bins.
+    // 5a. Push the NodeRecord region + every relation batch onto their EXACT-SIZE bins.
     write_free_offset(record_free_offset, freelist_bin_path(node_bin_prefix, record_free_offset.size));
-    write_free_offset(relation_list_free_offset, freelist_bin_path("rel", relation_list_free_offset.size));
+    for (uint64_t batch_off : relation_batch_offsets)
+    {
+        logger.info("delete_node_from_disk: adding relation batch free offset to freelist: offset="
+                    + std::to_string(batch_off) + ", size=" + std::to_string(relation_batch_region));
+        write_free_offset(RelationNodeListFreeOffset{batch_off, relation_batch_region},
+                          freelist_bin_path("rel", relation_batch_region));
+    }
 
     // 5b. Free each relation's edge chain (per-edge 48-byte slots, zeroed) — bumps
     //     free_edge_count internally.
     for (const auto &entry : relation_entries)
         free_edge_chain(entry.edge_offset, entry.edge_count, meta);
 
-    // 6. Zero the orphaned NodeRecord + relation batch in nodes.dat (edges already
-    //    zeroed by free_edge_chain). The freelist bins track offset+size, not the
-    //    bytes — a future reuse overwrites these zeros.
+    // 6. Zero the orphaned NodeRecord + every relation batch of the chain in nodes.dat
+    //    (edges already zeroed by free_edge_chain). The freelist bins track offset+size,
+    //    not the bytes — a future reuse overwrites these zeros.
     {
         std::fstream dat(std::filesystem::path(DB_PATH) / "nodes.dat", std::ios::binary | std::ios::in | std::ios::out);
         if (!dat) throw std::runtime_error("delete_node_from_disk: failed to open nodes.dat for zeroing.");
         zero_region(dat, node_idx.offset, record_size);
-        zero_region(dat, node_idx.relation_offset, relation_list_total_size);
+        for (uint64_t batch_off : relation_batch_offsets)
+            zero_region(dat, batch_off, relation_batch_region);
     }
 
     // 7. Tombstone the slot in nodes.idx: the entry stays (the id is reusable via the freelist),

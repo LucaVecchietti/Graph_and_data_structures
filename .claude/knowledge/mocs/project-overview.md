@@ -31,14 +31,17 @@ no test suite.
 [[in-edges-index]] and [[complex-nodes]].
 
 **Working with it** - [[build-and-run]] and [[smoke-test]]. The traps: [[db-path-relative-to-cwd]],
-[[load-bearing-misspellings]], [[eight-relation-types-cap]].
+[[load-bearing-misspellings]], [[docs-drift-vs-code]].
 
 **Historical / out of scope** - [[legacy-c-prototypes]] are early C prototypes not in the build.
 
 ## Open questions
 
-- Relation batch chaining for more than 8 relation types is unimplemented - see [[eight-relation-types-cap]].
-- The on-disk format has no magic, version or checksum, and is host-byte-order dependent.
+- The on-disk format has no magic, version or checksum, and is host-byte-order dependent - which
+  is also why a relation chain walk needs the `RELATION_MAX_BATCHES` bound
+  ([[decision-relation-batch-chaining]]).
+- `RELATION_LINES_PER_BATCH` is still 8, so a node pays 2213 bytes per started group of 8
+  relation types; lowering it would be a schema break.
 - Deleting a single edge in O(1), an in-place node payload update, and a query layer are all still missing (see [[project-docs]] for the roadmap).
 
 ## Links

@@ -6,8 +6,8 @@
 |---|---|
 | Tipo | module |
 | Lingua | en |
-| Ultimo aggiornamento | 2026-06-19 |
-| Commit di riferimento | 0a043f7 |
+| Ultimo aggiornamento | 2026-08-09 |
+| Commit di riferimento | fbc6703 |
 | Mirror | — |
 
 ---
@@ -49,7 +49,7 @@ The `attributes/` subtree only exists once at least one COMPLEX node has been wr
 - **Fixed-width `NodeIndex`** — allows O(1) lookup by id via `seekg(id * sizeof(NodeIndex))` in `nodes.idx`. Also enables the in-place patch above.
 - **Type tag inside `NodeIndex`** — lets `read_node` dispatch to the right `read_typed_node<T>` without touching `nodes.dat`.
 - **Edges stored separately, doubly-linked** — `edges.dat` holds all edges; each `NodeRelationList` tail line stores `(name, edge_offset, edge_count)` where `edge_offset` is the **head** of that relation's edge linked list (each `Edge` carries `prev_offset`/`next_offset`). Since 2026-06-19.
-- **Fixed-width relation batches** — a node's relations live in a `NodeRelationList` batch: a 37-byte header + a fixed `RELATION_BATCH_TAIL` (2176) byte tail of up to 8 fixed 272-byte lines, total 2213 bytes regardless of how few relations are used. A single line is addressable by index (`tail + i*272`), so one relation can be rewritten in place, and every batch is one freelist size class. Since 2026-06-19 — see the [decision](../legacy/design_decisions.md#2026-06-19--relation-list-a-batch-fixed-width--edge-a-lista-doppiamente-concatenata).
+- **Fixed-width relation batches, chained** — a node's relations live in a `NodeRelationList` batch: a 37-byte header + a fixed `RELATION_BATCH_TAIL` (2176) byte tail of up to 8 fixed 272-byte lines, total 2213 bytes regardless of how few relations are used. A single line is addressable by index (`tail + i*272`), so one relation can be rewritten in place, and every batch is one freelist size class. Since 2026-06-19 — see the [decision](../legacy/design_decisions.md#2026-06-19--relation-list-a-batch-fixed-width--edge-a-lista-doppiamente-concatenata). Beyond 8 relation types the list continues in further batches linked by `next_offset` (`head` 1→2→3), each allocated on its own and therefore not necessarily contiguous; since 2026-08-09 — see the [chaining decision](../legacy/design_decisions.md#2026-08-09--relation-batch-chaining-catena-di-batch-via-next_offset).
 - **Edge add/overwrite is O(1) (since 2026-06-19)** — a new edge is appended (or a freed 48 B slot reused), spliced at the relation's chain head (`prev_offset` of the old head patched in place), and the one fixed-width relation line is updated in place; the batch never moves so `NodeIndex` is untouched (`persist_new_edge`). A weight overwrite is an in-place 8-byte write at `edge_offset + offsetof(Edge, weight)` (`persist_edge_weight`). The whole-node rewrite (`update_node_edges`) survives only for `delete_node`'s inbound cleanup: it frees the old edges by chain-walk (per-edge 48 B slots → `edges` bin) and the old batch → `rel` bin, then re-lays the node contiguously, reusing an exact-size `rel` hole in place and refreshing each `EdgeRef.offset`. See the [O(1) add_edge decision](../legacy/design_decisions.md#2026-06-19--add_edge-in-o1-append--relink--in-place-line-update).
 - **Freelist: size-segregated bins (since 2026-06-03)** — `db/freelist/<prefix>_<size>.dat`, one bin file per distinct free-region size. Push appends a free-offset record; pop reads the last record and truncates one record — both O(1), and a pop is always an exact fit. Since 2026-06-19 the sizes are standardized: one `rel_2213` bin (whole batch) and one `edges_48` bin (single `Edge`), so each is effectively a single bin. `delete_node` / `update_node_edges` push; `insert` pops `nodes`/`complex`, `persist_new_edge` pops `edges`. `FreeRecord` was removed in favour of three sized POD records (`NodeFreeOffset` / `RelationNodeListFreeOffset` / `BatchOfEdgesFreeOffset`, the last now one edge per record). `MetaRecord.free_edge_count` counts free **edges** (48 B slots): `free_edge_chain` bumps it per freed edge, `persist_new_edge` decrements it on a pop. See [Freelist a bin segregati](../legacy/design_decisions.md#2026-06-03--freelist-a-bin-segregati-per-dimensione-esatta--cancellazione-nodo).
 - **COMPLEX payload stored out-of-line, per-type size class** — for `NodeType::COMPLEX`, the record in `nodes.dat` carries only the header + the two labels; the JSON attributes live in `attributes/{prog_number:020}_{type_label}.json`. The `prog_number` is **zero-padded to `COMPLEX_PROG_DIGITS` (20)**, which makes the record's on-disk size a pure function of `type_label` length — so the exact-size `complex_<size>` bins act as per-type size classes. On COMPLEX delete the sidecar file is removed and its `prog_number` recycled onto `freelist/json_prog.dat`. See the [per-type binning decision](../legacy/design_decisions.md#2026-06-07--bin-per-tipo-per-i-record-complex-via-prog_number-zero-paddato).
@@ -106,7 +106,7 @@ For each inserted node, the file contains two regions in this order (but not con
      8      8    type_count   (uint64_t) → relation lines used in this batch (0..8)
     16      2    batch_size   (uint16_t) → reserved tail bytes, constant 2176
     18      2    free_bytes   (uint16_t) → batch_size - type_count*272
-    20      8    next_offset  (uint64_t) → next batch offset, 0 if last (chaining WIP)
+    20      8    next_offset  (uint64_t) → next batch of this node's chain, 0 if last
     28      8    head         (uint64_t) → batch serial: 1 first, 2,3,... extensions
     36      1    is_deleted   (uint8_t)
    ```
@@ -119,7 +119,9 @@ For each inserted node, the file contains two regions in this order (but not con
    ```
    The total on-disk size of a batch is `sizeof(NodeRelationList) + batch_size = 37 + 2176 = 2213` bytes — constant. Line `i` is at `tail_start + i*272`.
 
-The byte offsets are recorded in the corresponding `NodeIndex` (`offset` → start of `NodeRecord<T>` or `ComplexHeader`, `relation_offset` → start of the `NodeRelationList` header). Since 2026-06-19 a normal `add_edge` **does not move the batch**: `persist_new_edge` updates one relation line (and the header, for a new relation type) in place inside the existing 2213-byte region, so `NodeIndex.relation_offset` is untouched. The batch is only relocated (old → `rel` bin, new written pop-then-append, `relation_offset` patched) by `update_node_edges` during `delete_node`'s inbound cleanup. A node with >8 relation types is rejected (batch chaining via `next_offset` is WIP).
+   A node with more than 8 relation types owns a **chain** of batches (since 2026-08-09): `relation_offset` → the first, each `next_offset` → the following one (0 = last), `head` = 1, 2, 3… A node with `n` types owns `ceil(n / 8)` batches, minimum one. Lines `0..type_count-1` of a batch are used with **no holes**, and a new type always lands in the last batch (or in a fresh one appended to the chain). The batches are allocated independently (`rel` bin pop or append), so they are **not necessarily contiguous** — only `next_offset` defines the order. A walk is bounded by `RELATION_MAX_BATCHES` (4096) since the format carries no checksum. See the [decision](../legacy/design_decisions.md#2026-08-09--relation-batch-chaining-catena-di-batch-via-next_offset).
+
+The byte offsets are recorded in the corresponding `NodeIndex` (`offset` → start of `NodeRecord<T>` or `ComplexHeader`, `relation_offset` → start of the **first** `NodeRelationList` header). Since 2026-06-19 a normal `add_edge` **does not move the batch**: `persist_new_edge` updates one relation line (and the header, for a new relation type) in place inside the existing 2213-byte region, so `NodeIndex.relation_offset` is untouched. That still holds when a new type overflows the last batch: the fresh batch is linked by patching `next_offset`, not by moving anything. Batches are only relocated (old chain → `rel` bin, new chain written pop-then-append, `relation_offset` patched to the first) by `update_node_edges` during `delete_node`'s inbound cleanup.
 
 ### `edges.dat`
 
@@ -145,7 +147,7 @@ Size-segregated free-offset bins, created lazily on the first `delete_node` (via
 |---|---|---|
 | `nodes` | `NodeFreeOffset` (24 B: `idx`, `offset`, `size`) | a freed primitive `NodeRecord` region in `nodes.dat` + its reusable id slot in `nodes.idx`. `size ∈ {1,4,8}` for the current primitives. |
 | `complex` | `NodeFreeOffset` (24 B: `idx`, `offset`, `size`) | a freed COMPLEX record region in `nodes.dat` + its reusable id slot. `size = (22 + COMPLEX_PROG_DIGITS) + 2·L` — constant per `type_label` length, so the bin is a per-type size class. |
-| `rel` | `RelationNodeListFreeOffset` (16 B: `offset`, `size`) | a freed `NodeRelationList` batch (header + fixed tail) in `nodes.dat`. `size` is constant 2213 → a single `rel_2213.dat` bin. |
+| `rel` | `RelationNodeListFreeOffset` (16 B: `offset`, `size`) | a freed `NodeRelationList` batch (header + fixed tail) in `nodes.dat`. `size` is constant 2213 → a single `rel_2213.dat` bin. **One record per batch**: freeing a node whose relation list is a chain of `k` batches pushes `k` records (since 2026-08-09), and a chained batch allocation pops one. |
 | `edges` | `BatchOfEdgesFreeOffset` (24 B: `idx`, `offset`, `size`) | a freed **single** `Edge` in `edges.dat`. `size` is constant `sizeof(Edge)` = 48 → a single `edges_48.dat` bin (since 2026-06-19; edges are no longer contiguous chunks). `idx` is the freed edge's id, ignored on reuse. |
 
 `json_prog.dat` (no `<size>` suffix) is a separate LIFO stack of freed `prog_number`s (`uint64`), pushed on COMPLEX delete and popped by `complex_node_to_record` to keep sidecar numbers dense.
@@ -210,8 +212,10 @@ The exact filename **must** match the `json_file_path` string stored in the on-d
 ### O(1) add ordering inside `persist_new_edge` (since 2026-06-19)
 
 ```
-1. read nodes.idx[node_id].relation_offset       ← batch start (NOT modified below)
-2. read batch header + lines (ifstream)          ← find the line for `type` (≤8 → O(1))
+1. read nodes.idx[node_id].relation_offset       ← chain start (NOT modified below)
+2. walk the batch chain (ifstream), hopping next_offset:
+     stop on the line for `type`, else stop at the LAST batch
+     (O(batches) = O(types/8); ≤8 types → one header read, as before)
 3. allocate the Edge slot:
      - pop edges_48 bin → reuse a freed 48-byte slot (free_edge_count--)
      - else seekp(end) on edges.dat → new_off = tellp()
@@ -219,27 +223,34 @@ The exact filename **must** match the `json_file_path` string stored in the on-d
 5. if relation existed and old_head != 0:
      seekp(old_head + offsetof(Edge, prev_offset)); write new_off   ← relink
 6. update the relation line IN PLACE (nodes.dat in|out):
-     - existing relation: seekp(tail + i*272); write [new_off][old_count+1]
-     - new relation type: write a full line at slot type_count, then
-       rewrite the header with type_count+1 / free_bytes-272
-   (nodes.idx is NEVER touched — the batch does not move)
+     - existing relation: seekp(found_batch + 37 + i*272); write [new_off][old_count+1]
+     - new type, last batch has room: write a full line at slot type_count of the
+       LAST batch, then rewrite its header with type_count+1 / free_bytes-272
+     - new type, last batch FULL (since 2026-08-09): allocate a batch
+         · pop rel_2213 bin → reuse a freed region, else seekp(end)
+         · write header{head+1, type_count=1, next=0} + the line + zeroed tail
+         · seekp(last_batch + offsetof(NodeRelationList, next_offset)); write it
+   (nodes.idx is NEVER touched — no batch ever moves)
 ```
 Weight overwrite (`persist_edge_weight`): `seekp(edge_offset + offsetof(Edge, weight))`, write 8 bytes. No allocation, no growth.
 
 ### Whole-node rewrite inside `update_node_edges` (delete path only, since 2026-06-19)
 
 ```
-1. read nodes.idx[node_id] + old batch
+1. read nodes.idx[node_id] + the old batch CHAIN (collecting every batch offset)
 2. free old edges per-edge: free_edge_chain walks each relation's chain,
    pushes each 48-byte slot → edges_48 bin, zeroes it, free_edge_count++
-   push old batch → rel_2213 bin; zero it
-3. rel_reuse = pop_free_offset(rel bin, 2213)
-     - hit  → seekp(rel_reuse.offset)   ← reuse the just-freed hole in place
-     - miss → seekp(end)                 ← append
-   write the NEW NodeRelationList header
-4. for each relation: append a fresh CONTIGUOUS edge run at EOF of edges.dat,
-   refresh each EdgeRef.offset, write its fixed 272-byte line; pad the tail
-5. patch nodes.idx[node_id].relation_offset in place
+   push EVERY old batch → rel_2213 bin; zero each
+3. n_batches = ceil(types / 8), min 1. FIRST decide where each one lands:
+     - pop rel_2213 bin per batch → reuse a just-freed hole in place
+     - miss → successive EOF slots (EOF + k*2213; probing EOF twice without
+              writing would hand back the same offset)
+   (deciding up front is required: each next_offset must point at the next batch)
+4. for each batch b: seekp(offset[b]); write header{head=b+1, next=offset[b+1] or 0};
+   for each of its ≤8 relations: append a fresh CONTIGUOUS edge run at EOF of
+   edges.dat, refresh each EdgeRef.offset, write its fixed 272-byte line;
+   then pad the tail. dat_out is seeked ONLY at batch boundaries.
+5. patch nodes.idx[node_id].relation_offset in place → offset[0]
 ```
 
 ## Dipendenze
@@ -250,6 +261,8 @@ Weight overwrite (`persist_edge_weight`): `seekp(edge_offset + offsetof(Edge, we
 
 ## Voci legacy collegate
 
+- [Relation-batch chaining: catena di batch via next_offset](../legacy/design_decisions.md#2026-08-09--relation-batch-chaining-catena-di-batch-via-next_offset)
+- [API — Firme relation-batch: relation_batch_header, read_relation_node_list con batch_offsets](../legacy/api_changes.md#2026-08-09--firme-relation-batch-relation_batch_header-read_relation_node_list-con-batch_offsets)
 - [add_edge in O(1): append + relink + in-place line update](../legacy/design_decisions.md#2026-06-19--add_edge-in-o1-append--relink--in-place-line-update)
 - [API — add_edge O(1): EdgeRef.offset + persist_new_edge / persist_edge_weight](../legacy/api_changes.md#2026-06-19--add_edge-o1-edgerefoffset--persist_new_edge--persist_edge_weight)
 - [Relation-list a batch fixed-width + Edge a lista doppiamente concatenata](../legacy/design_decisions.md#2026-06-19--relation-list-a-batch-fixed-width--edge-a-lista-doppiamente-concatenata)
@@ -304,7 +317,7 @@ Weight overwrite (`persist_edge_weight`): `seekp(edge_offset + offsetof(Edge, we
 - `graph_core/io/graph_io.cpp` — `update_node_edges` (delete-path only since 2026-06-19: step 2 frees old edges via `free_edge_chain` + pushes old batch onto `rel` bin; step 3 reuses an exact-size `rel` hole + appends fresh contiguous edge runs + refreshes `EdgeRef.offset`; step 4 patches `relation_offset`).
 - `graph_core/io/graph_io.h` — `write_relation_line` / `read_relation_line` / `pad_relation_tail` / `write_edge_chain_at` (fixed-width batch + edge-chain helpers).
 - `graph_core/struct/domain_struct.h` — `EdgeRef { id, weight, neighbor, offset }` (`offset` = disk position, for O(1) overwrite).
-- `graph_core/odt/node_odt.cpp` — `node_to_relation_list(BaseNode&, node_id, head)` (builds the fixed-width batch header).
+- `graph_core/odt/node_odt.cpp:32` — `relation_batch_header(node_id, lines_in_batch, head, next_offset)` (builds one fixed-width batch header of the chain).
 - `graph_core/io/io_utils.cpp:4` — `write_string` (length-prefixed).
 - `graph_core/struct/pod_struct.h:182,196,209` — `NodeFreeOffset`, `RelationNodeListFreeOffset`, `BatchOfEdgesFreeOffset` (freelist bin records).
 - `graph_core/io/graph_io.h:321,333,355` — `freelist_bin_path`, `write_free_offset`, `pop_free_offset` (bin path + push/pop).

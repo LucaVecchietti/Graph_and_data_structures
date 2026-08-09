@@ -28,8 +28,13 @@ representations diverge safely.
   `static_assert(is_trivially_copyable_v<T>)`.
 - `complex_node_to_record` builds a `ComplexHeader` and assigns the sidecar
   `json_file_path`, reusing a recycled `prog_number` when one is available ([[complex-nodes]]).
-- `node_to_relation_list` builds the [[relation-batch]] header (`type_count`, `free_bytes`,
-  `batch_size`); the fixed-width tail lines are written by [[persistence-io]].
+- `relation_batch_header` builds the header of ONE [[relation-batch]] (`type_count`,
+  `free_bytes`, `batch_size`, `head`, `next_offset`); the fixed-width tail lines are written by
+  [[persistence-io]], which is also the layer that knows the chain layout. It replaced
+  `node_to_relation_list(const BaseNode&, ...)` on 2026-08-09: deriving `type_count` from the
+  whole node is meaningless once a list spans several batches
+  ([[decision-relation-batch-chaining]]). It throws `std::invalid_argument` if asked for more
+  lines than a batch holds.
 - `node_to_node_index` and `edge_to_pod` (the latter takes optional `prev_offset`/`next_offset`).
 - `RelationEntry {name, edge_offset, edge_count}` is the POD-to-domain read helper.
 

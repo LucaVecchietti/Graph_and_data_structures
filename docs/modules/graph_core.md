@@ -6,8 +6,8 @@
 |---|---|
 | Tipo | module |
 | Lingua | en |
-| Ultimo aggiornamento | 2026-06-19 |
-| Commit di riferimento | 0a043f7 |
+| Ultimo aggiornamento | 2026-08-09 |
+| Commit di riferimento | fbc6703 |
 | Mirror | — |
 
 ---
@@ -68,8 +68,9 @@ File + stderr logger. Constructor opens the log file in append mode and throws `
 | `RELATION_TYPE_MAX_SIZE` | `constexpr uint8_t` | `255` | Max length of a relation-type string in `add_edge`. |
 | `RELATION_NAME_MAX` | `constexpr uint8_t` | `255` | Fixed name-field width per relation line (name zero-padded to this). |
 | `RELATION_LINE_SIZE` | `constexpr uint16_t` | `272` | Size of one fixed-width relation line: `8 (edge_offset) + 8 (edge_count) + 1 (name_length) + 255 (name)`. |
-| `RELATION_LINES_PER_BATCH` | `constexpr uint8_t` | `8` | Max relation lines per batch. Exceeding it (a 9th relation type) throws — chaining is WIP. |
+| `RELATION_LINES_PER_BATCH` | `constexpr uint8_t` | `8` | Max relation lines per batch. A 9th relation type spills into a chained batch (since 2026-08-09), it no longer throws. |
 | `RELATION_BATCH_TAIL` | `constexpr uint16_t` | `2176` | Reserved tail bytes per batch (`RELATION_LINE_SIZE * RELATION_LINES_PER_BATCH`). Always written full-width (unused lines zeroed) → every batch is one size class. |
+| `RELATION_MAX_BATCHES` | `constexpr uint32_t` | `4096` | Bound on a relation-chain walk. The format has no checksum, so every walker throws past this many batches rather than looping on a corrupted `next_offset`. Added 2026-08-09. |
 | `DB_PATH` | `constexpr std::string_view` | `"../db"` | Root directory of the on-disk store (relative to the build run dir). |
 | `META_FILE_PATH` | `constexpr std::string_view` | `"../db/meta.dat"` | Path to the meta file. Declared but currently unused — `write_meta`/`read_meta` still compose the path inline from `DB_PATH`. |
 | `JSON_ATTR_META_PATH` | `constexpr std::string_view` | `"../db/attributes/attributes_meta.dat"` | Path to the `JsonMeta` POD used to track unique JSON sidecar names. |
@@ -118,14 +119,16 @@ Header of one **fixed-width relation batch**. 37 bytes; renamed from `RelationNo
 | Field | Type | Purpose |
 |---|---|---|
 | `node_id` | `uint64_t` | Owning node id (back-reference). |
-| `type_count` | `uint64_t` | Number of relation lines actually used in this batch (0..8). |
+| `type_count` | `uint64_t` | Number of relation lines actually used in this batch (0..8). Lines `0..type_count-1` are used with **no holes**: a new relation type always goes into the last batch of the chain, or into a fresh one. |
 | `batch_size` | `uint16_t` | Reserved tail size in bytes — constant `RELATION_BATCH_TAIL` (2176). Reclaimable region = `sizeof(NodeRelationList) + batch_size = 2213`. |
 | `free_bytes` | `uint16_t` | Free tail bytes = `batch_size - type_count * RELATION_LINE_SIZE` (multiple of 272). |
-| `next_offset` | `uint64_t` | Offset of the next batch in `nodes.dat`, or 0 if last. Chaining (>8 types) is WIP. |
+| `next_offset` | `uint64_t` | Offset of the next batch in `nodes.dat`, or 0 if last. **Live since 2026-08-09** ([decision](../legacy/design_decisions.md#2026-08-09--relation-batch-chaining-catena-di-batch-via-next_offset)): batches of one chain are allocated independently, so they are not necessarily contiguous — only this field defines the order. |
 | `head` | `uint64_t` | Batch serial number: 1 = first batch, 2,3,… = extensions. |
 | `is_deleted` | `uint8_t` | 1 if the batch is a freed region, 0 if live. |
 
 The tail holds up to `RELATION_LINES_PER_BATCH` (8) **fixed-width** lines `[uint64_t edge_offset][uint64_t edge_count][uint8_t name_length][char name[255]]`, the first `type_count` used and the rest zero-filled. Line `i` lives at `tail + i * RELATION_LINE_SIZE`, so a single relation's `edge_offset`/`edge_count` can be rewritten in place. Lines are written by `write_relation_node_list` (insert) / `update_node_edges` (edge update) via the shared `write_relation_line` / `pad_relation_tail` helpers; `edge_offset` points at the **head** of that relation's edge linked list.
+
+A node's relation list is a **chain** of these batches (since 2026-08-09): `NodeIndex.relation_offset` → first batch, `next_offset` → the following one (0 = last), `head` numbering them 1, 2, 3… A node with `n` relation types owns `ceil(n / 8)` batches (minimum one, so `relation_offset` always points at a readable header). The layout helpers live in `io/graph_io.h`: `relation_batch_region_size()` (constant 2213), `relation_batch_count(n)` (`ceil(n/8)`, min 1) and `relation_lines_in_batch(n, b)`.
 
 ### `struct Edge` (POD, packed) (`struct/pod_struct.h`)
 48 bytes since 2026-06-19 (was 32 — added the two chain pointers; see [API change](../legacy/api_changes.md#2026-06-19--edge-aggiunti-prev_offset--next_offset-32--48-byte)). Edges of one `(node, relation)` pair form a **doubly-linked list**.
@@ -285,17 +288,17 @@ Thin wrappers selecting `BFSPolicy` / `DFSPolicy`.
 | `void write_node_index(uint64_t record_offset, uint64_t relation_offset, NodeType, std::ofstream&, const MetaRecord&)` | Builds and writes a `NodeIndex` to `nodes.idx`. `idx.id = meta.next_id`. |
 | `void write_complex(const ComplexRecord&, const std::string &json_file_path, std::ostream&)` | Writes the COMPLEX payload to `nodes.dat` (`ComplexHeader` built from current string sizes + two length-prefixed strings: `type_label` and `json_file_path`) and writes `record.json_attributes` to the sidecar file at `JSON_ATTR_PATH / json_file_path`. Takes `std::ostream&` (not `std::ofstream&`) since 2026-06-07 so it can also write **in place** on a `std::fstream` (reuse path). Throws `runtime_error` if the sidecar cannot be opened. |
 | `void read_complex(ComplexRecord&, std::ifstream&)` | Reads the COMPLEX payload (header + two length-prefixed strings) from `nodes.dat` and slurps the sidecar JSON file under `JSON_ATTR_PATH` into `out.json_attributes`. Throws `runtime_error` if the sidecar is missing. Called by the `if constexpr` COMPLEX branch of `read_typed_node<T>`. |
-| `uint64_t persist_new_edge(MetaRecord&, uint64_t node_id, const std::string& type, uint64_t to_id, uint64_t edge_id, int64_t weight)` | **O(1) add of a new edge (since 2026-06-19).** Reads `relation_offset` from `nodes.idx`, finds/creates the relation line in the batch (≤8 → O(1)), allocates the `Edge` slot (pop the 48 B `edges` bin else append to `edges.dat`), writes it with `prev=0, next=` current head, patches the old head's `prev_offset` in place, and updates that one relation line in place (or writes a fresh line + bumps `type_count`/`free_bytes` in the header for a new relation type). The batch never moves → `nodes.idx` untouched. Returns the new edge's `edges.dat` offset. Throws if the batch is full (8 types — chaining WIP). |
+| `uint64_t persist_new_edge(MetaRecord&, uint64_t node_id, const std::string& type, uint64_t to_id, uint64_t edge_id, int64_t weight)` | **O(1) add of a new edge (since 2026-06-19).** Reads `relation_offset` from `nodes.idx`, **walks the batch chain** to find the relation line (O(batches) = O(types / 8); the walk stops at the last batch, where a new type goes), allocates the `Edge` slot (pop the 48 B `edges` bin else append to `edges.dat`), writes it with `prev=0, next=` current head, patches the old head's `prev_offset` in place, and updates that one relation line in place — or, for a new relation type, writes a fresh line at slot `type_count` of the **last** batch and bumps `type_count`/`free_bytes` in its header. If that batch is full, since 2026-08-09 it **chains a fresh batch**: allocated from the `rel` bin (else appended), written whole (header `head+1` + the line + zeroed tail), and linked in by patching only the previous batch's `next_offset` (8 bytes). Batches never move → `nodes.idx` untouched in every case. Returns the new edge's `edges.dat` offset. |
 | `void persist_edge_weight(uint64_t edge_offset, int64_t weight)` | **O(1) weight overwrite (since 2026-06-19):** seek `edge_offset + offsetof(Edge, weight)` in `edges.dat`, write 8 bytes. No allocation/relink/growth. |
-| `void update_node_edges(BaseNode&, MetaRecord&, uint64_t node_id)` | Whole-node rewrite of an already-on-disk node's relations. **Since 2026-06-19 used ONLY by `Graph::delete_node`'s inbound cleanup** (`add_edge` now takes the O(1) `persist_*` path). Step 2 frees the OLD edges by chain-walk (`free_edge_chain`, per-edge 48 B slots onto the `edges` bin, zeroed) and pushes the old batch onto the `rel` bin (hence the non-`const` `MetaRecord&`). Step 3 reuses an exact-size `rel` hole in place (pop-then-append, streams `in\|out`) and appends fresh contiguous edge runs at EOF, **refreshing each `EdgeRef.offset`** as it writes (so a later O(1) overwrite seeks correctly after relocation). Step 4 patches `NodeIndex.relation_offset` in place. Throws if >8 relation types. |
+| `void update_node_edges(BaseNode&, MetaRecord&, uint64_t node_id)` | Whole-node rewrite of an already-on-disk node's relations. **Since 2026-06-19 used ONLY by `Graph::delete_node`'s inbound cleanup** (`add_edge` now takes the O(1) `persist_*` path). Step 2 frees the OLD edges by chain-walk (`free_edge_chain`, per-edge 48 B slots onto the `edges` bin, zeroed) and pushes **every batch of the old chain** onto the `rel` bin (offsets collected via `read_relation_node_list`'s out-param; hence the non-`const` `MetaRecord&`). Step 3 writes a fresh chain of `ceil(types / 8)` batches: it first decides where **each** batch lands (one `rel` pop per batch, else successive EOF slots — probing EOF twice without writing would hand back the same offset), then writes them, seeking only at batch boundaries; edge runs are appended fresh at EOF, **refreshing each `EdgeRef.offset`** as it writes (so a later O(1) overwrite seeks correctly after relocation). Step 4 patches `NodeIndex.relation_offset` to the **first** batch in place. |
 | `NodeIndex read_node_index(std::ifstream&)` | Reads one `NodeIndex` from the current stream position. |
-| `std::vector<RelationEntry> read_relation_node_list(std::ifstream&)` | Reads the `NodeRelationList` header + its `type_count` fixed-width lines (`read_relation_line`), then skips the unused tail (`free_bytes`) to land at the batch end. |
+| `std::vector<RelationEntry> read_relation_node_list(std::ifstream&, std::vector<uint64_t>* batch_offsets = nullptr)` | Reads the whole relation **chain** from the current position: per batch, the `NodeRelationList` header + its `type_count` fixed-width lines (`read_relation_line`), then hops to `next_offset` until 0, bounded by `RELATION_MAX_BATCHES` (a corrupted offset throws instead of looping). Lands at the end of the last batch region. `batch_offsets`, if given, receives the offset of every batch visited — needed by the callers that must reclaim the list, since `NodeIndex` only records where the chain starts. Chain-aware since 2026-08-09. |
 | `void write_meta(const MetaRecord&)` | Truncates and rewrites `meta.dat`. |
 | `MetaRecord read_meta()` | Reads `meta.dat`. |
 | `void write_json_attributes_meta(const JsonMeta&)` | Truncates and rewrites `db/attributes/attributes_meta.dat`. |
 | `JsonMeta read_json_attributes_meta()` | Reads the `JsonMeta` POD; lazy-creates the file with `prog_number = 0` if missing. Throws on empty/unreadable file. |
 | `template<T> uint64_t write_node_record(const Node<T>&)` | Appends a `NodeRecord<T>` to `nodes.dat`. Returns the offset. |
-| `template<T> uint64_t write_relation_node_list(const Node<T>&, uint64_t node_id, std::ofstream& out)` | Appends a `NodeRelationList` batch to `out` (already-open `nodes.dat`): header (via `node_to_relation_list`) + the used fixed-width lines + zero-filled tail (`pad_relation_tail`), full 2213-byte region. Writes each relation's edges to `edges.dat` as a doubly-linked chain (`write_edge_chain_at`). For a fresh node `neighborgs` is empty → an empty batch. Returns the batch offset. Throws if >8 relation types. |
+| `template<T> uint64_t write_relation_node_list(const Node<T>&, uint64_t node_id, std::ofstream& out)` | Appends the node's whole relation chain — `ceil(types / 8)` batches, minimum one — to `out` (already-open `nodes.dat`). Per batch: header (via `relation_batch_header`) + the used fixed-width lines + zero-filled tail (`pad_relation_tail`), full 2213-byte region. Since the batches land back-to-back here, every `next_offset` is known up front (`first + (b+1) * 2213`) and needs no back-patching. Writes each relation's edges to `edges.dat` as a doubly-linked chain (`write_edge_chain_at`). For a fresh node `neighborgs` is empty → one empty batch. Returns the offset of the **first** batch. |
 | `template<T> void write_node(const Node<T>&, const MetaRecord&)` | Composes the three writes for a full node persist (record + relations + index). Dispatches the record write via `if constexpr (node_type_of_v<T> == NodeType::COMPLEX)`: primitives go through `node_to_record` + `write_pod`, `COMPLEX` goes through `complex_node_to_record` + `write_complex`. Compiles since 2026-05-30 ([BUG-010](../legacy/known_bugs.md) fixed). |
 | `BaseNode* read_node(uint64_t id)` | Reads `NodeIndex` at `id * sizeof(NodeIndex)` in `nodes.idx`, dispatches on `type_id` to the right `read_typed_node<T>` (incl. `COMPLEX` → `read_typed_node<ComplexRecord>`). A `TOMBSTONE` tag throws `"node id N is tombstoned (deleted)"`; an unknown tag throws `"Unknown NodeType"`. |
 | `template<T> NodeRecord<T> read_node_record(std::ifstream&)` | Reads one `NodeRecord<T>`. |
@@ -327,7 +330,7 @@ Thin wrappers selecting `BFSPolicy` / `DFSPolicy`.
 |---|---|
 | `template<T> NodeRecord<T> node_to_record(const Node<T>&)` (`node_odt.h:22`) | Copies `node.data` into a `NodeRecord<T>`. Asserts POD. |
 | `NodeRecord<ComplexHeader> complex_node_to_record(const Node<ComplexRecord>&, std::string &json_file_path)` (`node_odt.cpp`) | COMPLEX-specific ODT bridge. Decides the `prog_number`: pops a recycled one from the json free list, else consumes `JsonMeta.prog_number` and persists `+1` (BUG-014 fix). Composes the out-param `json_file_path` as `{prog_number:020}_{type_label}.json` — **zero-padded to `COMPLEX_PROG_DIGITS`** so the record size is constant per type. Builds a `ComplexHeader` from `type_label.size()` and `json_file_path.size()` and returns it wrapped in `NodeRecord<ComplexHeader>` (currently unused by `write_node`, which rebuilds the header inside `write_complex` from the same inputs). |
-| `NodeRelationList node_to_relation_list(const BaseNode&, uint64_t node_id, uint64_t head = 1)` (`node_odt.cpp`) | Builds a fixed-width batch header: `node_id`, `type_count = neighborgs.size()`, `batch_size = RELATION_BATCH_TAIL` (constant), `free_bytes = batch_size - type_count*272`, `next_offset = 0`, `head`, `is_deleted = 0`. The tail lines are written separately by `write_relation_node_list` / `update_node_edges`. Signature gained `node_id`/`head` on 2026-06-19 — see [API change](../legacy/api_changes.md#2026-06-19--firme-odt-edge_to_pod-prevnext-node_to_relation_list-node_id-head). |
+| `NodeRelationList relation_batch_header(uint64_t node_id, uint64_t lines_in_batch, uint64_t head = 1, uint64_t next_offset = 0)` (`node_odt.cpp`) | Builds the header of **one** batch of the chain: `node_id`, `type_count = lines_in_batch`, `batch_size = RELATION_BATCH_TAIL` (constant), `free_bytes = batch_size - lines_in_batch*272`, `next_offset`, `head`, `is_deleted = 0`. Throws `std::invalid_argument` if `lines_in_batch > RELATION_LINES_PER_BATCH` (a caller bug: the overflow belongs in the next batch). The tail lines are written separately by `write_relation_node_list` / `update_node_edges`, which are also the ones that know the chain layout. Replaced `node_to_relation_list(const BaseNode&, node_id, head)` on 2026-08-09 — see [API change](../legacy/api_changes.md#2026-08-09--firme-relation-batch-relation_batch_header-read_relation_node_list-con-batch_offsets). |
 | `NodeIndex node_to_node_index(uint64_t id, uint64_t record_offset, uint64_t relation_offset)` (`node_odt.cpp`) | Builder for `NodeIndex` (currently unused — `write_node_index` builds the struct inline). |
 | `Edge edge_to_pod(uint64_t idx, uint64_t from, uint64_t to, uint64_t weight, uint64_t prev_offset = 0, uint64_t next_offset = 0)` (`edge_odt.h`) | Plain struct-builder for `Edge`. Gained the two optional chain offsets on 2026-06-19. |
 
@@ -374,6 +377,28 @@ nodes.idx                       nodes.dat                                edges.d
                                 └─────────────────────────────┘  edge_off → chain head
 ```
 
+A node with more than 8 relation types owns a **chain** of batches (`relation_offset` → the
+first, `next_offset` → the following one). The batches are allocated independently, so they
+are not necessarily adjacent in `nodes.dat`:
+
+```
+nodes.idx                nodes.dat (offsets not necessarily in order)
+┌──────────────┐         ┌───────────────────────────────┐
+│ NodeIndex #8 │         │ batch head=1  type_count=8     │  lines rel_0..rel_7
+│  relation_   │ ──────▶ │  next_offset ──────────────┐   │
+│  offset      │         ├────────────────────────────┼───┤
+└──────────────┘         │ ...other nodes' regions... │   │
+                         ├────────────────────────────▼───┤
+                         │ batch head=2  type_count=8     │  lines rel_8..rel_15
+                         │  next_offset ──────────────┐   │
+                         ├────────────────────────────┼───┤
+                         │ ...                        │   │
+                         ├────────────────────────────▼───┤
+                         │ batch head=3  type_count=1     │  line rel_16
+                         │  next_offset = 0  (last)       │  + 7 zeroed lines
+                         └───────────────────────────────┘
+```
+
 ## Dipendenze
 
 **IN** (who depends on `graph_core`):
@@ -386,6 +411,8 @@ No third-party libraries. No dependency on `data_tructures/`.
 
 ## Voci legacy collegate
 
+- [Relation-batch chaining: catena di batch via next_offset](../legacy/design_decisions.md#2026-08-09--relation-batch-chaining-catena-di-batch-via-next_offset)
+- [API — Firme relation-batch: relation_batch_header, read_relation_node_list con batch_offsets](../legacy/api_changes.md#2026-08-09--firme-relation-batch-relation_batch_header-read_relation_node_list-con-batch_offsets)
 - [add_edge in O(1): append + relink + in-place line update](../legacy/design_decisions.md#2026-06-19--add_edge-in-o1-append--relink--in-place-line-update)
 - [API — add_edge O(1): EdgeRef.offset + persist_new_edge / persist_edge_weight](../legacy/api_changes.md#2026-06-19--add_edge-o1-edgerefoffset--persist_new_edge--persist_edge_weight)
 - [Relation-list a batch fixed-width + Edge a lista doppiamente concatenata](../legacy/design_decisions.md#2026-06-19--relation-list-a-batch-fixed-width--edge-a-lista-doppiamente-concatenata)
@@ -455,7 +482,7 @@ No third-party libraries. No dependency on `data_tructures/`.
 - `graph_core/struct/pod_struct.h:41` — `NodeIndex`.
 - `graph_core/struct/pod_struct.h` — `NodeRelationList` (37-byte header + fixed 2176-byte tail = 2213-byte batch; renamed from `RelationNodeList` 2026-06-19).
 - `graph_core/struct/pod_struct.h` — `Edge` (48 bytes: `id`, `weight`, `to_node`, `from_node`, `prev_offset`, `next_offset`).
-- `graph_core/costants.h` — `RELATION_NAME_MAX`, `RELATION_LINE_SIZE`, `RELATION_LINES_PER_BATCH`, `RELATION_BATCH_TAIL`.
+- `graph_core/costants.h` — `RELATION_NAME_MAX`, `RELATION_LINE_SIZE`, `RELATION_LINES_PER_BATCH`, `RELATION_BATCH_TAIL`, `RELATION_MAX_BATCHES`.
 - `graph_core/struct/pod_struct.h:134` — `ComplexHeader` (field `json_file_path_size`).
 - `graph_core/struct/pod_struct.h:148` — `JsonMeta`.
 - `graph_core/struct/functions_policies.h:12` — `BFSPolicy`.
@@ -470,7 +497,10 @@ No third-party libraries. No dependency on `data_tructures/`.
 - `graph_core/io/graph_io.cpp:120` — `read_node` (type dispatch — COMPLEX case routes to `read_typed_node<ComplexRecord>`).
 - `graph_core/io/graph_io.cpp:172,190` — `write_json_attributes_meta`, `read_json_attributes_meta`.
 - `graph_core/io/graph_io.cpp:247` — `update_node_edges`.
-- `graph_core/odt/node_odt.cpp:27` — `node_to_relation_list` (computes `batch_size`).
+- `graph_core/odt/node_odt.cpp:32` — `relation_batch_header` (per-batch header of the chain; replaced `node_to_relation_list` 2026-08-09).
+- `graph_core/io/graph_io.h:146` — `relation_batch_region_size` / `relation_batch_count` / `relation_lines_in_batch` (chain layout helpers).
+- `graph_core/io/graph_io.cpp:164` — `read_relation_node_list` (walks `next_offset`, optional `batch_offsets` out-param).
+- `graph_core/io/graph_io.cpp:472` — `persist_new_edge`, chained-batch branch (allocate + link via one 8-byte `next_offset` write).
 - `graph_core/odt/node_odt.cpp:55` — `complex_node_to_record`.
 - `graph_core/graph.h:43` — `insert<T>` reuse path (`pop_free_offset` + `write_node_in_freed_slot`).
 - `graph_core/graph.h:117` — `delete_node` declaration.

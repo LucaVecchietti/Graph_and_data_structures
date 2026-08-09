@@ -56,7 +56,24 @@ void write_complex(const ComplexRecord &record, const std::string &json_file_pat
 void read_complex(ComplexRecord &out, std::ifstream &dat_in);
 
 NodeIndex                    read_node_index(std::ifstream &in);
-std::vector<RelationEntry>   read_relation_node_list(std::ifstream &in);
+
+/**
+ * Reads a node's WHOLE relation list — the chain of fixed-width batches starting at
+ * the stream's current get position (typically NodeIndex.relation_offset) — and
+ * returns the relation entries of every batch, in chain order.
+ *
+ * Each batch contributes its first `type_count` lines; the walk then hops to
+ * `next_offset` until it hits 0 (the last batch), bounded by RELATION_MAX_BATCHES so
+ * a corrupted offset throws instead of looping forever. On return the get position
+ * sits at the end of the LAST batch region of the chain.
+ *
+ * @param batch_offsets Optional out-param: receives the nodes.dat offset of every
+ *        batch visited, in chain order. Callers that must RECLAIM the list (delete /
+ *        whole-node rewrite) need this — one freelist record per batch region — since
+ *        NodeIndex only records where the chain starts.
+ */
+std::vector<RelationEntry>   read_relation_node_list(std::ifstream &in,
+                                                     std::vector<uint64_t> *batch_offsets = nullptr);
 
 void            write_meta(const MetaRecord &meta);
 MetaRecord      read_meta();
@@ -67,18 +84,21 @@ void            update_node_edges(BaseNode &node, MetaRecord &meta, uint64_t nod
 
 /**
  * O(1) persist of a brand-new edge (start --type--> to_id). The node's relation
- * batch never moves, so NodeIndex is untouched. Steps:
- *   1. read relation_offset from nodes.idx, then the batch header + lines to find
- *      the line for `type` (<= 8 lines → O(1));
+ * batches never move, so NodeIndex is untouched. Steps:
+ *   1. read relation_offset from nodes.idx, then walk the batch chain to find the
+ *      line for `type` (O(number of batches), i.e. O(relation types / 8));
  *   2. allocate the new Edge slot (pop the single-edge `edges` freelist bin, else
  *      append at EOF of edges.dat);
  *   3. write the Edge with prev=0, next=current chain head;
  *   4. patch the OLD head's prev_offset in place (if the relation already existed);
  *   5. update that relation's fixed-width line in place (edge_offset = new head,
  *      edge_count + 1) — or, for a brand-new relation type, write a fresh line at
- *      slot `type_count` and bump type_count / shrink free_bytes in the header.
- * Throws if the relation type is new and the batch is full (8 types / no free
- * line) — batch chaining via next_offset is still WIP.
+ *      slot `type_count` of the LAST batch and bump type_count / shrink free_bytes
+ *      in its header.
+ * If the last batch is full (8 lines), a fresh batch is allocated (exact-size `rel`
+ * bin pop, else append), written with the new line, and linked in by patching only
+ * the previous batch's next_offset — so the 8-relation-types cap no longer applies
+ * and nodes.idx still never changes.
  * @return the byte offset of the newly-written Edge in edges.dat (store it in EdgeRef.offset).
  */
 uint64_t        persist_new_edge(MetaRecord &meta, uint64_t node_id, const std::string &type,
@@ -112,6 +132,44 @@ std::unordered_map<int, std::unordered_set<int>> build_inbound_index(uint64_t ne
 // A relation batch tail is RELATION_BATCH_TAIL bytes of fixed-width lines (see
 // pod_struct.h / costants.h). These helpers keep the on-disk line layout in one
 // place so the read and write paths cannot drift.
+//
+// A node's relation list is a CHAIN of batches: NodeIndex.relation_offset points at
+// the first one, each header's next_offset at the following one (0 = last), and `head`
+// numbers them 1, 2, 3... Batches of one chain need NOT be contiguous in nodes.dat —
+// each is allocated on its own (freelist pop or append), which is what keeps adding a
+// relation type an in-place write that never moves the rest of the list.
+
+/**
+ * On-disk size of ONE batch region: the POD header plus its full fixed tail. Constant
+ * (2213 bytes), which is why the `rel` freelist collapses to a single size class.
+ */
+inline constexpr uint64_t relation_batch_region_size()
+{
+    return sizeof(NodeRelationList) + RELATION_BATCH_TAIL;
+}
+
+/**
+ * How many batches a node with `type_count` relation types needs: ceil(n / 8), and
+ * always at least ONE — a node with no relations still owns an empty batch, so
+ * NodeIndex.relation_offset always points at a readable header.
+ */
+inline uint64_t relation_batch_count(uint64_t type_count)
+{
+    if (type_count == 0) return 1;
+    return (type_count + RELATION_LINES_PER_BATCH - 1) / RELATION_LINES_PER_BATCH;
+}
+
+/**
+ * Lines used by batch index `b` (0-based) of a chain holding `type_count` types:
+ * RELATION_LINES_PER_BATCH for every batch but the last, the remainder for the last.
+ */
+inline uint64_t relation_lines_in_batch(uint64_t type_count, uint64_t b)
+{
+    uint64_t written = b * RELATION_LINES_PER_BATCH;
+    if (written >= type_count) return 0;
+    uint64_t left = type_count - written;
+    return left < RELATION_LINES_PER_BATCH ? left : RELATION_LINES_PER_BATCH;
+}
 
 /**
  * Writes one fixed-width relation line (RELATION_LINE_SIZE bytes) at the stream's
@@ -200,46 +258,56 @@ uint64_t write_node_record(const Node<T> &node)
 
 /**
  * Writes the adjacency list of a Node to nodes.dat (out) and edges to edges.dat.
- * For each relation type: writes [name][edge_offset][edge_count] after the POD header.
- * Returns the byte offset where the relation list was written.
- * 
- * Known limitation: currently only supports a single batch of relations (up to 8 types). If the node has more than 8 relation types, an exception is thrown.
- * Future work: implement batch chaining via next_offset to support more than 8 relation types.
+ * For each relation type: writes [edge_offset][edge_count][name] after the POD header.
+ * Returns the byte offset of the FIRST batch (what goes into NodeIndex.relation_offset).
+ *
+ * More than RELATION_LINES_PER_BATCH relation types spill into further batches,
+ * chained via next_offset (head 1 -> 2 -> 3 ...). Because this writer appends the
+ * whole chain back-to-back at the stream's put position, batch b+1 starts exactly
+ * relation_batch_region_size() bytes after batch b — so every next_offset is known
+ * up front and no back-patching is needed.
  */
 template <typename T>
 uint64_t write_relation_node_list(const Node<T> &node, uint64_t node_id, std::ofstream &out)
 {
-    NodeRelationList list = node_to_relation_list(node, node_id);
+    const uint64_t region    = relation_batch_region_size();
+    const uint64_t n_types   = static_cast<uint64_t>(node.neighborgs.size());
+    const uint64_t n_batches = relation_batch_count(n_types);
 
-    // Single-batch only for now: chaining a 2nd batch via next_offset is WIP.
-    if (list.type_count > RELATION_LINES_PER_BATCH)
-        throw std::runtime_error("write_relation_node_list: node " + std::to_string(node_id)
-                                 + " has more than " + std::to_string(RELATION_LINES_PER_BATCH)
-                                 + " relation types (batch chaining not yet implemented).");
-
-    uint64_t offset = out.tellp();
-    write_pod(list, out);
+    const uint64_t first_offset = static_cast<uint64_t>(out.tellp());
 
     std::ofstream edges_out(std::filesystem::path(DB_PATH) / "edges.dat", std::ios::binary | std::ios::app);
     if (!edges_out) throw std::runtime_error("Failed to open edges file for writing.");
 
     // Used by the initial node insert, when node.neighborgs is normally empty
-    // (edges are attached later via add_edge). Each relation's edges are written
-    // as a doubly-linked contiguous run; the line stores the head edge offset.
-    uint64_t used = 0;
-    for (const auto &[rel_type, neighbors] : node.neighborgs)
+    // (edges are attached later via add_edge) — then this writes one empty batch.
+    // Each relation's edges are written as a doubly-linked contiguous run; the line
+    // stores the head edge offset.
+    auto rel_it = node.neighborgs.begin();
+    for (uint64_t b = 0; b < n_batches; ++b)
     {
-        edges_out.seekp(0, std::ios::end);
-        uint64_t edge_offset = static_cast<uint64_t>(edges_out.tellp());
-        write_edge_chain_at(edges_out, edge_offset, node_id, neighbors);
-        write_relation_line(out, neighbors.empty() ? 0 : edge_offset,
-                            static_cast<uint64_t>(neighbors.size()), rel_type);
-        ++used;
+        const uint64_t lines = relation_lines_in_batch(n_types, b);
+        const uint64_t next  = (b + 1 < n_batches) ? first_offset + (b + 1) * region : 0;
+
+        write_pod(relation_batch_header(node_id, lines, b + 1, next), out);
+
+        for (uint64_t i = 0; i < lines; ++i, ++rel_it)
+        {
+            const auto &rel_type  = rel_it->first;
+            const auto &neighbors = rel_it->second;
+
+            edges_out.seekp(0, std::ios::end);
+            uint64_t edge_offset = static_cast<uint64_t>(edges_out.tellp());
+            write_edge_chain_at(edges_out, edge_offset, node_id, neighbors);
+            write_relation_line(out, neighbors.empty() ? 0 : edge_offset,
+                                static_cast<uint64_t>(neighbors.size()), rel_type);
+        }
+
+        // Pad the rest of the fixed tail so every batch region is exactly 2213 bytes.
+        pad_relation_tail(out, lines);
     }
 
-    // Pad the rest of the fixed tail so the batch region is always 2213 bytes.
-    pad_relation_tail(out, used);
-    return offset;
+    return first_offset;
 }
 
 /**

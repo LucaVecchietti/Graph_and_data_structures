@@ -10,7 +10,7 @@ status: active
 ---
 
 # Fixed-width relation batch
-> NodeRelationList: a constant 2213-byte batch of up to 8 relation lines, addressable in place.
+> NodeRelationList: a constant 2213-byte batch of up to 8 relation lines, addressable in place and chainable.
 
 ## Responsibility
 
@@ -32,19 +32,27 @@ Store a node's relations in a constant-size, fixed-width batch so that one relat
 - Line `i` sits at `tail + i * 272`, so updating one relation is an O(1) seek-write. This is
   the foundation of the O(1) `add_edge` in [[decision-o1-add-edge]].
 - Header fields: `node_id`, `type_count` (0..8 in use), `batch_size` (2176), `free_bytes`,
-  `next_offset` (intended chain to a second batch), `head` (serial 1, 2, 3...), `is_deleted`.
+  `next_offset` (next batch of this node's chain, 0 if last), `head` (serial 1, 2, 3...),
+  `is_deleted`.
 - Because the region size is constant, the `rel` [[freelist]] needs exactly one size class.
+- A node with more than 8 relation types owns a **chain** of batches: `ceil(types / 8)` of
+  them, linked by `next_offset`. The batches are allocated independently, so they are not
+  necessarily contiguous in `nodes.dat`. See [[decision-relation-batch-chaining]].
 
 ## Contracts and constraints
 
-- Unused lines are zero-filled, so every node pays ~2.2 KB on disk regardless of fanout.
-  That is the deliberate price of in-place line addressing.
-- More than 8 relation types per node throws: batch chaining via `next_offset` is declared
-  in the format but not implemented. See [[eight-relation-types-cap]].
+- Unused lines are zero-filled, so every node pays ~2.2 KB on disk per started group of 8
+  relation types, regardless of fanout. That is the deliberate price of in-place line
+  addressing.
+- Lines `0..type_count-1` of a batch are used, with no holes: a new relation type goes into
+  the last batch of the chain, or into a fresh one appended to it.
+- The layout helpers `relation_batch_region_size()` (2213), `relation_batch_count(n)` and
+  `relation_lines_in_batch(n, b)` in `io/graph_io.h` are the only place that computes the
+  chain geometry.
 
 ## Links
 
 - part of [[pod-layout]] - one of the on-disk records
 - relates to [[edge-record]] - each line points at the head of an edge chain
 - implements [[decision-fixed-width-relation-batch]] - the format this decision froze
-- causes [[eight-relation-types-cap]] - the 8-line tail is where the cap comes from
+- implements [[decision-relation-batch-chaining]] - why a batch is one link of a chain

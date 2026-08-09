@@ -49,7 +49,9 @@ costing O(deg) per edge. This decision cashes in the format.
 - `free_edge_count` now counts individual 48-byte edge slots, not chunks.
 - **Invariant to respect:** `EdgeRef.offset` in RAM must stay aligned with disk. It holds only
   as long as `update_node_edges` remains the sole code path that relocates edges.
-- Residual boundary: a full batch still throws - see [[eight-relation-types-cap]].
+- Residual boundary at the time: a full batch threw. Lifted on 2026-08-09 by
+  [[decision-relation-batch-chaining]], which allocates and links a further batch - at the
+  cost of making the line lookup O(batches) rather than strictly O(1).
 
 ## Links
 
@@ -57,4 +59,4 @@ costing O(deg) per edge. This decision cashes in the format.
 - implemented by [[graph-class]] - `add_edge` dispatches between the two paths
 - implemented by [[persistence-io]] - `persist_new_edge` and `persist_edge_weight`
 - depends on [[edge-record]] - the O(1) splice into the chain
-- relates to [[eight-relation-types-cap]] - the one case that still throws
+- relates to [[decision-relation-batch-chaining]] - what happens when the batch it writes into is full

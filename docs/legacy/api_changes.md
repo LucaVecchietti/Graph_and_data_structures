@@ -6,14 +6,15 @@
 |---|---|
 | Tipo | legacy-api |
 | Lingua | en |
-| Ultimo aggiornamento | 2026-06-19 |
-| Commit di riferimento | 0a043f7 |
+| Ultimo aggiornamento | 2026-08-09 |
+| Commit di riferimento | fbc6703 |
 | Mirror | — |
 
 ---
 
 ## Indice
 
+- [2026-08-09 — Firme relation-batch: `relation_batch_header`, `read_relation_node_list` con `batch_offsets`](#2026-08-09--firme-relation-batch-relation_batch_header-read_relation_node_list-con-batch_offsets)
 - [2026-06-19 — add_edge O(1): `EdgeRef.offset` + `persist_new_edge` / `persist_edge_weight`](#2026-06-19--add_edge-o1-edgerefoffset--persist_new_edge--persist_edge_weight)
 - [2026-06-19 — `RelationNodeList` → `NodeRelationList`: header esteso + tail fixed-width](#2026-06-19--relationnodelist--noderelationlist-header-esteso--tail-fixed-width)
 - [2026-06-19 — `Edge`: aggiunti `prev_offset` / `next_offset` (32 → 48 byte)](#2026-06-19--edge-aggiunti-prev_offset--next_offset-32--48-byte)
@@ -45,6 +46,50 @@
 > Nota: il progetto non ha ancora consumatori esterni, quindi "API pubblica" qui significa: classe `Graph`, POD persistiti su disco (`pod_struct.h`), funzioni esposte nei header pubblici (`io/graph_io.h`, `io/io_utils.h`, `odt/*.h`, `struct/*.h`).
 >
 > Le modifiche ai POD persistiti sono particolarmente sensibili perché rompono il formato su disco — andranno tracciate qui anche se prive di consumatori esterni.
+
+---
+
+### 2026-08-09 — Firme relation-batch: `relation_batch_header`, `read_relation_node_list` con `batch_offsets`
+
+- **Motivazione:** implementare il chaining dei batch di relazione (lift del cap di 8 tipi per nodo). Vedi [decisione](design_decisions.md#2026-08-09--relation-batch-chaining-catena-di-batch-via-next_offset). Le due firme toccate assumevano entrambe **un solo batch**: l'ODT derivava `type_count` dal nodo intero (con underflow di `free_bytes` oltre le 8 relazioni), e il read path leggeva un header e si fermava.
+- **Before:**
+  ```cpp
+  // odt/node_odt.h — header derivato dal nodo, sempre next_offset = 0
+  NodeRelationList node_to_relation_list(const BaseNode &node, uint64_t node_id, uint64_t head = 1);
+
+  // io/graph_io.h — legge UN batch, nessun modo di sapere dove sono i successivi
+  std::vector<RelationEntry> read_relation_node_list(std::ifstream &in);
+
+  // i tre percorsi di scrittura lanciavano oltre le 8 righe
+  if (list.type_count > RELATION_LINES_PER_BATCH)
+      throw std::runtime_error("... batch chaining not yet implemented.");
+  ```
+- **After:**
+  ```cpp
+  // odt/node_odt.h — costruttore di UN batch della catena: valori per-batch espliciti
+  NodeRelationList relation_batch_header(uint64_t node_id, uint64_t lines_in_batch,
+                                        uint64_t head = 1, uint64_t next_offset = 0);
+  // lancia std::invalid_argument se lines_in_batch > RELATION_LINES_PER_BATCH
+
+  // io/graph_io.h — cammina next_offset su tutta la catena; out-param opzionale
+  // con l'offset di ogni batch visitato (serve per reclamarli tutti sul bin rel)
+  std::vector<RelationEntry> read_relation_node_list(std::ifstream &in,
+                                                     std::vector<uint64_t> *batch_offsets = nullptr);
+
+  // io/graph_io.h — nuovi helper di layout della catena
+  inline constexpr uint64_t relation_batch_region_size();                        // 2213
+  inline uint64_t relation_batch_count(uint64_t type_count);                     // ceil(n/8), min 1
+  inline uint64_t relation_lines_in_batch(uint64_t type_count, uint64_t b);      // righe del batch b
+
+  // costants.h — bound del walk su una catena (formato senza checksum)
+  constexpr uint32_t RELATION_MAX_BATCHES = 4096;
+  ```
+- **Note di migrazione:**
+  - `node_to_relation_list` **non esiste più**: chi costruiva l'header passando il nodo deve ora dire quante righe mette in *quel* batch e a chi punta (`relation_batch_header`). I due soli chiamanti in-tree (`write_relation_node_list`, `update_node_edges`) sono stati riscritti per iterare sui batch.
+  - `read_relation_node_list` è compatibile con i chiamanti esistenti (il parametro è opzionale) e ora restituisce le righe di **tutta** la catena: `read_typed_node` e `build_inbound_index` non hanno richiesto modifiche. Chi **libera** la lista (`delete_node_from_disk`, `update_node_edges`) deve passare `&batch_offsets` e pushare un `RelationNodeListFreeOffset` per batch, non uno solo.
+  - Chi calcolava la size della regione come `sizeof(NodeRelationList) + header.batch_size` letta dal primo header può usare `relation_batch_region_size()`: è costante e uguale per ogni batch.
+  - Comportamento: i `throw` "batch chaining not yet implemented" di `write_relation_node_list`, `persist_new_edge` e `update_node_edges` sono **rimossi**. Nessun cambio di layout on-disk → un `db/` esistente resta leggibile (`next_offset = 0` = catena di 1).
+- **Riferimenti:** commit `fbc6703` (working tree, branch `update/write_relation_node_list`). `graph_core/odt/node_odt.h:46` + `graph_core/odt/node_odt.cpp:32` (`relation_batch_header`), `graph_core/io/graph_io.h:75` (decl del read path), `graph_core/io/graph_io.h:146` (helper di batch), `graph_core/io/graph_io.cpp:164` (`read_relation_node_list`), `graph_core/costants.h:26` (`RELATION_MAX_BATCHES`).
 
 ---
 

@@ -36,7 +36,7 @@ Three-layer separation inside `graph_core/`, deliberately kept apart so RAM and 
 
 1. **Domain** (`struct/domain_struct.h`) — `BaseNode` (type-erased, holds the adjacency map) + `template<class T> Node : BaseNode` (typed payload). Adjacency is `unordered_map<string relation, unordered_map<int neighbor_id, pair<int weight, BaseNode*>>>`.
 2. **POD** (`struct/pod_struct.h`) — packed (`#pragma pack(push,1)`) on-disk records: `NodeIndex`, `NodeRecord<T>`, `NodeRelationList` (fixed-width batch), `Edge` (with `prev_offset`/`next_offset` chain), `MetaRecord`, plus the WIP `ComplexHeader`. No magic, no version, no checksum — the on-disk format is host-byte-order-dependent and ABI-fragile.
-3. **ODT** (`odt/`) — Object Data Transfer: the only layer allowed to convert between (1) and (2). `node_to_record`, `node_to_relation_list`, `reconstruct_neighbors`, `edge_to_pod`.
+3. **ODT** (`odt/`) — Object Data Transfer: the only layer allowed to convert between (1) and (2). `node_to_record`, `relation_batch_header`, `complex_node_to_record`, `edge_to_pod`.
 
 `Graph` (`graph.h/cpp`) owns the in-RAM map `unordered_map<int, BaseNode*>` and `MetaRecord meta`. Every `insert<T>` immediately persists via `io/graph_io.h`'s `write_node` (record → relations → index, all appended; `meta.dat` is truncated and rewritten).
 

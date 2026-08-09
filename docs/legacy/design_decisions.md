@@ -6,14 +6,15 @@
 |---|---|
 | Tipo | legacy-decisions |
 | Lingua | en |
-| Ultimo aggiornamento | 2026-06-19 |
-| Commit di riferimento | 0a043f7 |
+| Ultimo aggiornamento | 2026-08-09 |
+| Commit di riferimento | fbc6703 |
 | Mirror | — |
 
 ---
 
 ## Indice
 
+- [2026-08-09 — Relation-batch chaining: catena di batch via next_offset](#2026-08-09--relation-batch-chaining-catena-di-batch-via-next_offset)
 - [2026-06-19 — add_edge in O(1): append + relink + in-place line update](#2026-06-19--add_edge-in-o1-append--relink--in-place-line-update)
 - [2026-06-19 — Relation-list a batch fixed-width + Edge a lista doppiamente concatenata](#2026-06-19--relation-list-a-batch-fixed-width--edge-a-lista-doppiamente-concatenata)
 - [2026-06-13 — Reuse of the rel/edges freelist bins (edge-space compaction)](#2026-06-13--reuse-of-the-reledges-freelist-bins-edge-space-compaction)
@@ -35,6 +36,32 @@
 
 ---
 
+### 2026-08-09 — Relation-batch chaining: catena di batch via next_offset
+
+- **Stato:** active
+- **Contesto:** Il formato fixed-width batch ([decisione 2026-06-19](#2026-06-19--relation-list-a-batch-fixed-width--edge-a-lista-doppiamente-concatenata)) aveva congelato una tail da `RELATION_LINES_PER_BATCH = 8` righe e riservato in header `next_offset` + `head` per concatenare batch successivi, **senza implementare il chaining**: il nono tipo di relazione su un nodo faceva lanciare `write_relation_node_list`, `persist_new_edge` e `update_node_edges`. Era il *boundary residuo* n. 3 di quella decisione e il primo item della roadmap.
+- **Decisione:** la relation-list di un nodo diventa una **catena di batch**. `NodeIndex.relation_offset` punta al primo; ogni header punta al successivo con `next_offset` (0 = ultimo); `head` numera i batch 1, 2, 3… **Nessun cambio di layout POD** — i campi c'erano già e un `db/` esistente ha `next_offset = 0` su ogni batch, cioè una catena di lunghezza 1: **non è uno schema-break**.
+  - **Invarianti della catena:** in ogni batch le righe `0..type_count-1` sono usate, **senza buchi**; un tipo di relazione nuovo va sempre nell'**ultimo** batch (o in uno fresco), mai a first-fit; i batch di una catena **non sono necessariamente contigui** su `nodes.dat` (ognuno è allocato per sé), quindi solo `next_offset` definisce l'ordine.
+  - **Write path insert (`write_relation_node_list`)**: scrive `ceil(n/8)` batch consecutivi (minimo 1, anche per un nodo senza relazioni), quindi ogni `next_offset` è noto a priori (`first + (b+1) * 2213`) e non serve back-patching. Ritorna l'offset del **primo** batch.
+  - **Add di un tipo nuovo (`persist_new_edge`)**: se l'ultimo batch ha una riga libera, si riempie lo slot `type_count` e si aggiorna l'header in place (come prima). Se è **pieno**, si alloca un batch fresco (pop dal bin `rel` a dimensione esatta, altrimenti append), lo si scrive intero (header + riga + tail azzerata), e lo si aggancia con **una singola scrittura in place di 8 byte** su `next_offset` del batch precedente. `nodes.idx` resta intoccato anche in questo caso.
+  - **Read path (`read_relation_node_list`)**: cammina `next_offset` e accumula le righe di tutta la catena; out-param opzionale con l'offset di **ogni** batch visitato, perché chi deve reclamare la lista ha bisogno di un record di freelist per batch (`NodeIndex` conosce solo l'inizio).
+  - **Reclaim (`delete_node_from_disk`, `update_node_edges`)**: ogni batch della catena viene pushato sul bin `rel` (tutti nella stessa classe da 2213 B) e azzerato. `update_node_edges` riscrive la catena decidendo **prima** dove atterra ogni batch (un pop per batch, altrimenti slot successivi a EOF) e poi scrivendoli, perché `next_offset` deve puntare al batch seguente e sondare EOF due volte senza scrivere restituirebbe lo stesso offset.
+  - **Guardia anti-loop:** il formato non ha checksum, quindi ogni walk è limitato a `RELATION_MAX_BATCHES = 4096` batch e lancia oltre — un `next_offset` corrotto non manda in loop il reader.
+- **Alternative considerate:**
+  - *First-fit della riga nuova su tutta la catena*: servirebbe solo se una delete di singola relazione lasciasse buchi, cosa che nessun percorso fa oggi (la delete riscrive tutto il nodo). Aggiunge un walk e l'obbligo di gestire i buchi senza guadagno → scartata a favore dell'append-only sull'ultimo batch.
+  - *Ridurre `RELATION_LINES_PER_BATCH` (es. a 4) ora che il chaining esiste*, per abbassare il pavimento di ~2.2 KB per nodo: valutata e **rimandata** — è uno schema-break e cambia la classe di size del bin `rel`.
+  - *Batch della catena forzatamente contigui* (una sola regione da `k * 2213`): renderebbe il walk banale ma vorrebbe una classe di size per ogni `k` nel freelist e un rewrite dell'intera catena per aggiungere un tipo → uccide l'O(1) dell'add. Scartata.
+  - *Puntatore al tail della catena nel primo header* per rendere O(1) l'aggancio: inutile, la ricerca del tipo deve comunque camminare la catena.
+- **Conseguenze:**
+  - **Il cap di 8 tipi di relazione per nodo non esiste più**: i tre `throw` "batch chaining not yet implemented" sono rimossi. Il limite pratico è `RELATION_MAX_BATCHES` (32768 tipi per nodo).
+  - `persist_new_edge` è **O(numero di batch)** = O(tipi di relazione / 8) invece di O(1) stretto: il walk sostituisce la lettura di un solo header. Per un nodo con ≤8 tipi il costo è identico a prima.
+  - Nessuna crescita di `nodes.dat` quando il bin `rel` ha regioni libere: un batch nuovo riusa un buco esatto (verificato dalla Phase 7 dello smoke test, dove entrambi i batch aggiuntivi riusano regioni liberate dalle fasi precedenti).
+  - Il costo spazio resta `ceil(tipi / 8) * 2213` byte per nodo: un nodo con 9 tipi paga due batch pieni (4426 B).
+  - Chiude il boundary residuo n. 3 della [decisione del formato](#2026-06-19--relation-list-a-batch-fixed-width--edge-a-lista-doppiamente-concatenata) e il primo item TODO della roadmap.
+- **Riferimenti:** commit `fbc6703` (working tree, branch `update/write_relation_node_list`). `graph_core/costants.h` (`RELATION_MAX_BATCHES`), `graph_core/io/graph_io.h` (`relation_batch_region_size`, `relation_batch_count`, `relation_lines_in_batch`, `write_relation_node_list`), `graph_core/io/graph_io.cpp` (`read_relation_node_list`, `persist_new_edge`, `update_node_edges`, `delete_node_from_disk`), `graph_core/odt/node_odt.{h,cpp}` (`relation_batch_header`), `main.cpp` Phase 7 (regression guard a 17 tipi di relazione). Vedi [API change](api_changes.md#2026-08-09--firme-relation-batch-relation_batch_header-read_relation_node_list-con-batch_offsets).
+
+---
+
 ### 2026-06-19 — add_edge in O(1): append + relink + in-place line update
 
 - **Stato:** active
@@ -53,7 +80,7 @@
   - `add_edge` ora **non sposta il batch né patcha `relation_offset`**: `nodes.idx` non è toccato sull'aggiunta di un arco (lo era invece nel vecchio `update_node_edges`). `nodes.dat` non cresce su un arco aggiunto (riga aggiornata in place nel batch già allocato); `edges.dat` cresce di 48 B per arco nuovo (o riusa uno slot liberato), 0 su overwrite.
   - `free_edge_count` ora conta **archi** liberi (slot da 48 B), non più "chunk". `free_edge_chain` lo incrementa per arco; `persist_new_edge` lo decrementa su un pop.
   - **Vincolo di coerenza:** `EdgeRef.offset` in RAM deve restare allineato al disco. `update_node_edges` lo rinfresca quando rilocalizza; finché è l'unico a spostare archi, l'invariante regge.
-  - **Boundary residuo:** il batch chaining per >8 tipi di relazione resta WIP — `persist_new_edge` lancia se il batch è pieno.
+  - ~~**Boundary residuo:** il batch chaining per >8 tipi di relazione resta WIP — `persist_new_edge` lancia se il batch è pieno.~~ — **risolto 2026-08-09** ([Relation-batch chaining](#2026-08-09--relation-batch-chaining-catena-di-batch-via-next_offset)): batch pieno → si alloca e si aggancia un batch nuovo. `persist_new_edge` diventa O(numero di batch).
   - Risolve i punti (1) `add_edge` O(1) e (2) freelist a bin singolo elencati nel *Boundary residuo* della [decisione del formato](#2026-06-19--relation-list-a-batch-fixed-width--edge-a-lista-doppiamente-concatenata).
 - **Riferimenti:** commit `0a043f7` (working tree). `graph_core/struct/domain_struct.h` (`EdgeRef.offset`), `graph_core/io/graph_io.{h,cpp}` (`persist_new_edge`, `persist_edge_weight`, `free_edge_chain`, `update_node_edges`, `delete_node_from_disk`, edge-read in `read_typed_node`), `graph_core/graph.cpp` (`add_edge`); `main.cpp` Phase 5 (zero-growth regression guard). Vedi [API change](api_changes.md#2026-06-19--add_edge-o1-edgerefoffset--persist_new_edge--persist_edge_weight).
 
@@ -61,7 +88,7 @@
 
 ### 2026-06-19 — Relation-list a batch fixed-width + Edge a lista doppiamente concatenata
 
-- **Stato:** active (formato congelato in questa fase; l'exploit O(1) di `add_edge`, il freelist a bin singolo e il chaining dei batch sono lavoro della fase successiva — vedi *Conseguenze → Boundary residuo*)
+- **Stato:** active (formato congelato in questa fase; l'exploit O(1) di `add_edge` e il freelist a bin singolo sono arrivati il 2026-06-19, il chaining dei batch il 2026-08-09 — vedi *Conseguenze → Boundary residuo*)
 - **Contesto:** `add_edge` è **O(deg)**: `update_node_edges` riscrive l'**intera** relation-list del nodo + **tutti** i chunk di edge ad ogni arco aggiunto (anche per un solo arco nuovo). Il design [Edge persistence 2026-05-30](#2026-05-30--edge-persistence-append--obsolete--in-place-index-patch) aveva già valutato e **scartato** la linked-list di edge (per non rompere il formato `Edge` e restare sui "chunk contigui per `(node, relation)`"), accettando la write-amplification. Obiettivo di questo lavoro: portare l'inserimento arco a **O(1)**. Serve un formato che (a) permetta di aggiornare la riga di **una** relazione senza riscrivere le altre, e (b) permetta di agganciare un nuovo arco senza riscrivere il chunk.
 - **Decisione (questa fase = solo il formato on-disk + il write path di insert):**
   - **`RelationNodeList` → `NodeRelationList`**, header da **37 byte** (`node_id`, `type_count`, `batch_size`, `free_bytes`, `next_offset`, `head`, `is_deleted`) seguito da una **tail a larghezza fissa** `RELATION_BATCH_TAIL = 2176` byte = fino a `RELATION_LINES_PER_BATCH = 8` righe da `RELATION_LINE_SIZE = 272` byte. La regione totale di un batch è **costante a 2213 byte**, indipendente dal numero di relazioni usate (le righe inutilizzate sono azzerate). Riga: `[uint64_t edge_offset][uint64_t edge_count][uint8_t name_length][char name[255]]`. La larghezza fissa rende la riga `i` indirizzabile a `tail + i*272` → **update in place O(1)** di una relazione; e rende ogni batch **un'unica classe di size** → il bin `rel` del freelist ne ha una sola.
@@ -74,11 +101,11 @@
 - **Conseguenze:**
   - **Schema-break del formato on-disk** (`NodeRelationList` e `Edge` cambiano layout): qualunque `db/` pre-esistente va cancellato. `main.cpp` fa già `remove_all(DB_PATH)` ad ogni run.
   - **Costo spazio fisso:** ogni nodo paga **~2.2 KB** di batch relation-list (tail sempre piena), anche con poche relazioni — il prezzo dell'indirizzamento in place. `Edge` cresce del 50% (32 → 48 byte).
-  - **Cap di 8 relazioni per nodo** finché il chaining dei batch (`next_offset`, `head` 1→2→3) non è implementato: `write_relation_node_list` / `update_node_edges` lanciano `std::runtime_error` oltre le 8.
+  - ~~**Cap di 8 relazioni per nodo** finché il chaining dei batch (`next_offset`, `head` 1→2→3) non è implementato: `write_relation_node_list` / `update_node_edges` lanciano `std::runtime_error` oltre le 8.~~ — **rimosso 2026-08-09** con il [chaining](#2026-08-09--relation-batch-chaining-catena-di-batch-via-next_offset): oltre le 8 righe si aggiunge un batch alla catena. Il costo spazio diventa `ceil(tipi / 8) * 2213` byte per nodo.
   - **Boundary residuo (fase successiva):**
     1. ~~`add_edge` non è ancora O(1)~~ — **risolto 2026-06-19** ([add_edge in O(1)](#2026-06-19--add_edge-in-o1-append--relink--in-place-line-update)): `persist_new_edge` (append+relink+riga in place) e `persist_edge_weight` (overwrite in place). `update_node_edges` resta solo per la pulizia degli archi entranti in `delete_node`.
     2. ~~Freelist a bin singolo per tipo~~ — **risolto 2026-06-19**: gli archi si liberano/riusano come slot singoli da 48 B (`edges`), il batch come 2213 (`rel`) → un bin per dimensione.
-    3. **Batch chaining** per >8 tipi — ancora WIP (`persist_new_edge` lancia se il batch è pieno).
+    3. ~~**Batch chaining** per >8 tipi — ancora WIP (`persist_new_edge` lancia se il batch è pieno).~~ — **risolto 2026-08-09** ([Relation-batch chaining](#2026-08-09--relation-batch-chaining-catena-di-batch-via-next_offset)): la relation-list è una catena di batch legati da `next_offset`, `head` 1→2→3. Non è uno schema-break: i campi erano già in header.
   - Il read path (`read_typed_node`, `build_inbound_index`) e `delete_node_from_disk` sono già adeguati al nuovo formato.
 - **Riferimenti:** commit `0a043f7` (working tree). `graph_core/struct/pod_struct.h` (`NodeRelationList`, `Edge`), `graph_core/costants.h` (`RELATION_LINE_SIZE`/`RELATION_LINES_PER_BATCH`/`RELATION_BATCH_TAIL`/`RELATION_NAME_MAX`), `graph_core/odt/node_odt.cpp` (`node_to_relation_list`), `graph_core/odt/edge_odt.cpp` (`edge_to_pod`), `graph_core/io/graph_io.h` (helper di formato + `write_relation_node_list` + edge-read chain in `read_typed_node`), `graph_core/io/graph_io.cpp` (`read_relation_node_list`, `update_node_edges`, `build_inbound_index`, `delete_node_from_disk`); `main.cpp` (smoke test). Supera la scelta "linked-list scartata" di [Edge persistence 2026-05-30](#2026-05-30--edge-persistence-append--obsolete--in-place-index-patch); il freelist a bin singolo evolve [Freelist a bin segregati 2026-06-03](#2026-06-03--freelist-a-bin-segregati-per-dimensione-esatta--cancellazione-nodo).
 

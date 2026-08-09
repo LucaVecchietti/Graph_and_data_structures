@@ -18,6 +18,13 @@ constexpr uint16_t RELATION_LINE_SIZE       = 8 + 8 + 1 + RELATION_NAME_MAX; // 
 constexpr uint8_t  RELATION_LINES_PER_BATCH = 8;                  // max relation lines per batch
 constexpr uint16_t RELATION_BATCH_TAIL      = RELATION_LINE_SIZE * RELATION_LINES_PER_BATCH; // = 2176
 
+// A node with more than RELATION_LINES_PER_BATCH relation types spills into further
+// batches, chained through NodeRelationList::next_offset (head 1 -> 2 -> 3 ...). The
+// on-disk format carries no checksum, so a corrupted next_offset could make a chain
+// walk loop forever: every walker bounds itself by this many batches and throws past
+// it. 4096 batches = 32768 relation types per node, far beyond any sane model.
+constexpr uint32_t RELATION_MAX_BATCHES     = 4096;
+
 // Fixed width (in digits) of the zero-padded prog_number prefix in a COMPLEX
 // node's sidecar filename (e.g. "00000000000000000005_Athlete.json"). 20 covers
 // the full uint64 range, so a COMPLEX record's on-disk size depends ONLY on its

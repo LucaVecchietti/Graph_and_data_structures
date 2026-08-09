@@ -6,8 +6,8 @@
 |---|---|
 | Tipo | architecture |
 | Lingua | en |
-| Ultimo aggiornamento | 2026-06-19 |
-| Commit di riferimento | 0a043f7 |
+| Ultimo aggiornamento | 2026-08-09 |
+| Commit di riferimento | fbc6703 |
 | Mirror | — |
 
 ---
@@ -105,7 +105,7 @@ write_node<T>          (graph_core/io/graph_io.h)
    │       write_complex(node.data, json_file_path, dat_out)
    │                                       → ComplexHeader + 2 strings → nodes.dat
    │                                       → JSON payload              → attributes/{prog}_{label}.json
-   │ NodeRelationList batch (2213 B)      → nodes.dat
+   │ NodeRelationList chain (2213 B each)  → nodes.dat
    │ NodeIndex                            → nodes.idx
    │ (per-relation edge chains)           → edges.dat
    ▼
@@ -124,11 +124,13 @@ Graph::add_edge        (graph_core/graph.cpp)
    │ resolve: new edge (fresh id) vs overwrite (existing EdgeRef.id + .offset)
    ▼
 NEW edge → persist_new_edge   (graph_core/io/graph_io.cpp)   ← O(1)
-   │ read relation_offset from nodes.idx; find/make the relation line (≤8 → O(1))
+   │ read relation_offset from nodes.idx; walk the batch chain to the line (or the last batch)
    │ alloc Edge slot: pop edges_48 bin, else append edges.dat
    │ write Edge {prev=0, next=old_head}; patch old head's prev_offset in place
    │ update ONE relation line in place (new head + count) — or add a line + header
-   │ (batch never moves → nodes.idx untouched); store returned offset in EdgeRef
+   │ to the LAST batch — or, if that one is full, allocate a batch and link it
+   │ by patching its next_offset (chaining, since 2026-08-09)
+   │ (no batch ever moves → nodes.idx untouched); store returned offset in EdgeRef
    │ in_edges[end].insert(start); meta.next_edge_id++; meta.edge_count++
 OVERWRITE → persist_edge_weight(EdgeRef.offset, weight)        ← O(1), 8 bytes in place
    ▼
@@ -153,7 +155,7 @@ Graph::delete_node       (graph_core/graph.cpp)
 delete_node_from_disk    (graph_core/io/graph_io.cpp)
    │ read NodeIndex (+ ComplexHeader if COMPLEX → real size, remove sidecar, recycle prog)
    │ push NodeRecord region       → db/freelist/{nodes|complex}_<size>.dat
-   │ push NodeRelationList batch  → db/freelist/rel_<size>.dat (size constant 2213)
+   │ push EVERY NodeRelationList batch of the chain → db/freelist/rel_2213.dat
    │ push each edge chunk         → db/freelist/edges_<size>.dat
    │ zero the orphaned bytes; tombstone nodes.idx slot (type_id=TOMBSTONE)
    │ meta: node_count--, free_count++, free_edge_count += chunks
@@ -181,7 +183,7 @@ read_typed_node<T>      (graph_core/io/graph_io.h)
    │ seek nodes.dat at NodeIndex.offset
    │ read NodeRecord<T>
    │ seek nodes.dat at NodeIndex.relation_offset
-   │ read NodeRelationList header + fixed-width lines
+   │ read the batch CHAIN: header + fixed-width lines, hop next_offset until 0
    │ for each line: walk the edge chain from edge_offset via next_offset
    │ neighbor pointers left as nullptr  ← must be re-linked later
 ```
@@ -218,3 +220,4 @@ main.cpp
 - [Bin per-tipo per i record COMPLEX via prog_number zero-paddato](../legacy/design_decisions.md#2026-06-07--bin-per-tipo-per-i-record-complex-via-prog_number-zero-paddato) — how COMPLEX records reuse freed slots.
 - [Relation-list a batch fixed-width + Edge a lista doppiamente concatenata](../legacy/design_decisions.md#2026-06-19--relation-list-a-batch-fixed-width--edge-a-lista-doppiamente-concatenata) — the fixed-width relation batch and edge linked-list format (groundwork for O(1) `add_edge`).
 - [add_edge in O(1): append + relink + in-place line update](../legacy/design_decisions.md#2026-06-19--add_edge-in-o1-append--relink--in-place-line-update) — how `add_edge`/overwrite became O(1) on that format.
+- [Relation-batch chaining: catena di batch via next_offset](../legacy/design_decisions.md#2026-08-09--relation-batch-chaining-catena-di-batch-via-next_offset) — how a node goes past 8 relation types without moving anything.

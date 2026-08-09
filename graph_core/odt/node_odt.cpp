@@ -24,27 +24,37 @@ namespace {
  */
 
 /**
- * Translates a typed Node struct to a RelationNodeList POD struct for serialization.
- * The RelationNodeList contains the adjacency information (relation types and neighbor offsets),
- * while the data payload is stored separately in the NodeRecord.
+ * Builds the header of ONE fixed-width relation batch. A node's relation list is a
+ * CHAIN of such batches (see graph_io.h), so `lines_in_batch`, `head` and
+ * `next_offset` are supplied by the I/O layer that lays the chain out on disk.
  */
 
- NodeRelationList node_to_relation_list(const BaseNode &node, uint64_t node_id, uint64_t head)
+ NodeRelationList relation_batch_header(uint64_t node_id, uint64_t lines_in_batch,
+                                        uint64_t head, uint64_t next_offset)
  {
      // Fixed-width batch: the tail is always written full-width (RELATION_BATCH_TAIL
      // bytes), with the first `type_count` lines used and the rest zero-filled. So
      // batch_size is the CONSTANT reserved tail, and free_bytes is what is left after
      // the used lines. This makes every batch the same on-disk size — one freelist
      // size class — and lets a single relation line be rewritten in place.
-     uint64_t type_count = node.neighborgs.size();
+     if (lines_in_batch > RELATION_LINES_PER_BATCH)
+     {
+         logger.error("relation_batch_header: " + std::to_string(lines_in_batch)
+                      + " lines requested for node " + std::to_string(node_id)
+                      + ", but a batch holds at most " + std::to_string(RELATION_LINES_PER_BATCH));
+         throw std::invalid_argument("relation_batch_header: lines_in_batch exceeds RELATION_LINES_PER_BATCH ("
+                                     + std::to_string(lines_in_batch) + " > "
+                                     + std::to_string(RELATION_LINES_PER_BATCH) + ") — the overflow "
+                                     "belongs in the next batch of the chain.");
+     }
 
      NodeRelationList list;
      list.node_id     = node_id;
-     list.type_count  = type_count;
+     list.type_count  = lines_in_batch;
      list.batch_size  = RELATION_BATCH_TAIL;
-     list.free_bytes  = static_cast<uint16_t>(RELATION_BATCH_TAIL - type_count * RELATION_LINE_SIZE);
-     list.next_offset = 0;     // single-batch for now; chaining is WIP (see ROADMAP)
-     list.head        = head;  // 1 = first batch
+     list.free_bytes  = static_cast<uint16_t>(RELATION_BATCH_TAIL - lines_in_batch * RELATION_LINE_SIZE);
+     list.next_offset = next_offset; // 0 = last batch of the chain
+     list.head        = head;        // 1 = first batch, 2, 3, ... = chained extensions
      list.is_deleted  = 0;
      return list;
  }

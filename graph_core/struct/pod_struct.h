@@ -90,14 +90,18 @@ struct NodeRecord
  *       (O(1) seek-write) — the foundation of O(1) add_edge.
  *    2. Every batch is the same on-disk size, so the relation freelist needs only
  *       ONE size class/bin instead of one per variable tail length.
- *  A node with more than 8 relation types chains a second batch via next_offset
- *  (head 1 -> 2 -> 3 ...). (Batch chaining traversal is WIP — see ROADMAP.)
+ *  A node with more than 8 relation types chains further batches via next_offset
+ *  (head 1 -> 2 -> 3 ...). The batches of one chain are allocated independently
+ *  (freelist pop or append), so they are NOT necessarily contiguous: only
+ *  next_offset defines the order. NodeIndex.relation_offset points at the first.
  */
 #pragma pack(push, 1)
 struct NodeRelationList
 {
     uint64_t node_id;     // Id of the owning node (back-reference, also aids recovery).
     uint64_t type_count;  // Number of relation-type LINES actually used in THIS batch (0..8).
+                          // Lines 0..type_count-1 are used, with no holes: a new relation type
+                          // always goes into the LAST batch of the chain (or a fresh one).
     uint16_t batch_size;  // Reserved tail size in bytes. Constant RELATION_BATCH_TAIL (= 2176):
                           // the tail is always written full-width (unused lines zero-filled), so
                           // the total reclaimable region at the batch offset is

@@ -1,6 +1,6 @@
 ---
 id: smoke-test
-title: Run the six-phase smoke test
+title: Run the seven-phase smoke test
 type: procedure
 tags: [test, regression]
 aliases: []
@@ -9,8 +9,8 @@ updated: 2026-08-09
 status: active
 ---
 
-# Run the six-phase smoke test
-> main.cpp is the only verification harness: six phases covering insert, reload, delete, reuse, compaction and edge chains.
+# Run the seven-phase smoke test
+> main.cpp is the only verification harness: seven phases covering insert, reload, delete, reuse, compaction, edge chains and relation-batch chaining.
 
 ## When to run this
 
@@ -25,7 +25,7 @@ there is no automated test suite, so this is the regression suite.
 
 ## Steps
 
-Run `.\build\graph.exe` from `build/` and read the six phases in order:
+Run `.\build\graph.exe` from `build/` and read the seven phases in order:
 
 1. **Fresh writes** - three `insert<int>`, one `insert<ComplexRecord>` (an Athlete), two
    `add_edge` calls, then a BFS.
@@ -37,11 +37,16 @@ Run `.\build\graph.exe` from `build/` and read the six phases in order:
    growth through the `rel`/`edges` bin push-then-pop.
 6. **Edge chains** - several edges on one relation, plus a mid-chain weight overwrite that
    must survive a reload ([[edge-record]]).
+7. **Relation-batch chaining** - a hub node with 17 relation types (8 + 8 + 1 batches): all
+   17 edges must be found before and after a reload, and again after a `delete_node` forces
+   the whole chain to be rewritten ([[decision-relation-batch-chaining]]).
 
 ## Verification
 
 Check the phase output against `db/`, `db/freelist/`, `db/attributes/` and the meta counters.
 Phase 5 is the sharp one: any file growth there means the freelist reuse path regressed.
+Phase 7 prints PASS/FAIL edge counts; the log should show two `chained batch head` lines
+reusing `rel` bin regions rather than appending.
 
 ## If it goes wrong
 
@@ -54,3 +59,4 @@ is usually what broke.
 - part of [[build-and-run]] - the verification step of that procedure
 - relates to [[graph-class]] - it exercises insert, add_edge, delete_node and bfs
 - relates to [[freelist]] - phases 3 to 5 are the freelist regression guard
+- verifies [[decision-relation-batch-chaining]] - phase 7 is its regression guard

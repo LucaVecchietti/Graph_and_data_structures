@@ -44,16 +44,22 @@ NodeRecord<T> node_to_record(const Node<T> &node)
 NodeRecord<ComplexHeader> complex_node_to_record(const Node<ComplexRecord> &node, std::string &json_file_path);
 
 /**
- * Translates a typed Node struct to a NodeRelationList batch HEADER for serialization.
- * The header describes a single fixed-width relation batch (the tail lines are written
- * by the I/O layer). type_count counts the node's relation types, free_bytes / batch_size
- * follow the fixed-width layout (see pod_struct.h / costants.h).
- * @param node    The Node to be translated.
- * @param node_id Id of the owning node (stored as the batch back-reference).
- * @param head    Batch serial number (1 for the first/only batch).
+ * Builds the HEADER of ONE fixed-width relation batch (the tail lines are written by
+ * the I/O layer). A node's relation list is a CHAIN of these batches, so the caller —
+ * which is the only one that knows how the chain is laid out on disk — passes the
+ * per-batch values explicitly rather than deriving them from the node.
+ * @param node_id        Id of the owning node (stored as the batch back-reference).
+ * @param lines_in_batch Relation lines used in THIS batch (0..RELATION_LINES_PER_BATCH);
+ *                       free_bytes is derived from it.
+ * @param head           Batch serial number: 1 for the first batch, 2, 3, ... for the
+ *                       chained extensions.
+ * @param next_offset    Offset in nodes.dat of the next batch of the chain, 0 if last.
  * @return The NodeRelationList header for serialization.
+ * @throws std::invalid_argument if lines_in_batch exceeds RELATION_LINES_PER_BATCH
+ *         (a caller bug: the overflow belongs in the NEXT batch of the chain).
  */
-NodeRelationList node_to_relation_list(const BaseNode &node, uint64_t node_id, uint64_t head = 1);
+NodeRelationList relation_batch_header(uint64_t node_id, uint64_t lines_in_batch,
+                                       uint64_t head = 1, uint64_t next_offset = 0);
 
 /**
  * Translates a NodeRecord POD struct back to a typed Node struct for use in memory.
