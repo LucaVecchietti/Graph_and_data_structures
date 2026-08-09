@@ -202,6 +202,9 @@ uint64_t write_node_record(const Node<T> &node)
  * Writes the adjacency list of a Node to nodes.dat (out) and edges to edges.dat.
  * For each relation type: writes [name][edge_offset][edge_count] after the POD header.
  * Returns the byte offset where the relation list was written.
+ * 
+ * Known limitation: currently only supports a single batch of relations (up to 8 types). If the node has more than 8 relation types, an exception is thrown.
+ * Future work: implement batch chaining via next_offset to support more than 8 relation types.
  */
 template <typename T>
 uint64_t write_relation_node_list(const Node<T> &node, uint64_t node_id, std::ofstream &out)
