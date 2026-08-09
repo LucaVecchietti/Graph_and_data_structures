@@ -860,6 +860,61 @@ void delete_node_from_disk(uint64_t node_id, MetaRecord &meta)
     // Graph::delete_node, driven by the reverse index (build_inbound_index).
 }
 
+/**
+ * Resolves a global edge id to its (from_node, to_node, relation). See graph_io.h for
+ * why this has to walk the node topology instead of scanning edges.dat flat.
+ */
+std::optional<EdgeLocation> find_edge_by_id(uint64_t edge_id, uint64_t next_id)
+{
+    namespace fs = std::filesystem;
+
+    std::ifstream idx_in(fs::path(DB_PATH) / "nodes.idx", std::ios::binary);
+    if (!idx_in) return std::nullopt; // no nodes persisted yet
+
+    std::ifstream dat_in(fs::path(DB_PATH) / "nodes.dat", std::ios::binary);
+    std::ifstream edges_in(fs::path(DB_PATH) / "edges.dat", std::ios::binary);
+    if (!dat_in || !edges_in) return std::nullopt;
+
+    for (uint64_t id = 0; id < next_id; ++id)
+    {
+        idx_in.clear();
+        idx_in.seekg(static_cast<std::streamoff>(id * sizeof(NodeIndex)));
+        NodeIndex ni = read_node_index(idx_in);
+        if (!idx_in) break; // short / truncated index — stop defensively
+
+        if (ni.type_id == NodeType::TOMBSTONE) continue; // deleted slot: no live edges
+
+        // Follow only this LIVE node's relation chain, so zeroed/freed edge regions are
+        // never read. from_node == id for every edge it owns.
+        dat_in.clear();
+        dat_in.seekg(static_cast<std::streamoff>(ni.relation_offset));
+        std::vector<RelationEntry> entries = read_relation_node_list(dat_in);
+
+        for (const auto &entry : entries)
+        {
+            // Walk the edge linked list from its head, hopping by next_offset.
+            uint64_t off = entry.edge_offset;
+            for (uint64_t i = 0; i < entry.edge_count; ++i)
+            {
+                edges_in.clear();
+                edges_in.seekg(static_cast<std::streamoff>(off));
+                Edge e = read_pod<Edge>(edges_in);
+                if (e.id == edge_id)
+                {
+                    logger.info("find_edge_by_id: edge id " + std::to_string(edge_id) + " is "
+                                + std::to_string(e.from_node) + " --" + entry.name + "--> "
+                                + std::to_string(e.to_node) + " at edges.dat offset " + std::to_string(off));
+                    return EdgeLocation{e.from_node, e.to_node, entry.name};
+                }
+                off = e.next_offset;
+            }
+        }
+    }
+
+    logger.info("find_edge_by_id: no live edge carries id " + std::to_string(edge_id));
+    return std::nullopt;
+}
+
 std::unordered_map<int, std::unordered_set<int>> build_inbound_index(uint64_t next_id)
 {
     namespace fs = std::filesystem;

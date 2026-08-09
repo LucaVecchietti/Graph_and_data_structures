@@ -372,8 +372,27 @@ void Graph::delete_edge(int start, int end, std::string type)
             // Update the node's edges on disk
             update_node_edges(*node, meta, static_cast<uint64_t>(start));
 
-            // Update the reverse index
-            in_edges[end].erase(start);
+            // Reverse index: it is keyed by (source node -> target node), with NO
+            // relation granularity, so `start` must stay in in_edges[end] as long as
+            // ANY of its relations still points at `end`. Dropping it unconditionally
+            // would, after deleting 0 --road--> 1 while 0 --train--> 1 survives, make a
+            // later delete_node(1) skip the "train" edge and leave it dangling at a
+            // tombstoned slot. O(relation types of start).
+            bool still_points_at_end = false;
+            for (const auto &[other_rel, other_neighbors] : node->neighborgs)
+            {
+                (void)other_rel;
+                if (other_neighbors.find(end) != other_neighbors.end())
+                {
+                    still_points_at_end = true;
+                    break;
+                }
+            }
+            if (!still_points_at_end)
+            {
+                auto in_it = in_edges.find(end);
+                if (in_it != in_edges.end()) in_it->second.erase(start);
+            }
 
             // Update metadata
             meta.edge_count--;
@@ -392,4 +411,76 @@ void Graph::delete_edge(int start, int end, std::string type)
         Graph::logger.error("Failed to delete edge: relation type '" + type + "' does not exist for node " + std::to_string(start));
         throw std::out_of_range("Relation type '" + type + "' does not exist for node " + std::to_string(start));
     }
+}
+
+/**
+ * Overload 2: deletes the edge carrying `edge_id`.
+ *
+ * Edge ids are global and stable but there is NO id -> location index, so the id is
+ * first resolved to (start, end, relation) and then handed to overload 1 — which keeps
+ * a single delete path (update_node_edges + reverse index + counters) for both entry
+ * points. Resolution mirrors the lazy-load pattern of the other overloads: the in-RAM
+ * nodes are searched first, and only if the edge is not resident does it fall back to
+ * the O(N+E) disk scan in find_edge_by_id.
+ * @param edge_id The id of the edge to delete.
+ * @throws std::out_of_range if no live edge carries that id.
+ */
+void Graph::delete_edge(int edge_id)
+{
+    // Same shape as the node-id guards in the other overloads: an id >= next_edge_id was
+    // never assigned, so there is nothing to look for.
+    if (edge_id < 0 || static_cast<uint64_t>(edge_id) >= meta.next_edge_id)
+    {
+        Graph::logger.error("Failed to delete edge: edge id " + std::to_string(edge_id) + " was never assigned.");
+        throw std::out_of_range("Edge id " + std::to_string(edge_id) + " was never assigned.");
+    }
+
+    // ---- 1. Resolve the id against the resident nodes -----------------------
+    // Copies are captured, not references: the delegate below mutates the very maps
+    // being iterated here (and erases the relation entry when it empties).
+    int start = -1;
+    int end = -1;
+    std::string type;
+    bool found = false;
+
+    for (const auto &[owner_id, owner] : nodes)
+    {
+        for (const auto &[rel_type, neighbors] : owner->neighborgs)
+        {
+            for (const auto &[to_id, ref] : neighbors)
+            {
+                if (ref.id == static_cast<uint64_t>(edge_id))
+                {
+                    start = owner_id;
+                    end   = to_id;
+                    type  = rel_type;
+                    found = true;
+                    break;
+                }
+            }
+            if (found) break;
+        }
+        if (found) break;
+    }
+
+    // ---- 2. Not resident: fall back to the disk scan ------------------------
+    if (!found)
+    {
+        std::optional<EdgeLocation> loc = find_edge_by_id(static_cast<uint64_t>(edge_id), meta.next_id);
+        if (!loc)
+        {
+            Graph::logger.error("Failed to delete edge: no live edge carries id " + std::to_string(edge_id) + ".");
+            throw std::out_of_range("Edge id " + std::to_string(edge_id) + " does not exist.");
+        }
+        start = static_cast<int>(loc->from_node);
+        end   = static_cast<int>(loc->to_node);
+        type  = loc->relation;
+    }
+
+    logger.info("delete_edge: edge id " + std::to_string(edge_id) + " resolved to "
+                + std::to_string(start) + " --" + type + "--> " + std::to_string(end)
+                + (found ? " (from RAM)" : " (from disk scan)"));
+
+    // ---- 3. One single delete path ------------------------------------------
+    delete_edge(start, end, type);
 }

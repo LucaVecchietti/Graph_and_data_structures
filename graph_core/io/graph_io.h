@@ -114,6 +114,32 @@ void            persist_edge_weight(uint64_t edge_offset, int64_t weight);
 void            delete_node_from_disk(uint64_t node_id, MetaRecord &meta);
 
 /**
+ * Where an edge lives, in the terms Graph addresses edges with: the two node ids plus
+ * the relation whose chain owns it. Returned by find_edge_by_id.
+ */
+struct EdgeLocation
+{
+    uint64_t    from_node;
+    uint64_t    to_node;
+    std::string relation;
+};
+
+/**
+ * Resolves a global edge id to its (from_node, to_node, relation).
+ *
+ * There is no id -> offset index on disk, so this scans every live node exactly like
+ * build_inbound_index: for each non-tombstoned nodes.idx slot it walks the node's
+ * relation batch CHAIN and each relation's edge chain until it hits Edge.id == edge_id.
+ * Only live nodes' chains are followed, so zeroed/freed regions are never mistaken for
+ * live edges — a freed 48-byte slot reads back as id 0, which collides with the real
+ * edge id 0, which is why a flat scan of edges.dat would not be sound. O(N + E).
+ *
+ * Edge ids are globally unique and never recycled, so the first match is the only one.
+ * @return the location, or std::nullopt if no live edge carries that id.
+ */
+std::optional<EdgeLocation> find_edge_by_id(uint64_t edge_id, uint64_t next_id);
+
+/**
  * Builds the inbound (reverse) edge index by scanning every live node on disk:
  * for each live node's outbound edge (from_node → to_node), records
  * to_node → { from_node, ... }. Tombstoned slots are skipped and only live
