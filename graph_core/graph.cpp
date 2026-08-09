@@ -293,3 +293,103 @@ void Graph::delete_node(int node_id)
     delete_node_from_disk(static_cast<uint64_t>(node_id), meta);
     write_meta(meta);
 }
+
+/**
+ * TODO: Implement a method to delete an edge from the graph.
+ * 
+ * Overload 1: Deletes an edge from start to end with a specific type.
+ * @param start The ID of the start node.
+ * @param end The ID of the end node.
+ * @param type The relation type of the edge (e.g., "road", "train"). Optional, defaults to an empty string. 
+ */ 
+void Graph::delete_edge(int start, int end, std::string type)
+{
+    // Implementation for deleting an edge from start to end with a specific type.
+    // This method should check if the start and end nodes exist, if the edge exists,
+    // and then remove the edge from the graph, updating the necessary data structures.
+
+    //Check if the nodes is already loaded in memory, if not load it from disk
+    if (nodes.find(start) == nodes.end())
+    {
+        if (static_cast<uint64_t>(start) < meta.next_id)
+        {
+            try
+            {
+                nodes[start] = read_node(static_cast<uint64_t>(start));
+            }
+            catch (const std::exception &e)
+            {
+                Graph::logger.error("Failed to delete edge: could not read node " + std::to_string(start) + ": " + e.what());
+                throw std::runtime_error("Failed to read node " + std::to_string(start) + ": " + e.what());
+            }
+        }
+        else
+        {
+            Graph::logger.error("Failed to delete edge: node " + std::to_string(start) + " does not exist.");
+            throw std::out_of_range("Node " + std::to_string(start) + " does not exist.");
+        }
+    }
+
+    if (nodes.find(end) == nodes.end())
+    {
+        if (static_cast<uint64_t>(end) < meta.next_id)
+        {
+            try
+            {
+                nodes[end] = read_node(static_cast<uint64_t>(end));
+            }
+            catch (const std::exception &e)
+            {
+                Graph::logger.error("Failed to delete edge: could not read node " + std::to_string(end) + ": " + e.what());
+                throw std::runtime_error("Failed to read node " + std::to_string(end) + ": " + e.what());
+            }
+        }
+        else
+        {
+            Graph::logger.error("Failed to delete edge: node " + std::to_string(end) + " does not exist.");
+            throw std::out_of_range("Node " + std::to_string(end) + " does not exist.");
+        }
+    }
+
+    BaseNode *node = nodes[start]; // Get the start node from the base nodes vector
+
+    auto rel_it = node->neighborgs.find(type);
+    if (rel_it != node->neighborgs.end())
+    {
+        auto edge_it = rel_it->second.find(end);
+        if (edge_it != rel_it->second.end())
+        {
+            // Remove the edge from the in-memory structure
+            uint64_t edge_offset = edge_it->second.offset;
+            rel_it->second.erase(edge_it);
+
+            // If the relation type is now empty, remove it from the node's neighborgs
+            if (rel_it->second.empty())
+            {
+                node->neighborgs.erase(rel_it);
+            }
+
+            // Update the node's edges on disk
+            update_node_edges(*node, meta, static_cast<uint64_t>(start));
+
+            // Update the reverse index
+            in_edges[end].erase(start);
+
+            // Update metadata
+            meta.edge_count--;
+            write_meta(meta);
+
+            logger.info("Deleted edge from node " + std::to_string(start) + " to node " + std::to_string(end) + " with type '" + type + "'");
+        }
+        else
+        {
+            Graph::logger.error("Failed to delete edge: edge from node " + std::to_string(start) + " to node " + std::to_string(end) + " with type '" + type + "' does not exist.");
+            throw std::out_of_range("Edge from node " + std::to_string(start) + " to node " + std::to_string(end) + " with type '" + type + "' does not exist.");
+        }
+    }
+    else
+    {
+        Graph::logger.error("Failed to delete edge: relation type '" + type + "' does not exist for node " + std::to_string(start));
+        throw std::out_of_range("Relation type '" + type + "' does not exist for node " + std::to_string(start));
+    }
+}

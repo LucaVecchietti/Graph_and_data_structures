@@ -508,7 +508,7 @@ void persist_edge_weight(uint64_t edge_offset, int64_t weight)
 /**
  * Updates the edges of a node on the disk when a new edge is added to the node in memory.
  * This function delete the current edges batch and rewrites it whitch the new edges added to the node
- * ina  new position on the disk, then it updates the relation list of the node tu poitn to the new position
+ * in a new position on the disk, then it updates the relation list of the node to point to the new position
  * and finnealy add the free offstet to the nodes freelist to be reused.
  * @param node The node whose edges need to be updated.
  * @param meta The metadata containing information about the graph state.

@@ -158,6 +158,9 @@ public:
      * @throws std::out_of_range if either the start or end node does not exist
      * @throws std::out_of_range if the edge does not exist
      */
+    void delete_edge(int start, int end, std::string type = "");
+
+    void delete_edge(int edge_id);
 
     /**
      * Generic graph traversal — behavior determined by Policy at compile time.
