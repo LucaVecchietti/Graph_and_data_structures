@@ -144,6 +144,22 @@ public:
     void delete_node(int node_id); 
 
     /**
+     * TODO: Implement a method to delete an edge from the graph.
+     * 
+     * Overload 1: Deletes an edge from start to end with a specific type.
+     * @param start The ID of the start node.
+     * @param end The ID of the end node.
+     * @param type The relation type of the edge (e.g., "road", "train"). Optional, defaults to an empty string. 
+     * 
+     * Ovcerload 2: Deletes an edge from start to end with the id.
+     * @param edge_id ID of the edge to delete.
+     * 
+     * @throws std::invalid_argument if the relation type exceeds the maximum allowed size.
+     * @throws std::out_of_range if either the start or end node does not exist
+     * @throws std::out_of_range if the edge does not exist
+     */
+
+    /**
      * Generic graph traversal — behavior determined by Policy at compile time.
      * NodeFn: callback(int nodeIdx)            — fired when a node is first visited
      * EdgeFn: callback(int from, int to, int weight) — fired for every edge explored
