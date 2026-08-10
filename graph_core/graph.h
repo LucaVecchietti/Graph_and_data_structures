@@ -185,27 +185,30 @@ public:
         std::unordered_set<int> visited;
         typename Policy::Frontier frontier;
 
-        //Lazy load the start node if it is not already in memory
-        if (nodes.find(start) == nodes.end())
-        {
-            if (static_cast<uint64_t>(start) < meta.next_id)
+        auto lazy_load_node = [&](int node_id) {
+            if (nodes.find(node_id) == nodes.end())
             {
-                try
+                if (static_cast<uint64_t>(node_id) < meta.next_id)
                 {
-                    nodes[start] = read_node(static_cast<uint64_t>(start));
+                    try
+                    {
+                        nodes[node_id] = read_node(static_cast<uint64_t>(node_id));
+                    }
+                    catch (const std::exception &e)
+                    {
+                        Graph::logger.error("Failed to traverse: could not read node " + std::to_string(node_id) + ": " + e.what());
+                        throw std::runtime_error("Failed to read node " + std::to_string(node_id) + ": " + e.what());
+                    }
                 }
-                catch (const std::exception &e)
+                else
                 {
-                    Graph::logger.error("Failed to traverse: could not read node " + std::to_string(start) + ": " + e.what());
-                    throw std::runtime_error("Failed to read node " + std::to_string(start) + ": " + e.what());
+                    Graph::logger.error("Failed to traverse: node " + std::to_string(node_id) + " does not exist.");
+                    throw std::out_of_range("Node " + std::to_string(node_id) + " does not exist.");
                 }
             }
-            else
-            {
-                Graph::logger.error("Failed to traverse: node " + std::to_string(start) + " does not exist.");
-                throw std::out_of_range("Node " + std::to_string(start) + " does not exist.");
-            }
-        }
+        };
+
+        lazy_load_node(start);
 
         // Marks a node as visited, fires the node callback, pushes to frontier
         auto visit = [&](int idx)
@@ -220,6 +223,8 @@ public:
         while (!Policy::empty(frontier))
         {
             int current = Policy::pop(frontier);
+
+            lazy_load_node(current); // Ensure the current node is loaded in memory
 
             // save some time by looking up the node once instead of per edge
             auto nodeIt = nodes.find(current);

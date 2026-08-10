@@ -2,17 +2,48 @@
 
 #include <iostream>
 #include <filesystem>
+#include <string>
 #include <windows.h>
 
 namespace fs = std::filesystem;
 
-// Convenience wrapper around g.bfs for the two-phase smoke test below.
-// on_node logs each visited node id; on_edge logs each (from, to, weight) triple.
-static void run_bfs(Graph &g, int start, const std::string &relation)
+// ---- Tiny assertion harness -----------------------------------------------
+// The phases below no longer ask the reader to eyeball BFS output: every phase
+// states what it expects, and the run ends with a single verdict + exit code.
+static int g_failures = 0;
+
+static void expect(const std::string &label, long long got, long long want)
+{
+    const bool ok = (got == want);
+    if (!ok) ++g_failures;
+    std::cout << "  " << (ok ? "[PASS] " : "[FAIL] ") << label
+              << " -> got " << got << ", want " << want << "\n";
+}
+
+// Result of one traversal: how many distinct nodes were visited and how many
+// edges were explored.
+struct Walk
+{
+    int nodes = 0;
+    int edges = 0;
+    long long weight_sum = 0;
+};
+
+static Walk bfs_walk(Graph &g, int start, const std::string &relation)
+{
+    Walk w;
+    g.bfs(start, relation,
+          [&](int)                { ++w.nodes; },
+          [&](int, int, int wgt)  { ++w.edges; w.weight_sum += wgt; });
+    return w;
+}
+
+// Verbose variant, for the phases where seeing the shape of the walk helps.
+static void print_bfs(Graph &g, int start, const std::string &relation)
 {
     g.bfs(start, relation,
-        [](int idx)                 { std::cout << "  node " << idx << "\n"; },
-        [](int from, int to, int w) { std::cout << "  edge " << from << " -> " << to << " w=" << w << "\n"; }
+        [](int idx)                 { std::cout << "    node " << idx << "\n"; },
+        [](int from, int to, int w) { std::cout << "    edge " << from << " -> " << to << " w=" << w << "\n"; }
     );
 }
 
@@ -28,11 +59,11 @@ int main()
     // Exercises:
     //   - Graph::insert<int>             (primitive payload, fast path)
     //   - Graph::insert<ComplexRecord>   (COMPLEX payload + JSON sidecar)
-    //   - Graph::add_edge                (now persists via update_node_edges:
-    //                                     rewrites relation list + edge chunks,
-    //                                     patches NodeIndex.relation_offset)
+    //   - Graph::add_edge                (O(1) persist via persist_new_edge)
     //   - Graph::bfs                     (in-RAM traversal of the just-written graph)
-    std::cout << "=== Phase 1: fresh writes ===\n";
+    // Everything is resident here, so this is the baseline the cold-cache
+    // phases below are compared against.
+    std::cout << "=== Phase 1: fresh writes (all nodes resident) ===\n";
     {
         Graph g; // init_meta on an empty db/
 
@@ -45,40 +76,57 @@ int main()
         g.add_edge(1, 2, "road");
         g.add_edge(2, 3, "knows");   // int payload -> COMPLEX payload
 
-        std::cout << "BFS from 0 on \"road\":\n";
-        run_bfs(g, 0, "road");
-        std::cout << "BFS from 2 on \"knows\":\n";
-        run_bfs(g, 2, "knows");
-    } // Graph destructor: nothing else written to disk — persisted state already there.
+        std::cout << "  BFS from 0 on \"road\" (chain 0 -> 1 -> 2):\n";
+        print_bfs(g, 0, "road");
 
-    // ===== Phase 2: reload from disk and verify ============================
-    // Exercises:
-    //   - Graph::Graph() loading meta.dat                  (load_meta path)
-    //   - read_node for primitive nodes (id 0, 1, 2)       (read_typed_node else branch)
-    //   - read_node for the COMPLEX node (id 3)            (read_typed_node if constexpr +
-    //                                                       read_complex + sidecar JSON)
-    //   - Persisted "road" / "knows" edges visible after restart
-    //     (regression test for BUG-001).
-    std::cout << "\n=== Phase 2: reload + verify ===\n";
+        Walk road = bfs_walk(g, 0, "road");
+        expect("road: nodes visited", road.nodes, 3);   // 0, 1, 2
+        expect("road: edges explored", road.edges, 2);  // 0->1, 1->2
+
+        Walk knows = bfs_walk(g, 2, "knows");
+        expect("knows: nodes visited", knows.nodes, 2); // 2, 3
+        expect("knows: edges explored", knows.edges, 1);
+    } // Graph destructor: nothing else written — persisted state already there.
+
+    // ===== Phase 2: cold reload — lazy load inside traverse ================
+    // THE discriminating phase for the lazy-loading work. A brand-new Graph has
+    // an EMPTY `nodes` map: only meta.dat and the reverse index are loaded. So a
+    // traversal has to materialise nodes from disk as it walks.
+    //
+    // Previously every phase forced the load by hand with a throwaway
+    // `add_edge(x, y, "_load")` call, which polluted the store and hid this gap.
+    // That trick is gone: the walks below rely on traverse alone.
+    //
+    // Two cases, deliberately separated:
+    //   (a) DEPTH 1  — 2 --knows--> 3. Only the START node must be materialised.
+    //   (b) DEPTH 2  — 0 --road--> 1 --road--> 2. The node discovered at depth 1
+    //                  must ALSO be materialised in order to be expanded.
+    std::cout << "\n=== Phase 2: cold reload + lazy load in traverse ===\n";
     {
-        Graph g; // load_meta — reads next_id=4 from db/meta.dat.
+        Graph g; // load_meta only — `nodes` is empty, nothing is resident
 
-        // Graph::traverse does NOT lazy-load: it silently skips ids that
-        // are not already in the in-RAM `nodes` map. Since there is no
-        // public read_node API on Graph, the simplest trick to pull each
-        // persisted node back into RAM is to call add_edge: it lazy-loads
-        // start/end via read_node when they are absent. A dedicated
-        // "_load" relation type keeps the relations being verified clean.
-        // Side effect: the "_load" edges themselves get persisted — desired
-        // noise for a smoke test, not a correctness problem.
-        g.add_edge(0, 1, "_load");
-        g.add_edge(1, 2, "_load");
-        g.add_edge(2, 3, "_load");
+        std::cout << "  (a) depth-1 walk, BFS from 2 on \"knows\":\n";
+        print_bfs(g, 2, "knows");
+        Walk knows = bfs_walk(g, 2, "knows");
+        expect("cold depth-1: nodes visited", knows.nodes, 2);  // 2, 3
+        expect("cold depth-1: edges explored", knows.edges, 1);
+    }
+    {
+        Graph g; // fresh again, so case (b) starts from a genuinely cold map
 
-        std::cout << "BFS from 0 on \"road\" after reload:\n";
-        run_bfs(g, 0, "road");
-        std::cout << "BFS from 2 on \"knows\" after reload:\n";
-        run_bfs(g, 2, "knows");
+        std::cout << "  (b) depth-2 walk, BFS from 0 on \"road\":\n";
+        print_bfs(g, 0, "road");
+        Walk road = bfs_walk(g, 0, "road");
+        expect("cold depth-2: nodes visited", road.nodes, 3);   // 0, 1, 2
+        expect("cold depth-2: edges explored", road.edges, 2);  // 0->1, 1->2
+    }
+    {
+        Graph g; // a non-existent start must still be rejected, not silently empty
+
+        bool threw = false;
+        try { bfs_walk(g, 999, "road"); }
+        catch (const std::out_of_range &) { threw = true; }
+        expect("cold walk from a never-assigned id throws", threw ? 1 : 0, 1);
     }
 
     // ===== Phase 3: delete + freelist reuse on insert =====================
@@ -91,16 +139,18 @@ int main()
     {
         Graph g; // load_meta — next_id is 4 after phases 1-2.
 
-        // Delete node 1 (an int). Its 4-byte record region + id slot go on the freelist.
-        g.delete_node(1);
+        g.delete_node(1);   // its 4-byte record region + id slot go on the freelist
+        g.insert(777);      // reuse path: recycles id 1, next_id stays 4
 
-        // Insert a new int. The reuse path should recycle id 1 (next_id stays 4)
-        // and overwrite the freed region rather than appending a fresh record.
-        // Watch graph.log for "Inserted node with ID 1 (reused slot) and value 777".
-        g.insert(777);
+        // Node 1 is gone as a hop: the road chain now ends at 0 -> 1(new, no edges).
+        // 0 --road--> 1 was removed by delete_node's inbound cleanup, so the walk
+        // from 0 sees only itself.
+        Walk road = bfs_walk(g, 0, "road");
+        expect("road after delete_node(1): nodes visited", road.nodes, 1);
+        expect("road after delete_node(1): edges explored", road.edges, 0);
 
-        std::cout << "deleted node 1, inserted 777 — see graph.log for id reuse,\n"
-                     "and db/freelist/ for the bin files.\n";
+        std::cout << "  deleted node 1, inserted 777 — see graph.log for id reuse,\n"
+                     "  and db/freelist/ for the bin files.\n";
     }
 
     // ===== Phase 4: COMPLEX delete + reuse ================================
@@ -117,38 +167,29 @@ int main()
         Graph g; // next_id is still 4 after phases 1-3.
 
         g.delete_node(3); // Athlete -> complex bin + recycled prog_number + removed sidecar
-
-        // Re-insert an Athlete: same size class -> pops the complex bin and the
-        // recycled prog_number 0, so the same sidecar filename is reborn with new JSON.
         g.insert(ComplexRecord{ "Athlete", R"({"name":"Gatlin","age":42})" });
 
-        std::cout << "deleted COMPLEX node 3, re-inserted an Athlete — see graph.log for\n"
-                     "id/prog reuse, db/freelist/complex_*.dat and db/attributes/.\n";
+        // The "knows" edge 2 -> 3 was reclaimed with the old node 3.
+        Walk knows = bfs_walk(g, 2, "knows");
+        expect("knows after COMPLEX delete: edges explored", knows.edges, 0);
+
+        std::cout << "  deleted COMPLEX node 3, re-inserted an Athlete — see graph.log for\n"
+                     "  id/prog reuse, db/freelist/complex_*.dat and db/attributes/.\n";
     }
 
     // ===== Phase 5: edge-space compaction (rel/edges bin reuse) ============
-    // Exercises the NEW pop-then-append path in update_node_edges (step 3):
-    // a repeated weight-overwrite of the SAME (start, end, relation) edge.
-    // Each overwrite pushes the node's old relation-list region + 32-byte edge
-    // chunk onto the size-segregated rel/edges bins, then pops the exact-size
-    // region right back (LIFO) -> true in-place rewrite, ZERO file growth.
-    // On the OLD design every overwrite appended a fresh rel region + chunk,
-    // so nodes.dat / edges.dat would grow by 20x (rel region + 32 bytes).
+    // A repeated weight-overwrite of the SAME (start, end, relation) edge must be
+    // an in-place 8-byte write (persist_edge_weight): no allocation, no relink, and
+    // therefore ZERO growth of nodes.dat / edges.dat.
     std::cout << "\n=== Phase 5: edge-space compaction (overwrite loop) ===\n";
     {
         Graph g;
 
-        // Reuse two nodes that are live after phases 1-4 (both are ints):
-        //   node 0 (value 10) and node 2 (value 30). insert() returns void, so
-        //   we use known-live ids instead of capturing fresh ones. node 0 also
-        //   already owns "road"/"_load" relations, so the overwrite rewrites a
-        //   multi-relation list -> exercises several rel/edges bin push/pops.
-        const int a = 0;
-        const int b = 2;
+        const int a = 0;   // value 10, live since phase 1
+        const int b = 2;   // value 30, live since phase 1
 
         // First write of the edge (a NEW edge), then one overwrite to settle
-        // into steady state (the push/pop cycle has run at least once and the
-        // relation-list / edge-chunk sizes are now fixed).
+        // into steady state (sizes are fixed from here on).
         g.add_edge(a, b, "ow", 1);
         g.add_edge(a, b, "ow", 2);
 
@@ -158,33 +199,27 @@ int main()
         std::uintmax_t nodes_before = fs::file_size(nodes_dat);
         std::uintmax_t edges_before = fs::file_size(edges_dat);
 
-        // 20 weight-overwrites of the same edge. If reuse fires, neither file
-        // grows; if it does not, both grow monotonically.
         for (int w = 3; w < 23; ++w)
             g.add_edge(a, b, "ow", w);
 
         std::uintmax_t nodes_after = fs::file_size(nodes_dat);
         std::uintmax_t edges_after = fs::file_size(edges_dat);
 
-        std::cout << "  nodes.dat: before=" << nodes_before
-                  << " after=" << nodes_after
-                  << (nodes_after == nodes_before ? "  [EQUAL]" : "  [GREW]") << "\n";
-        std::cout << "  edges.dat: before=" << edges_before
-                  << " after=" << edges_after
-                  << (edges_after == edges_before ? "  [EQUAL]" : "  [GREW]") << "\n";
-        std::cout << "  compaction verdict: "
-                  << ((nodes_after == nodes_before && edges_after == edges_before)
-                          ? "PASS (zero growth across 20 overwrites)"
-                          : "FAIL (file grew -> reuse not firing)")
-                  << "\n";
+        std::cout << "  nodes.dat: before=" << nodes_before << " after=" << nodes_after << "\n";
+        std::cout << "  edges.dat: before=" << edges_before << " after=" << edges_after << "\n";
+        expect("nodes.dat growth over 20 overwrites", (long long)(nodes_after - nodes_before), 0);
+        expect("edges.dat growth over 20 overwrites", (long long)(edges_after - edges_before), 0);
+
+        // The last written weight must be the one we read back.
+        Walk ow = bfs_walk(g, a, "ow");
+        expect("ow: last weight wins", ow.weight_sum, 22);
     }
 
     // ===== Phase 6: multi-edge chain on one relation (O(1) add + reload) ===
-    // Regression guard for the O(1) add_edge path (persist_new_edge): several
-    // edges under the SAME (node, relation) form a doubly-linked chain spliced at
-    // the head, and a mid-chain weight overwrite (persist_edge_weight) must survive
-    // a reload. The previous phases only ever put one edge per relation, so they
-    // never exercised the chain walk on read / the prev_offset relink on write.
+    // Several edges under the SAME (node, relation) form a doubly-linked chain
+    // spliced at the head; a mid-chain weight overwrite (persist_edge_weight) must
+    // survive a reload. All three targets are leaves, so the reload walk only needs
+    // the START node materialised — depth 1.
     std::cout << "\n=== Phase 6: multi-edge chain (same relation) ===\n";
     {
         Graph g;
@@ -194,46 +229,46 @@ int main()
         g.insert(300); // id 6
         g.insert(400); // id 7
 
-        // node 4 --link--> {5, 6, 7}: a 3-edge chain under one relation.
         g.add_edge(4, 5, "link", 51);
         g.add_edge(4, 6, "link", 61);
         g.add_edge(4, 7, "link", 71);
+        g.add_edge(4, 6, "link", 999);   // mid-chain overwrite
 
-        // Overwrite a MID-chain weight (the splice put 6 in the middle of the list).
-        g.add_edge(4, 6, "link", 999);
-
-        std::cout << "before reload, BFS from 4 on \"link\" (expect 5/w51, 6/w999, 7/w71):\n";
-        run_bfs(g, 4, "link");
+        std::cout << "  before reload:\n";
+        print_bfs(g, 4, "link");
+        Walk before = bfs_walk(g, 4, "link");
+        expect("chain before reload: edges", before.edges, 3);
+        expect("chain before reload: weight sum", before.weight_sum, 51 + 999 + 71);
     }
     {
-        Graph g; // reload: rebuild the chain from disk by walking next_offset.
+        Graph g; // cold: the chain is rebuilt from disk by walking next_offset
 
-        g.add_edge(4, 5, "_load"); // force node 4 back into RAM (lazy-load via add_edge)
-
-        std::cout << "after reload, BFS from 4 on \"link\" (must match: 5/w51, 6/w999, 7/w71):\n";
-        run_bfs(g, 4, "link");
+        std::cout << "  after reload:\n";
+        print_bfs(g, 4, "link");
+        Walk after = bfs_walk(g, 4, "link");
+        expect("chain after reload: nodes", after.nodes, 4);              // 4, 5, 6, 7
+        expect("chain after reload: edges", after.edges, 3);
+        expect("chain after reload: weight sum", after.weight_sum, 51 + 999 + 71);
     }
 
     // ===== Phase 7: relation-batch chaining (> 8 relation types) ===========
-    // Regression guard for the relation batch CHAIN. A batch holds at most
-    // RELATION_LINES_PER_BATCH (8) fixed-width lines; beyond that persist_new_edge
-    // allocates a further batch and links it via next_offset (head 1 -> 2 -> 3...).
-    // This phase drives a hub node past two batch boundaries (17 relation types =>
-    // 8 + 8 + 1) and checks the three paths that must agree on the chain:
-    //   - persist_new_edge      : new line in the last batch / brand-new batch
-    //   - read_relation_node_list: walk next_offset on reload (all 17 relations back)
-    //   - update_node_edges      : whole-chain rewrite (delete_node inbound cleanup)
+    // A batch holds at most RELATION_LINES_PER_BATCH (8) fixed-width lines; beyond
+    // that persist_new_edge allocates a further batch and links it via next_offset
+    // (head 1 -> 2 -> 3...). 17 relation types => 8 + 8 + 1. Checks the three paths
+    // that must agree on the chain: persist_new_edge (new line / new batch),
+    // read_relation_node_list (walk on reload) and update_node_edges (whole-chain
+    // rewrite, driven here by delete_node's inbound cleanup).
     std::cout << "\n=== Phase 7: relation-batch chaining (17 relation types) ===\n";
     const int hub = 8;          // next_id is 8 after phases 1-6
     const int first_target = 9; // targets are ids 9..25
     const int rel_types = 17;
 
-    // Counts the edges a BFS from `hub` finds on each of rel_0..rel_(count-1).
+    // Edges the hub still has over rel_0..rel_(count-1). Each relation holds one
+    // edge to a leaf, so every walk is depth 1.
     auto count_hub_edges = [](Graph &g, int start, int count) {
         int seen = 0;
         for (int i = 0; i < count; ++i)
-            g.bfs(start, "rel_" + std::to_string(i),
-                  [](int) {}, [&](int, int, int) { ++seen; });
+            seen += bfs_walk(g, start, "rel_" + std::to_string(i)).edges;
         return seen;
     };
 
@@ -244,45 +279,41 @@ int main()
         for (int i = 0; i < rel_types; ++i)
             g.insert(2000 + i);                           // ids 9..25 — one target per relation
 
-        // 17 distinct relation types on ONE node: the 9th and the 17th each force a
-        // brand-new batch, so the chain ends up 3 batches long.
+        // The 9th and the 17th type each force a brand-new batch: 3 batches total.
         for (int i = 0; i < rel_types; ++i)
             g.add_edge(hub, first_target + i, "rel_" + std::to_string(i), 100 + i);
 
-        int seen = count_hub_edges(g, hub, rel_types);
-        std::cout << "  before reload, edges over 17 relations: " << seen
-                  << (seen == rel_types ? "  [PASS]" : "  [FAIL]") << "\n";
+        expect("chaining before reload: edges over 17 relations",
+               count_hub_edges(g, hub, rel_types), rel_types);
     }
     {
-        Graph g; // reload: read_relation_node_list must hop next_offset across 3 batches
+        Graph g; // cold: read_relation_node_list must hop next_offset across 3 batches
 
-        g.add_edge(hub, first_target, "_load"); // lazy-load the hub back into RAM
-
-        int seen = count_hub_edges(g, hub, rel_types);
-        std::cout << "  after reload,  edges over 17 relations: " << seen
-                  << (seen == rel_types ? "  [PASS]" : "  [FAIL]") << "\n";
+        expect("chaining after reload: edges over 17 relations",
+               count_hub_edges(g, hub, rel_types), rel_types);
     }
     {
         // Delete the LAST target (id 25, reachable only via rel_16, the lone line of
         // the 3rd batch). The hub is its only inbound owner, so delete_node drives
         // update_node_edges on the hub: the whole 3-batch chain is freed onto the rel
-        // bin and rewritten (16 rel_* + "_load" = 17 types => 3 batches again).
+        // bin and rewritten.
         Graph g;
         g.delete_node(first_target + rel_types - 1); // id 25
     }
     {
-        Graph g; // reload after the chain rewrite
+        Graph g; // cold reload after the chain rewrite
 
-        g.add_edge(hub, first_target, "_load"); // lazy-load the hub (existing relation: weight overwrite)
-
-        int seen = count_hub_edges(g, hub, rel_types - 1); // rel_0..rel_15 survive
-        int gone = count_hub_edges(g, hub, rel_types) - seen;
-        std::cout << "  after chain rewrite, edges over rel_0..rel_15: " << seen
-                  << (seen == rel_types - 1 ? "  [PASS]" : "  [FAIL]") << "\n";
-        std::cout << "  rel_16 (target deleted) must be empty: " << gone
-                  << (gone == 0 ? "  [PASS]" : "  [FAIL]") << "\n";
+        expect("after chain rewrite: edges over rel_0..rel_15",
+               count_hub_edges(g, hub, rel_types - 1), rel_types - 1);
+        expect("after chain rewrite: rel_16 is empty",
+               bfs_walk(g, hub, "rel_16").edges, 0);
     }
 
+    // ===== Verdict =========================================================
+    std::cout << "\n=== Verdict ===\n"
+              << (g_failures == 0 ? "  ALL CHECKS PASSED\n"
+                                  : "  " + std::to_string(g_failures) + " CHECK(S) FAILED\n");
+
     system("pause");
-    return 0;
+    return g_failures == 0 ? 0 : 1;
 }
