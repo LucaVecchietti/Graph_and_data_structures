@@ -6,14 +6,16 @@
 |---|---|
 | Tipo | legacy-decisions |
 | Lingua | en |
-| Ultimo aggiornamento | 2026-08-09 |
-| Commit di riferimento | fbc6703 |
+| Ultimo aggiornamento | 2026-08-10 |
+| Commit di riferimento | 7eaf864 |
 | Mirror | — |
 
 ---
 
 ## Indice
 
+- [2026-08-10 — Lazy load su ogni pop della frontiera, via un unico `ensure_loaded`](#2026-08-10--lazy-load-su-ogni-pop-della-frontiera-via-un-unico-ensure_loaded)
+- [2026-08-09 — Cancellazione di un singolo arco sopra `update_node_edges`](#2026-08-09--cancellazione-di-un-singolo-arco-sopra-update_node_edges)
 - [2026-08-09 — Relation-batch chaining: catena di batch via next_offset](#2026-08-09--relation-batch-chaining-catena-di-batch-via-next_offset)
 - [2026-06-19 — add_edge in O(1): append + relink + in-place line update](#2026-06-19--add_edge-in-o1-append--relink--in-place-line-update)
 - [2026-06-19 — Relation-list a batch fixed-width + Edge a lista doppiamente concatenata](#2026-06-19--relation-list-a-batch-fixed-width--edge-a-lista-doppiamente-concatenata)
@@ -33,6 +35,45 @@
 - [2026-05-26 — Single-open append su nodes.dat](#2026-05-26--single-open-append-su-nodesdat)
 - [2026-05-26 — POD packed e fragilità ABI](#2026-05-26--pod-packed-e-fragilità-abi)
 - [2026-05-26 — Hash table standalone in C (non linkata)](#2026-05-26--hash-table-standalone-in-c-non-linkata)
+
+---
+
+### 2026-08-10 — Lazy load su ogni pop della frontiera, via un unico `ensure_loaded`
+
+- **Stato:** active
+- **Contesto:** `traverse` operava solo sulla mappa `nodes` in RAM: un vicino non residente veniva scartato con un `continue`, quindi su store freddo una walk si fermava a **profondità 1** senza alcun errore. Il difetto era invisibile perché ogni fase dello smoke test forzava i caricamenti a mano con un `add_edge(x, y, "_load")` di scarto — un trucco che, oltre a mascherare il problema, scriveva archi finti nello store. In parallelo lo stesso blocco di lazy load (residente? id assegnato? leggibile?) era copiato in `add_edge`, `delete_node` e `delete_edge`.
+- **Decisione:** il caricamento avviene **quando un nodo esce dalla frontiera**, non prima di partire, attraverso un unico membro privato `Graph::ensure_loaded(int id, const std::string &action)` che tutti i punti di ingresso condividono. Il parametro `action` serve solo a comporre la riga di log, così i messaggi per-chiamante non si sono appiattiti nel refactoring. Essendo per-pop, il meccanismo è indipendente dalla profondità.
+  - Un nodo non caricabile **lancia**: `std::out_of_range` per un id mai assegnato, `std::runtime_error` se il record non è leggibile (tipicamente uno slot tombstoned raggiunto da un arco pendente).
+  - Unica eccezione voluta: la pulizia degli archi entranti in `delete_node` avvolge la chiamata in `try/catch` e **salta** l'owner illeggibile — una delete deve comunque riuscire a reclamare il nodo che le è stato chiesto di rimuovere.
+- **Alternative considerate:**
+  - *Precaricare tutti i nodi alla costruzione del `Graph`*: banale ma butta a terra il senso del lazy load, e su uno store grande costa un O(N+E) a ogni apertura.
+  - *Caricare solo la chiusura dei vicini del nodo di partenza* (primo tentativo, commit `175a877`): copre solo la profondità 1, che è esattamente il caso già funzionante.
+  - *Tenere lo skip silenzioso sui nodi illeggibili*: robusto ai residui, ma nasconde le incoerenze del DB e produce risultati di traversata semanticamente falsi. Scartato in favore del fail-fast, ora che [BUG-018](known_bugs.md#2026-08-09--bug-018-delete_edge-rimuove-la-sorgente-da-in_edges-anche-se-altre-relazioni-puntano-ancora-al-target) ha chiuso la fonte principale di archi pendenti.
+- **Conseguenze:**
+  - **Cambio di contratto** di `traverse`/`bfs`/`dfs`: prima non lanciavano mai, ora sì (vedi [API change](api_changes.md#2026-08-10--graphensure_loaded--traverse-con-lazy-load)).
+  - Una walk materializza **tutta la componente raggiungibile** e `nodes` non ha eviction: la RAM cresce monotona per la vita dell'oggetto `Graph`. Accettabile per un motore single-thread embedded, da rivedere se servirà un working set limitato.
+  - Il ramo "nodo non trovato" dentro `traverse` è diventato irraggiungibile ed è stato rimosso: `ensure_loaded` o inserisce o lancia.
+  - Lo smoke test ha potuto perdere il trucco `"_load"` e diventare auto-verificante, con la Phase 2 che cammina una catena a 2 hop da store freddo.
+- **Riferimenti:** commit `175a877`, `7eaf864`, più working tree per l'estrazione dell'helper. `graph_core/graph.h:50` + `graph_core/graph.cpp:57` (`ensure_loaded`), `graph_core/graph.h:201,221` (`traverse`), `main.cpp` Phase 2.
+
+---
+
+### 2026-08-09 — Cancellazione di un singolo arco sopra `update_node_edges`
+
+- **Stato:** active (implementazione provvisoria: il percorso O(1) resta il target — vedi *Conseguenze*)
+- **Contesto:** finché è esistito solo `delete_node`, l'unico modo di far sparire un arco era cancellare uno dei due nodi. Serviva `delete_edge`, in due forme: per tripla `(start, end, relation)` e per `edge_id` globale.
+- **Decisione:** costruire entrambi gli overload **sopra il rewrite whole-node già esistente** (`update_node_edges`) invece di scrivere subito un unlink O(1): si cancella l'arco dall'adiacenza in RAM e si ri-persiste il nodo. L'overload per id **non duplica** la logica: risolve `edge_id → (start, end, relation)` e delega al primo, così esiste un solo percorso di cancellazione (rewrite + indice inverso + contatori).
+  - La risoluzione dell'id guarda prima i nodi residenti, poi ricade su `find_edge_by_id`, che scansiona la topologia dei nodi vivi come `build_inbound_index` — **non** `edges.dat` in modo piatto, perché uno slot liberato è azzerato e rileggerebbe `id = 0`, indistinguibile dall'edge id 0 reale.
+- **Alternative considerate:**
+  - *Unlink O(1) subito* (patch di `prev_offset`/`next_offset` dei vicini nella catena, free dello slot, decremento di `edge_count` sulla riga della relazione in place): è la forma giusta, ma è lavoro indipendente e più rischioso; rimandato per avere prima l'API corretta e coperta.
+  - *Corpo autonomo per l'overload per id*: raddoppierebbe la logica di cancellazione, con due posti dove sbagliare l'indice inverso o i contatori.
+  - *Indice persistente `edge_id → offset`* per evitare la scansione: nuovo file e nuovo schema da mantenere coerente su ogni splice; sproporzionato rispetto all'uso attuale.
+- **Conseguenze:**
+  - Costo **O(grado totale del nodo)**, non O(1): il rewrite ri-scrive *tutte* le relazioni del nodo. E `edges.dat` cresce di `48 * archi superstiti` per chiamata, perché le run vengono riappese a EOF mentre gli slot liberati restano sul bin `edges` in attesa del prossimo `add_edge`.
+  - L'overload per id paga O(N+E) quando il nodo non è residente.
+  - Ha fatto emergere [BUG-018](known_bugs.md#2026-08-09--bug-018-delete_edge-rimuove-la-sorgente-da-in_edges-anche-se-altre-relazioni-puntano-ancora-al-target): `delete_edge` è il primo percorso che rimuove *una* relazione, e ha reso visibile che `in_edges` è a granularità nodo→nodo.
+  - Nessuna copertura in `main.cpp`: entrambi gli overload sono stati verificati solo con un harness usa-e-getta.
+- **Riferimenti:** commit `f98f847`, `858af5b`. `graph_core/graph.cpp:266,349`, `graph_core/io/graph_io.cpp:867`. Vedi [API change](api_changes.md#2026-08-09--graphdelete_edge-2-overload--find_edge_by_id--edgelocation).
 
 ---
 

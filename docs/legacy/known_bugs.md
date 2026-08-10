@@ -6,14 +6,15 @@
 |---|---|
 | Tipo | legacy-bugs |
 | Lingua | en |
-| Ultimo aggiornamento | 2026-06-13 |
-| Commit di riferimento | cb9939c |
+| Ultimo aggiornamento | 2026-08-10 |
+| Commit di riferimento | 7eaf864 |
 | Mirror | — |
 
 ---
 
 ## Indice
 
+- [2026-08-09 — BUG-018: `delete_edge` rimuove la sorgente da `in_edges` anche se altre relazioni puntano ancora al target](#2026-08-09--bug-018-delete_edge-rimuove-la-sorgente-da-in_edges-anche-se-altre-relazioni-puntano-ancora-al-target)
 - [2026-06-07 — BUG-017: `update_node_edges` orfanizza regioni senza spingerle sulla freelist](#2026-06-07--bug-017-update_node_edges-orfanizza-regioni-senza-spingerle-sulla-freelist)
 - [2026-06-03 — BUG-016: `delete_node` prototipo non aggiorna idx, contatori meta, archi entranti, COMPLEX](#2026-06-03--bug-016-delete_node-prototipo-non-aggiorna-idx-contatori-meta-archi-entranti-complex)
 - [2026-05-30 — BUG-015: `Graph::insert` chiama `std::to_string` su `newNode->data`, incompatibile con `ComplexRecord`](#2026-05-30--bug-015-graphinsert-chiama-stdto_string-su-newnode-data-incompatibile-con-complexrecord)
@@ -31,6 +32,16 @@
 - [2026-05-26 — BUG-003: `reconstruct_neighbors` non implementata](#2026-05-26--bug-003-reconstruct_neighbors-non-implementata)
 - [2026-05-26 — BUG-002: `Edge.id` non globale tra nodi](#2026-05-26--bug-002-edgeid-non-globale-tra-nodi)
 - [2026-05-26 — BUG-001: `add_edge` non persiste su disco](#2026-05-26--bug-001-add_edge-non-persiste-su-disco)
+
+---
+
+### 2026-08-09 — BUG-018: `delete_edge` rimuove la sorgente da `in_edges` anche se altre relazioni puntano ancora al target
+
+- **Stato:** fixed (2026-08-09)
+- **Sintomo:** Con due archi fra gli stessi nodi ma su relazioni diverse (`0 --road--> 1` e `0 --train--> 1`), dopo `delete_edge(0, 1, "road")` un successivo `delete_node(1)` **non** puliva l'arco `train` superstite. Il nodo 0 restava con un vicino verso uno slot tombstoned; alla ricarica quell'arco riappariva nell'adiacenza e, se `insert` aveva già riciclato l'id 1, puntava silenziosamente a un **nodo diverso** — corruzione logica senza nessun errore a runtime. Lo stesso arco fa lanciare `read_node` se il lazy load prova a materializzare lo slot tombstoned.
+- **Root cause:** `Graph::in_edges` è un `unordered_map<int, unordered_set<int>>` con chiave `target → { sorgenti }`: è a granularità **nodo → nodo**, non per relazione (vedi [decisione](design_decisions.md#2026-06-07--indice-inverso-degli-archi-entranti-in-ram)). `delete_edge` faceva `in_edges[end].erase(start)` incondizionatamente, cioè trattava la rimozione di **una** relazione come se il nodo non puntasse più al target. `delete_node` non ha lo stesso difetto: lì la sorgente scompare del tutto, quindi rimuoverla da ogni set è corretto. Il bug è nato con `delete_edge`, che è il primo percorso a rimuovere un singolo arco.
+- **Fix (2026-08-09):** `graph_core/graph.cpp:296-316` — prima di toccare l'indice, `delete_edge` verifica se **qualche** relazione residua del nodo punta ancora a `end`, e solo in caso negativo lo rimuove; l'accesso passa da `in_edges[end]` a `find()`, per non creare set vuoti su target mai visti. Costo O(tipi di relazione del nodo).
+- **Regression guard:** nessuna nel repo — verificato con un harness usa-e-getta (deleting `road` con `train` superstite, poi `delete_node`, poi reload: 0 archi pendenti; e la conferma che senza il fix il check falla). `main.cpp` non copre `delete_edge`: vedi [ROADMAP → Infrastructure](../ROADMAP.md).
 
 ---
 

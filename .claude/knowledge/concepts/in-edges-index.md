@@ -5,7 +5,7 @@ type: concept
 tags: [ram, delete]
 aliases: []
 created: 2026-08-09
-updated: 2026-08-09
+updated: 2026-08-10
 status: active
 ---
 
@@ -24,8 +24,12 @@ so `delete_node` can find inbound owners in O(deg_in) instead of scanning `edges
   O(N+E) scan that reads only live nodes' relation lists, skipping tombstones so zeroed
   regions never register as edges.
 - Maintained incrementally afterwards: `add_edge` inserts `start` into `in_edges[end]`;
-  `delete_node` removes the deleted node's outbound entries and erases its inbound owners.
+  `delete_node` removes the deleted node's outbound entries and erases its inbound owners;
+  `delete_edge` removes `start` only when no relation of it points at `end` any more.
 - Never persisted - it is rebuilt from disk on every load.
+- **The key is a node pair, with no relation in it.** An entry means "this source has at least
+  one edge here", so a per-relation removal may only erase it once that count hits zero -
+  the trap in [[reverse-index-node-granularity]].
 
 ## Why it matters here
 
@@ -39,3 +43,4 @@ would leave dangling neighbours in other nodes that survive a reload.
 - depends on [[persistence-io]] - `build_inbound_index` populates it at load
 - specified by [[decision-in-ram-inbound-index]] - why it is not persisted
 - relates to [[tombstoning]] - the scan must skip tombstoned slots to stay correct
+- causes [[reverse-index-node-granularity]] - the node-to-node key is the trap's root cause

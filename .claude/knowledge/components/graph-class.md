@@ -5,7 +5,7 @@ type: component
 tags: [ram, orchestration]
 aliases: []
 created: 2026-08-09
-updated: 2026-08-09
+updated: 2026-08-10
 status: active
 ---
 
@@ -35,12 +35,17 @@ and rewrite `meta.dat` before returning.
   recycle both the id and the disk region, write in place - and only appends a fresh id if
   no bin matched. Primitive versus COMPLEX writers are selected with `if constexpr`.
 - `add_edge` is O(1) and does persist. A new `(start, relation, end)` triple goes through
-  `persist_new_edge`; an existing one through `persist_edge_weight`. Absent endpoints are
-  lazily loaded via `read_node`. See [[decision-o1-add-edge]].
+  `persist_new_edge`; an existing one through `persist_edge_weight`. See [[decision-o1-add-edge]].
 - `delete_node` drops the node's outbound entries from `in_edges`, uses the reverse index
   to erase inbound owners' edges, frees the RAM node, then tombstones and frees on disk
   ([[tombstoning]]).
+- `delete_edge` removes one edge, by `(start, end, relation)` or by global edge id; the id
+  overload resolves the id and delegates, so there is one delete path
+  ([[decision-single-edge-delete-via-rewrite]]).
 - `traverse<Policy>` is a single template; `bfs`/`dfs` are wrappers ([[traversal-policies]]).
+- `ensure_loaded(id, action)` is the **single lazy-load path**: resident, else `read_node` and
+  cache, else throw. Every entry point above uses it - it replaced six copies of the same block
+  ([[decision-lazy-traversal]]).
 
 ## Contracts and constraints
 
@@ -61,3 +66,6 @@ and rewrite `meta.dat` before returning.
 - uses [[logger]] - constructs `Logger("graph.log", LogLevel::DEBUG)`
 - relates to [[tombstoning]] - how delete_node behaves on disk
 - implements [[decision-o1-add-edge]] - the add_edge fast path
+- implements [[decision-lazy-traversal]] - `ensure_loaded` is the shared lazy-load path
+- implements [[decision-single-edge-delete-via-rewrite]] - both `delete_edge` overloads
+- relates to [[reverse-index-node-granularity]] - the check `delete_edge` must do on `in_edges`

@@ -6,8 +6,8 @@
 |---|---|
 | Tipo | architecture |
 | Lingua | en |
-| Ultimo aggiornamento | 2026-08-09 |
-| Commit di riferimento | fbc6703 |
+| Ultimo aggiornamento | 2026-08-10 |
+| Commit di riferimento | 7eaf864 |
 | Mirror | — |
 
 ---
@@ -188,6 +188,48 @@ read_typed_node<T>      (graph_core/io/graph_io.h)
    │ neighbor pointers left as nullptr  ← must be re-linked later
 ```
 
+### Traversal flow (lazy, since 2026-08-10)
+
+`read_node` is never called by a caller directly: every entry point goes through
+`Graph::ensure_loaded`, which is also what makes a traversal work on a cold store.
+
+```
+Graph::bfs / dfs        (graph_core/graph.h)
+   │ traverse<Policy>(start, relation, on_node, on_edge)
+   ▼
+ensure_loaded(start)    ← resident? else read_node + cache; throws if absent/unreadable
+visit(start)            ← on_node + push on the Policy::Frontier
+   │
+   ▼  while frontier not empty
+pop(current)
+   │ ensure_loaded(current)      ← THE lazy step: a node discovered as a neighbour
+   │                               is not resident yet. Skipping it (pre-2026-08-10)
+   │                               cut every cold walk short at depth 1.
+   │ neighborgs.find(relation)   ← no edge of this relation → skip this node
+   │ for each (to_id, EdgeRef): on_edge(current, to_id, weight)
+   │                            if unvisited → visit(to_id)
+   ▼
+(RAM grows with the whole reachable component — `nodes` has no eviction)
+```
+
+### Single-edge delete flow (since 2026-08-09)
+
+```
+Graph::delete_edge(start, end, relation)      (graph_core/graph.cpp)
+   │ ensure_loaded(start), ensure_loaded(end)
+   │ erase the EdgeRef from RAM; drop the relation if it emptied
+   │ update_node_edges(node, meta, start)     ← whole-node rewrite: O(deg),
+   │                                            edges.dat grows by 48 * survivors
+   │ in_edges[end].erase(start) ONLY IF no other relation of start points at end
+   │ meta.edge_count--  →  write_meta(meta)
+   ▲
+   │ delegates
+Graph::delete_edge(edge_id)
+   │ guard edge_id < meta.next_edge_id
+   │ scan resident nodes for EdgeRef.id == edge_id
+   │ else find_edge_by_id(edge_id, meta.next_id)   ← O(N+E) live-node scan
+```
+
 ## Dipendenze cross-modulo
 
 ```
@@ -221,3 +263,5 @@ main.cpp
 - [Relation-list a batch fixed-width + Edge a lista doppiamente concatenata](../legacy/design_decisions.md#2026-06-19--relation-list-a-batch-fixed-width--edge-a-lista-doppiamente-concatenata) — the fixed-width relation batch and edge linked-list format (groundwork for O(1) `add_edge`).
 - [add_edge in O(1): append + relink + in-place line update](../legacy/design_decisions.md#2026-06-19--add_edge-in-o1-append--relink--in-place-line-update) — how `add_edge`/overwrite became O(1) on that format.
 - [Relation-batch chaining: catena di batch via next_offset](../legacy/design_decisions.md#2026-08-09--relation-batch-chaining-catena-di-batch-via-next_offset) — how a node goes past 8 relation types without moving anything.
+- [Lazy load su ogni pop della frontiera, via un unico ensure_loaded](../legacy/design_decisions.md#2026-08-10--lazy-load-su-ogni-pop-della-frontiera-via-un-unico-ensure_loaded) — why a traversal materialises nodes as it walks, and what it now throws.
+- [Cancellazione di un singolo arco sopra update_node_edges](../legacy/design_decisions.md#2026-08-09--cancellazione-di-un-singolo-arco-sopra-update_node_edges) — why `delete_edge` reuses the whole-node rewrite instead of an O(1) unlink.

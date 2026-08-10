@@ -5,7 +5,7 @@ type: component
 tags: [traversal]
 aliases: []
 created: 2026-08-09
-updated: 2026-08-09
+updated: 2026-08-10
 status: active
 ---
 
@@ -30,12 +30,17 @@ difference between them.
   wrappers that pick a policy.
 - A traversal follows a **single** relation type and fires `on_node(id)` and
   `on_edge(from, to, weight)`.
+- Every node is materialised as it leaves the frontier, via `Graph::ensure_loaded` - so a walk
+  of any depth works on a cold store. See [[decision-lazy-traversal]].
 
 ## Contracts and constraints
 
-- Traversal does **not** lazy-load: ids that are not already in the RAM `nodes` map are
-  silently skipped. `main.cpp` works around this by forcing loads with a throwaway `"_load"`
-  relation before traversing - see [[smoke-test]].
+- A node that cannot be materialised is **fatal**, not skipped: `std::out_of_range` for a
+  never-assigned start id, `std::runtime_error` for an unreadable record (a dangling edge into
+  a tombstoned slot). Before 2026-08-10 traversal skipped silently instead, which truncated
+  every cold walk at depth 1.
+- A walk pulls the whole reachable component into RAM and `nodes` has no eviction, so memory
+  only grows for the lifetime of the `Graph`.
 - Policies are static structs, not virtuals, deliberately: the alternative was runtime
   indirection inside a hot loop.
 
@@ -43,4 +48,5 @@ difference between them.
 
 - part of [[graph-class]] - `traverse` is a member template of Graph
 - relates to [[edge-record]] - it walks the adjacency rebuilt from these chains
-- relates to [[smoke-test]] - the `_load` trick exists because of the no-lazy-load rule
+- implements [[decision-lazy-traversal]] - the per-pop lazy load lives in this template
+- verified by [[smoke-test]] - phase 2 walks a 2-hop chain from a cold store

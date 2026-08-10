@@ -6,8 +6,8 @@
 |---|---|
 | Tipo | module |
 | Lingua | en |
-| Ultimo aggiornamento | 2026-08-09 |
-| Commit di riferimento | fbc6703 |
+| Ultimo aggiornamento | 2026-08-10 |
+| Commit di riferimento | 7eaf864 |
 | Mirror | — |
 
 ---
@@ -223,7 +223,8 @@ In-memory form of one relation-type entry parsed from a `NodeRelationList` tail 
 ### `class Graph` (`graph.h`)
 **Members:**
 - `std::unordered_map<int, BaseNode*> nodes` — owns all heap-allocated nodes; freed in the destructor.
-- `std::unordered_map<int, std::unordered_set<int>> in_edges` — inbound (reverse) edge index `to_id → {from_id}`. In-RAM only, never persisted; rebuilt from disk at load by `build_in_edges` and maintained incrementally by `add_edge` / `delete_node`. Lets `delete_node` find inbound edges in O(deg_in). Added 2026-06-07 — see the [reverse-index decision](../legacy/design_decisions.md#2026-06-07--indice-inverso-degli-archi-entranti-in-ram).
+- `std::unordered_map<int, std::unordered_set<int>> in_edges` — inbound (reverse) edge index `to_id → {from_id}`. In-RAM only, never persisted; rebuilt from disk at load by `build_in_edges` and maintained incrementally by `add_edge` / `delete_node` / `delete_edge`. Lets `delete_node` find inbound edges in O(deg_in). Added 2026-06-07 — see the [reverse-index decision](../legacy/design_decisions.md#2026-06-07--indice-inverso-degli-archi-entranti-in-ram).
+  **Invariant:** the index is keyed **node → node**, with no relation granularity. A source stays in a target's set as long as *any* of its relations still points there, so a per-relation removal must check the other relations before touching it — getting this wrong left edges dangling at tombstoned slots ([BUG-018](../legacy/known_bugs.md#2026-08-09--bug-018-delete_edge-rimuove-la-sorgente-da-in_edges-anche-se-altre-relazioni-puntano-ancora-al-target)).
 - `MetaRecord meta` — in-RAM copy of `meta.dat`.
 - `Logger logger` — writes to `graph.log` with `DEBUG` floor.
 
@@ -231,6 +232,7 @@ In-memory form of one relation-type entry parsed from a `NodeRelationList` tail 
 - `void init_meta()` — zero-fill `meta` and write `meta.dat`. Called by the constructor when no `meta.dat` exists.
 - `void load_meta()` — read `meta.dat` into `meta`.
 - `void build_in_edges()` — `in_edges = build_inbound_index(meta.next_id)`. Called by the constructor on the load path (existing DB). One O(N+E) disk scan.
+- `BaseNode *ensure_loaded(int id, const std::string &action)` (`graph.cpp:57`) — **the single lazy-load path** (since 2026-08-10). Returns the node from `nodes` if resident, else `read_node`s it and caches it. `action` only shapes the log line (`"add edge"`, `"traverse"`, `"delete node"`, ...), so per-caller log context survived the de-duplication. Throws `std::out_of_range` if `id >= meta.next_id` (never assigned) and `std::runtime_error` if the record cannot be read (e.g. a tombstoned slot). Used by `add_edge` (both endpoints), `delete_node`, `delete_edge` (both endpoints) and `traverse` (start + every frontier pop) — it replaced six copies of the same block. See the [lazy-load decision](../legacy/design_decisions.md#2026-08-10--lazy-load-su-ogni-pop-della-frontiera-via-un-unico-ensure_loaded).
 
 **Public methods:** see next section.
 
@@ -258,15 +260,15 @@ Both paths place the node in `nodes[node_id]`, log at INFO, then `write_meta(met
 
 ### `void Graph::delete_node(int node_id)` (`graph.cpp:163`)
 Fully deletes a node (added 2026-06-03, completed 2026-06-07 — [BUG-016](../legacy/known_bugs.md#2026-06-03--bug-016-delete_node-prototipo-non-aggiorna-idx-contatori-meta-archi-entranti-complex) closed). See [API change](../legacy/api_changes.md#2026-06-03--nuova-graphdelete_nodeint).
-1. If `node_id` not in RAM: lazy-load via `read_node` when `node_id < meta.next_id` (same pattern as `add_edge`), else throw `std::out_of_range`. A failed reload throws `std::runtime_error`.
+1. `ensure_loaded(node_id, "delete node")` — resident or read from disk; throws if the id was never assigned or the record is unreadable.
 2. Logs the count of outgoing edges. **Reverse-index outbound cleanup:** for every neighbor the node points at, removes `node_id` from `in_edges[neighbor]`. Decrements `meta.edge_count` by the node's outgoing edge count.
-3. **Inbound cleanup:** for each owner in `in_edges[node_id]`, loads it (lazy), erases `node_id` from every relation of its adjacency (dropping relations left empty), re-persists it via `update_node_edges`, and decrements `meta.edge_count` per removed edge. Then drops `in_edges[node_id]`. This is what prevents dangling neighbors after a reload.
+3. **Inbound cleanup:** for each owner in `in_edges[node_id]`, loads it via `ensure_loaded` — the one call site that catches and **skips** an unreadable owner instead of propagating, so a delete still reclaims the node it was asked to remove — erases `node_id` from every relation of its adjacency (dropping relations left empty), re-persists it via `update_node_edges`, and decrements `meta.edge_count` per removed edge. Then drops `in_edges[node_id]`. This is what prevents dangling neighbors after a reload.
 4. Erases the node from `nodes` and `delete`s the pointer.
 5. Calls `delete_node_from_disk(node_id, meta)` (orphans + zeroes the node's regions, tombstones its idx slot, removes the COMPLEX sidecar if any, updates `node_count`/`free_count`/`free_edge_count`), then `write_meta(meta)`.
 
 ### `void Graph::add_edge(int start, int end, std::string type = "", int weight = 1)` (`graph.cpp:53`)
 1. Rejects `type` longer than `RELATION_TYPE_MAX_SIZE` (throws `std::invalid_argument`).
-2. For each endpoint not in RAM: if id `< meta.next_id`, `read_node` from disk and cache; else throw `std::out_of_range`.
+2. `ensure_loaded` on both endpoints (resident, or read from disk and cached; throws otherwise).
 3. Resolves the edge id and whether it is new: a brand-new `(start, type, end)` triple consumes a fresh id from `meta.next_edge_id`; an existing triple reuses the id **and disk offset** already stored in its `EdgeRef` (only the weight is overwritten).
 4. **O(1) persist (since 2026-06-19):**
    - **New edge:** `persist_new_edge(meta, start, type, end, edge_id, weight)` appends/reuses one `Edge`, splices it at the relation's chain head, and updates that one fixed-width relation line in place (the batch never moves → `nodes.idx` untouched). The returned disk offset is stored into `EdgeRef{id, weight, end_ptr, offset}`; then `in_edges[end].insert(start)`, `meta.next_edge_id++`, `meta.edge_count++`.
@@ -275,11 +277,30 @@ Fully deletes a node (added 2026-06-03, completed 2026-06-07 — [BUG-016](../le
 
 **Side effects on disk (O(1) path, since 2026-06-19):** a new edge writes one `Edge` to `edges.dat` (append or a reused 48 B slot), patches the old chain head's `prev_offset` in place, and rewrites one relation line (+ the header for a brand-new relation type) in place — `nodes.dat` does not grow, `edges.dat` grows by ≤48 B, `nodes.idx` is **not** touched. An overwrite writes 8 bytes in place (no growth). `add_edge` no longer calls `update_node_edges`. See the [O(1) add_edge decision](../legacy/design_decisions.md#2026-06-19--add_edge-in-o1-append--relink--in-place-line-update), [BUG-001 fixed](../legacy/known_bugs.md#2026-05-26--bug-001-add_edge-non-persiste-su-disco), [BUG-002 fixed](../legacy/known_bugs.md#2026-05-26--bug-002-edgeid-non-globale-tra-nodi).
 
-### `template<class Policy, class NodeFn, class EdgeFn> void Graph::traverse(int start, const std::string& type, NodeFn on_node, EdgeFn on_edge)` (`graph.h:76`)
-Generic graph traversal. Maintains `visited` and a `Policy::Frontier`. On visit, calls `on_node(idx)` and pushes to the frontier. On each pop, iterates the node's neighbors for the requested `type`, calls `on_edge(from, to, weight)` for every edge, and visits unvisited targets. Missing node or missing relation → silently skipped.
+### `template<class Policy, class NodeFn, class EdgeFn> void Graph::traverse(int start, const std::string& type, NodeFn on_node, EdgeFn on_edge)` (`graph.h:182`)
+Generic graph traversal. Maintains `visited` and a `Policy::Frontier`. On visit, calls `on_node(idx)` and pushes to the frontier. On each pop it **materialises the node via `ensure_loaded`**, then iterates its neighbors for the requested `type`, calls `on_edge(from, to, weight)` for every edge, and visits unvisited targets. A node with no edge of the traversed relation is skipped.
 
-### `bfs(...)` / `dfs(...)` (`graph.h:115` / `graph.h:121`)
+**Lazy loading (since 2026-08-10).** Before, `traverse` only saw what was already in `nodes`: a neighbour discovered mid-walk was dropped with a `continue`, so on a cold store a walk stopped at **depth 1** with no error — callers papered over it with a throwaway `add_edge(x, y, "_load")` to force the loads. Now the load happens per frontier pop, so the walk works at any depth and no `"_load"` trick is needed. Consequences worth knowing:
+- A missing/unreadable node is now **fatal**, not skipped: `std::out_of_range` for a never-assigned start id, `std::runtime_error` for an unreadable record (a dangling edge into a tombstoned slot). This is a behavioural change — see the [API change](../legacy/api_changes.md#2026-08-10--graphensure_loaded--traverse-con-lazy-load).
+- A walk pulls the **whole reachable component** into RAM and `nodes` has no eviction, so memory only grows for the lifetime of the `Graph`.
+- Regression guard: `main.cpp` Phase 2 walks a 2-hop chain from a freshly constructed `Graph`.
+
+### `bfs(...)` / `dfs(...)` (`graph.h:243` / `graph.h:249`)
 Thin wrappers selecting `BFSPolicy` / `DFSPolicy`.
+
+### `void Graph::delete_edge(int start, int end, std::string type = "")` (`graph.cpp:266`)
+Removes **one** edge, leaving the rest of the node in place (added 2026-08-09).
+1. `ensure_loaded` on both endpoints.
+2. Looks up `type` then `end` in the start node's adjacency; a missing relation or edge throws `std::out_of_range`.
+3. Erases the `EdgeRef` from RAM, dropping the relation entry if it became empty.
+4. Re-persists the node with `update_node_edges` — hence **O(total degree of the node)**, and `edges.dat` grows by `48 * surviving edges` (the rewrite re-appends every relation's run at EOF while the freed slots wait on the `edges` bin).
+5. **Reverse index:** removes `start` from `in_edges[end]` **only if no other relation of `start` still points at `end`** — `in_edges` is keyed node → node, with no relation granularity ([BUG-018](../legacy/known_bugs.md#2026-08-09--bug-018-delete_edge-rimuove-la-sorgente-da-in_edges-anche-se-altre-relazioni-puntano-ancora-al-target)).
+6. `meta.edge_count--`, then `write_meta(meta)`.
+
+### `void Graph::delete_edge(int edge_id)` (`graph.cpp:349`)
+Same deletion, addressed by the global edge id. Guards `edge_id >= meta.next_edge_id` (never assigned → `std::out_of_range`), resolves the id to `(start, end, relation)` — scanning the resident nodes first, then falling back to `find_edge_by_id` (O(N+E) on disk) — and **delegates to the overload above**, so there is exactly one delete path. Throws `std::out_of_range` if no live edge carries the id (including an already-deleted one).
+
+> Reading trap: `delete_edge(5)` deletes the edge whose **id** is 5; `delete_edge(5, 3)` deletes the edge 5→3. Same name, different meaning for the first argument, told apart only by arity. See the [decision](../legacy/design_decisions.md#2026-08-09--cancellazione-di-un-singolo-arco-sopra-update_node_edges).
 
 ### I/O helpers (`io/graph_io.h`)
 
@@ -306,6 +327,7 @@ Thin wrappers selecting `BFSPolicy` / `DFSPolicy`.
 | `void delete_node_from_disk(uint64_t node_id, MetaRecord& meta)` | Orphans the node's regions (NodeRecord, RelationNodeList, each edge chunk) onto the size bins via `write_free_offset`, **zeroes** those byte regions (`zero_region`), **tombstones** the `nodes.idx` slot (`type_id = TOMBSTONE`, offsets zeroed), and updates the counters (`node_count--`, `free_count++`, `free_edge_count += chunks`). `meta` is taken by non-`const` ref since 2026-06-07 (caller does `write_meta`). For COMPLEX: reads the on-disk `ComplexHeader` for the real record size → `complex_<size>` bin, `remove()`s the JSON sidecar, and recycles its `prog_number` onto the json free list. Throws `runtime_error` on file-open failure. |
 | `template<T> void write_node_in_freed_slot(const Node<T>&, uint64_t node_id, uint64_t record_offset)` | Reuse-path counterpart of `write_node`: writes `NodeRecord<T>` **in place** at the freed `record_offset` in `nodes.dat`, the `NodeIndex` **in place** at the freed id slot in `nodes.idx`, and **appends** the (empty) `NodeRelationList` batch at end-of-`nodes.dat`. Never instantiated for COMPLEX (variable on-disk size). |
 | `void write_complex_in_freed_slot(const Node<ComplexRecord>&, uint64_t node_id, uint64_t record_offset)` (inline) | COMPLEX counterpart of `write_node_in_freed_slot`. Writes `ComplexHeader` + two strings **in place** at the freed `record_offset` (exact-fit slot) via `complex_node_to_record` + `write_complex` (which also writes the sidecar and assigns the `prog_number`), appends the empty `NodeRelationList` batch, and writes the `NodeIndex` (`type_id = COMPLEX`) in place. Added 2026-06-07. |
+| `std::optional<EdgeLocation> find_edge_by_id(uint64_t edge_id, uint64_t next_id)` | Resolves a global edge id to `EdgeLocation{from_node, to_node, relation}` (added 2026-08-09). There is no `edge_id` → offset index, so it scans the live-node topology like `build_inbound_index`: per non-tombstoned `nodes.idx` slot it walks the relation batch **chain** and each relation's edge chain until `Edge.id == edge_id`. O(N+E), `std::nullopt` if no live edge carries the id. A flat scan of `edges.dat` would **not** be sound: a freed 48 B slot is zeroed and reads back as `id = 0`, colliding with the real edge id 0. Used by `Graph::delete_edge(int edge_id)`. |
 | `std::unordered_map<int, std::unordered_set<int>> build_inbound_index(uint64_t next_id)` | Scans every live node (skips `TOMBSTONE`) and follows its relation chunks to build the reverse index `to_node → {from_node}`. O(N+E). Only live nodes' chunks are read, so zeroed/freed edges are never counted. Used by `Graph::build_in_edges` at load. Added 2026-06-07. |
 | `uint64_t complex_record_on_disk_size(uint64_t type_label_len)` (inline) | On-disk size of a COMPLEX record as a pure function of `type_label` length: `sizeof(ComplexHeader) + L + (COMPLEX_PROG_DIGITS + 1 + L + 5)`. Used to pick the `complex_<size>` bin on insert. Added 2026-06-07. |
 | `std::filesystem::path json_freelist_path()` (inline) | Path of the json free list `db/freelist/json_prog.dat` (LIFO stack of freed `prog_number`s). Added 2026-06-07. |
@@ -411,6 +433,11 @@ No third-party libraries. No dependency on `data_tructures/`.
 
 ## Voci legacy collegate
 
+- [Lazy load su ogni pop della frontiera, via un unico ensure_loaded](../legacy/design_decisions.md#2026-08-10--lazy-load-su-ogni-pop-della-frontiera-via-un-unico-ensure_loaded)
+- [API — Graph::ensure_loaded + traverse con lazy load](../legacy/api_changes.md#2026-08-10--graphensure_loaded--traverse-con-lazy-load)
+- [Cancellazione di un singolo arco sopra update_node_edges](../legacy/design_decisions.md#2026-08-09--cancellazione-di-un-singolo-arco-sopra-update_node_edges)
+- [API — Graph::delete_edge (2 overload) + find_edge_by_id / EdgeLocation](../legacy/api_changes.md#2026-08-09--graphdelete_edge-2-overload--find_edge_by_id--edgelocation)
+- [BUG-018 — delete_edge e la granularità di in_edges (fixed)](../legacy/known_bugs.md#2026-08-09--bug-018-delete_edge-rimuove-la-sorgente-da-in_edges-anche-se-altre-relazioni-puntano-ancora-al-target)
 - [Relation-batch chaining: catena di batch via next_offset](../legacy/design_decisions.md#2026-08-09--relation-batch-chaining-catena-di-batch-via-next_offset)
 - [API — Firme relation-batch: relation_batch_header, read_relation_node_list con batch_offsets](../legacy/api_changes.md#2026-08-09--firme-relation-batch-relation_batch_header-read_relation_node_list-con-batch_offsets)
 - [add_edge in O(1): append + relink + in-place line update](../legacy/design_decisions.md#2026-06-19--add_edge-in-o1-append--relink--in-place-line-update)
@@ -470,8 +497,11 @@ No third-party libraries. No dependency on `data_tructures/`.
 
 - `graph_core/graph.h:19` — `class Graph`.
 - `graph_core/graph.h:43` — `insert<T>` template.
-- `graph_core/graph.h:76` — `traverse<Policy, ...>` template.
-- `graph_core/graph.cpp:57` — `add_edge` (resolves edge id, bumps `next_edge_id`/`edge_count`).
+- `graph_core/graph.h:50` + `graph_core/graph.cpp:57` — `ensure_loaded` (single lazy-load path).
+- `graph_core/graph.h:182` — `traverse<Policy, ...>` template (lazy-loads on every frontier pop).
+- `graph_core/graph.cpp:95` — `add_edge` (resolves edge id, bumps `next_edge_id`/`edge_count`).
+- `graph_core/graph.cpp:266` / `graph_core/graph.cpp:349` — `delete_edge` by triple / by edge id.
+- `graph_core/io/graph_io.h:118,140` + `graph_core/io/graph_io.cpp:867` — `EdgeLocation`, `find_edge_by_id`.
 - `graph_core/struct/domain_struct.h:24` — `EdgeRef` (RAM-side edge: `id`, `weight`, `neighbor`, `offset`).
 - `graph_core/io/graph_io.h` / `graph_core/io/graph_io.cpp` — `persist_new_edge`, `persist_edge_weight` (O(1) add/overwrite), `free_edge_chain` (per-edge reclaim).
 - `graph_core/struct/domain_struct.h:35` — `BaseNode` (`neighborgs` value type now `EdgeRef`).

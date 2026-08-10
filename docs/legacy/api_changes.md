@@ -6,14 +6,16 @@
 |---|---|
 | Tipo | legacy-api |
 | Lingua | en |
-| Ultimo aggiornamento | 2026-08-09 |
-| Commit di riferimento | fbc6703 |
+| Ultimo aggiornamento | 2026-08-10 |
+| Commit di riferimento | 7eaf864 |
 | Mirror | — |
 
 ---
 
 ## Indice
 
+- [2026-08-10 — `Graph::ensure_loaded` + `traverse` con lazy load](#2026-08-10--graphensure_loaded--traverse-con-lazy-load)
+- [2026-08-09 — `Graph::delete_edge` (2 overload) + `find_edge_by_id` / `EdgeLocation`](#2026-08-09--graphdelete_edge-2-overload--find_edge_by_id--edgelocation)
 - [2026-08-09 — Firme relation-batch: `relation_batch_header`, `read_relation_node_list` con `batch_offsets`](#2026-08-09--firme-relation-batch-relation_batch_header-read_relation_node_list-con-batch_offsets)
 - [2026-06-19 — add_edge O(1): `EdgeRef.offset` + `persist_new_edge` / `persist_edge_weight`](#2026-06-19--add_edge-o1-edgerefoffset--persist_new_edge--persist_edge_weight)
 - [2026-06-19 — `RelationNodeList` → `NodeRelationList`: header esteso + tail fixed-width](#2026-06-19--relationnodelist--noderelationlist-header-esteso--tail-fixed-width)
@@ -46,6 +48,82 @@
 > Nota: il progetto non ha ancora consumatori esterni, quindi "API pubblica" qui significa: classe `Graph`, POD persistiti su disco (`pod_struct.h`), funzioni esposte nei header pubblici (`io/graph_io.h`, `io/io_utils.h`, `odt/*.h`, `struct/*.h`).
 >
 > Le modifiche ai POD persistiti sono particolarmente sensibili perché rompono il formato su disco — andranno tracciate qui anche se prive di consumatori esterni.
+
+---
+
+### 2026-08-10 — `Graph::ensure_loaded` + `traverse` con lazy load
+
+- **Motivazione:** `traverse` non caricava nulla: vedeva solo i nodi già in RAM e **saltava in silenzio** quelli scoperti come vicini, quindi su store freddo una walk si fermava a profondità 1. Ogni fase dello smoke test lo mascherava forzando i caricamenti a mano con un `add_edge(x, y, "_load")` di scarto. Nel sistemarlo è emerso che lo stesso blocco di lazy load era copiato in quattro punti, con messaggi di log leggermente diversi.
+- **Before:**
+  ```cpp
+  // graph.h — traverse: nessun caricamento, il vicino non residente viene scartato
+  while (!Policy::empty(frontier)) {
+      int current = Policy::pop(frontier);
+      auto nodeIt = nodes.find(current);
+      if (nodeIt == nodes.end()) continue;      // <- la walk muore qui
+      ...
+  }
+
+  // add_edge / delete_node / delete_edge: lo stesso blocco, 20 righe, ripetuto
+  if (nodes.find(start) == nodes.end()) {
+      if (static_cast<uint64_t>(start) < meta.next_id) {
+          try { nodes[start] = read_node(static_cast<uint64_t>(start)); }
+          catch (const std::exception &e) { logger.error("Failed to add edge: ..."); throw std::runtime_error(...); }
+      } else { logger.error(...); throw std::out_of_range(...); }
+  }
+  ```
+- **After:**
+  ```cpp
+  // graph.h — nuovo membro privato: percorso di lazy load unico
+  BaseNode *ensure_loaded(int id, const std::string &action);
+  // `action` compone solo la riga di log ("add edge", "traverse", "delete node", ...)
+  // throws std::out_of_range  se l'id non è mai stato assegnato (>= meta.next_id)
+  // throws std::runtime_error se il record non è leggibile (es. slot tombstoned)
+
+  // traverse: ogni nodo estratto dalla frontiera viene materializzato
+  ensure_loaded(start, "traverse");
+  while (!Policy::empty(frontier)) {
+      int current = Policy::pop(frontier);
+      BaseNode *current_node = ensure_loaded(current, "traverse");
+      ...
+  }
+  ```
+- **Note di migrazione:**
+  - **Cambio di contratto di `traverse`/`bfs`/`dfs`:** prima non lanciavano mai per un nodo mancante (walk silenziosamente troncata); ora lanciano `std::out_of_range` su un id di partenza mai assegnato e `std::runtime_error` se un nodo raggiunto non è leggibile (arco pendente verso uno slot tombstoned). Fail-fast al posto dello skip.
+  - Il trucco `add_edge(x, y, "_load")` per forzare i caricamenti **non serve più** e va rimosso dai chiamanti: sporcava lo store con archi finti. `main.cpp` è stato riscritto senza.
+  - Il ramo `if (nodes.find(current) == nodes.end()) continue;` dentro `traverse` era diventato codice morto dopo il fix (la lambda inserisce o lancia) ed è stato rimosso.
+  - Conseguenza operativa: una walk materializza tutta la componente raggiungibile e `nodes` non ha eviction, quindi la RAM cresce per la vita del `Graph`.
+  - L'unico call site che **non** propaga è la pulizia degli archi entranti in `delete_node`: avvolge `ensure_loaded` in `try/catch` e salta l'owner illeggibile, perché una delete deve comunque reclamare il nodo richiesto.
+- **Riferimenti:** commit `175a877` (lazy load del solo nodo di partenza), `7eaf864` (lazy load su ogni pop), più working tree per l'estrazione dell'helper. `graph_core/graph.h:50` (dichiarazione), `graph_core/graph.cpp:57` (definizione), `graph_core/graph.h:201,221` (uso in `traverse`), `graph_core/graph.cpp:105,173,217,274` (gli altri call site). Regression guard: `main.cpp` Phase 2.
+
+---
+
+### 2026-08-09 — `Graph::delete_edge` (2 overload) + `find_edge_by_id` / `EdgeLocation`
+
+- **Motivazione:** rimuovere **un** arco senza cancellare il nodo. Prima l'unico modo di far sparire un arco era `delete_node` sull'uno dei due estremi.
+- **Before:**
+  ```cpp
+  // graph.h — dichiarati ma con corpo assente (overload 2 non definito: errore di link se chiamato)
+  void delete_edge(int start, int end, std::string type = "");
+  void delete_edge(int edge_id);
+  ```
+- **After:**
+  ```cpp
+  // graph.h / graph.cpp — entrambi implementati
+  void delete_edge(int start, int end, std::string type = "");  // erase in RAM + update_node_edges + in_edges + meta
+  void delete_edge(int edge_id);                                // risolve l'id, poi delega al primo
+
+  // io/graph_io.h — supporto per l'overload per id
+  struct EdgeLocation { uint64_t from_node; uint64_t to_node; std::string relation; };
+  std::optional<EdgeLocation> find_edge_by_id(uint64_t edge_id, uint64_t next_id);
+  ```
+- **Note di migrazione:**
+  - **Trabocchetto di lettura:** `delete_edge(5)` cancella l'arco con **id** 5, `delete_edge(5, 3)` cancella l'arco 5→3. Stesso nome, primo argomento con significato diverso, distinti solo per arità.
+  - `delete_edge(int edge_id)` risolve l'id cercando prima fra i nodi residenti, poi con `find_edge_by_id`: non esiste un indice `edge_id → offset`, quindi il fallback è una scansione **O(N+E)** della topologia dei nodi vivi (non di `edges.dat`, dove uno slot liberato è azzerato e leggerebbe `id = 0`, indistinguibile dall'edge id 0 reale).
+  - Entrambi gli overload lanciano `std::out_of_range` per nodo / arco / relazione inesistenti, e per un id mai assegnato o già cancellato.
+  - **Costo:** la cancellazione passa dal rewrite whole-node `update_node_edges`, quindi è O(grado totale del nodo) e fa crescere `edges.dat` di `48 * archi superstiti` per chiamata. Il percorso O(1) (unlink dalla catena + free dello slot + decremento della riga in place) resta da fare — vedi [ROADMAP](../ROADMAP.md).
+  - Vedi anche [BUG-018](known_bugs.md#2026-08-09--bug-018-delete_edge-rimuove-la-sorgente-da-in_edges-anche-se-altre-relazioni-puntano-ancora-al-target): il primo tentativo sbagliava l'aggiornamento dell'indice inverso.
+- **Riferimenti:** commit `f98f847`, `858af5b`, più working tree. `graph_core/graph.cpp:266` (overload 1), `graph_core/graph.cpp:349` (overload 2), `graph_core/io/graph_io.h:118,140` (`EdgeLocation`, `find_edge_by_id`), `graph_core/io/graph_io.cpp:867` (implementazione della scansione).
 
 ---
 

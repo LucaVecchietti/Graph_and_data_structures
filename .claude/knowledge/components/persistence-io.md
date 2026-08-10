@@ -5,7 +5,7 @@ type: component
 tags: [io, disk]
 aliases: []
 created: 2026-08-09
-updated: 2026-08-09
+updated: 2026-08-10
 status: active
 ---
 
@@ -42,13 +42,17 @@ Move bytes between POD records and the files under `db/`: `nodes.dat`, `nodes.id
   fixed-width relation line in place. If the relation type is new and the last batch of the
   chain is full, it allocates a batch and links it with one 8-byte write to `next_offset`.
   `persist_edge_weight` is an 8-byte in-place write.
-- `update_node_edges` is the whole-node rewrite path, now used only for the inbound cleanup
-  in `delete_node`. It pushes every old batch and edge onto the [[freelist]] bins and pops
+- `update_node_edges` is the whole-node rewrite path, used by `delete_node`'s inbound cleanup
+  and by both `delete_edge` overloads. It pushes every old batch and edge onto the [[freelist]] bins and pops
   exact-size bins for the new ones, which is what makes a weight overwrite cost zero growth.
   For a multi-batch chain it decides where every batch lands before writing any of them,
   because each `next_offset` needs the following batch's offset.
 - `build_inbound_index` does an O(N+E) scan of live slots (skipping tombstones) to rebuild
   [[in-edges-index]] at load.
+- `find_edge_by_id` resolves a global edge id to `EdgeLocation{from_node, to_node, relation}` by
+  the same live-node sweep. There is no id-to-offset index, and a flat scan of `edges.dat` would
+  be unsound: a freed 48-byte slot is zeroed and reads back as `id = 0`, colliding with the real
+  edge id 0. Used by `delete_edge(edge_id)` ([[decision-single-edge-delete-via-rewrite]]).
 - `nodes.idx` is fixed-width, so id lookup is `seekg(id * sizeof(NodeIndex))`.
 
 ## Contracts and constraints

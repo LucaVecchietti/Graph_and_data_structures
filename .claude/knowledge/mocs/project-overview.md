@@ -5,7 +5,7 @@ type: moc
 tags: [architecture]
 aliases: []
 created: 2026-08-09
-updated: 2026-08-09
+updated: 2026-08-10
 status: active
 ---
 
@@ -31,7 +31,7 @@ no test suite.
 [[in-edges-index]] and [[complex-nodes]].
 
 **Working with it** - [[build-and-run]] and [[smoke-test]]. The traps: [[db-path-relative-to-cwd]],
-[[load-bearing-misspellings]], [[docs-drift-vs-code]].
+[[load-bearing-misspellings]], [[docs-drift-vs-code]], [[reverse-index-node-granularity]].
 
 **Historical / out of scope** - [[legacy-c-prototypes]] are early C prototypes not in the build.
 
@@ -42,7 +42,11 @@ no test suite.
   ([[decision-relation-batch-chaining]]).
 - `RELATION_LINES_PER_BATCH` is still 8, so a node pays 2213 bytes per started group of 8
   relation types; lowering it would be a schema break.
-- Deleting a single edge in O(1), an in-place node payload update, and a query layer are all still missing (see [[project-docs]] for the roadmap).
+- Deleting a single edge **exists** but rides the whole-node rewrite, so it is O(deg) and grows
+  `edges.dat` ([[decision-single-edge-delete-via-rewrite]]); the O(1) unlink, an in-place node
+  payload update and a query layer are all still missing (see [[project-docs]] for the roadmap).
+- A traversal materialises the whole reachable component and `nodes` has no eviction
+  ([[decision-lazy-traversal]]), so RAM only grows for the lifetime of a `Graph`.
 
 ## Links
 
