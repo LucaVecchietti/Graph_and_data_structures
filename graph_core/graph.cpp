@@ -49,6 +49,35 @@ void Graph::load_meta()
     Graph::meta = read_meta();
 }
 
+/**
+ * Single lazy-load path: makes a node resident and returns it. See graph.h.
+ * Every public entry point that needs a node in RAM goes through here, so the
+ * "already resident? / id ever assigned? / readable?" decision exists once.
+ */
+BaseNode *Graph::ensure_loaded(int id, const std::string &action)
+{
+    auto it = nodes.find(id);
+    if (it != nodes.end()) return it->second;
+
+    if (static_cast<uint64_t>(id) >= meta.next_id)
+    {
+        Graph::logger.error("Failed to " + action + ": node " + std::to_string(id) + " does not exist.");
+        throw std::out_of_range("Node " + std::to_string(id) + " does not exist.");
+    }
+
+    try
+    {
+        BaseNode *node = read_node(static_cast<uint64_t>(id));
+        nodes[id] = node;
+        return node;
+    }
+    catch (const std::exception &e)
+    {
+        Graph::logger.error("Failed to " + action + ": could not read node " + std::to_string(id) + ": " + e.what());
+        throw std::runtime_error("Failed to read node " + std::to_string(id) + ": " + e.what());
+    }
+}
+
 void Graph::build_in_edges()
 {
     // One O(N + E) scan of the persisted graph rebuilds the reverse index. From
@@ -73,47 +102,8 @@ void Graph::add_edge(int start, int end, std::string type, int weight)
             std::to_string(RELATION_TYPE_MAX_SIZE) + " characters by " + std::to_string(type.length() - RELATION_TYPE_MAX_SIZE) + " characters.");
     }
 
-    if (nodes.find(start) == nodes.end())
-    {   
-        if (static_cast<uint64_t>(start) < meta.next_id)
-        {
-            try{
-                nodes[start] = read_node(static_cast<uint64_t>(start));
-            }
-            catch (const std::exception &e)
-            {
-                Graph::logger.error("Failed to add edge: could not read node " + std::to_string(start) + ": " + e.what());
-                throw std::runtime_error("Failed to read node " + std::to_string(start) + ": " + e.what());
-            }
-        }
-        else
-        {
-            Graph::logger.error("Failed to add edge: node " + std::to_string(start) + " does not exist.");
-            throw std::out_of_range("Node " + std::to_string(start) + " does not exist.");
-        }
-    }
-
-    if (nodes.find(end) == nodes.end())
-    {
-        if (static_cast<uint64_t>(end) < meta.next_id)
-        {
-            try{
-                nodes[end] = read_node(static_cast<uint64_t>(end));
-            }
-            catch (const std::exception &e)
-            {
-                Graph::logger.error("Failed to add edge: could not read node " + std::to_string(end) + ": " + e.what());
-                throw std::runtime_error("Failed to read node " + std::to_string(end) + ": " + e.what());
-            }
-        }
-        else
-        {
-            Graph::logger.error("Failed to add edge: node " + std::to_string(end) + " does not exist.");
-            throw std::out_of_range("Node " + std::to_string(end) + " does not exist.");
-        }
-    }
-
-    BaseNode *node = nodes[start]; // Get the start node from the base nodes vector
+    BaseNode *node = ensure_loaded(start, "add edge"); // start node, from RAM or disk
+    ensure_loaded(end, "add edge");                    // target must exist too
 
     logger.info("Adding edge from node " + std::to_string(start) + " to node " + std::to_string(end) + " with type '" + type + "' and weight " + std::to_string(weight));
 
@@ -179,30 +169,8 @@ void Graph::add_edge(int start, int end, std::string type, int weight)
  */
 void Graph::delete_node(int node_id)
 {
-    // Ensure the node is resident in RAM. If it is not, lazy-load it from disk
-    // (same pattern as add_edge): an id >= meta.next_id was never assigned.
-    if (nodes.find(node_id) == nodes.end())
-    {
-        if (static_cast<uint64_t>(node_id) < meta.next_id)
-        {
-            try
-            {
-                nodes[node_id] = read_node(static_cast<uint64_t>(node_id));
-            }
-            catch (const std::exception &e)
-            {
-                Graph::logger.error("Failed to delete node: could not read node " + std::to_string(node_id) + ": " + e.what());
-                throw std::runtime_error("Failed to read node " + std::to_string(node_id) + ": " + e.what());
-            }
-        }
-        else
-        {
-            Graph::logger.error("Failed to delete node: node " + std::to_string(node_id) + " does not exist.");
-            throw std::out_of_range("Node " + std::to_string(node_id) + " does not exist.");
-        }
-    }
-
-    BaseNode *node = nodes[node_id];
+    // Ensure the node is resident in RAM, lazy-loading it from disk if needed.
+    BaseNode *node = ensure_loaded(node_id, "delete node");
 
     // Log how many edges are being dropped (sum of the neighbor maps over all relation types).
     size_t edge_count = 0;
@@ -241,24 +209,17 @@ void Graph::delete_node(int node_id)
         {
             if (owner_id == node_id) continue; // self-loop: reclaimed with node_id's own edges
 
+            // Unlike the other call sites, an unreadable owner is SKIPPED rather than
+            // fatal: a delete must still reclaim the node it was asked to remove.
             BaseNode *owner = nullptr;
-            auto oit = nodes.find(owner_id);
-            if (oit != nodes.end())
+            try
             {
-                owner = oit->second;
+                owner = ensure_loaded(owner_id, "delete node (inbound cleanup)");
             }
-            else
+            catch (const std::exception &e)
             {
-                try
-                {
-                    owner = read_node(static_cast<uint64_t>(owner_id));
-                }
-                catch (const std::exception &e)
-                {
-                    Graph::logger.error("delete_node: could not load inbound owner " + std::to_string(owner_id) + ": " + e.what());
-                    continue;
-                }
-                nodes[owner_id] = owner;
+                Graph::logger.error("delete_node: could not load inbound owner " + std::to_string(owner_id) + ": " + e.what());
+                continue;
             }
 
             // Erase node_id from every relation of the owner; drop relations left empty.
@@ -308,50 +269,10 @@ void Graph::delete_edge(int start, int end, std::string type)
     // This method should check if the start and end nodes exist, if the edge exists,
     // and then remove the edge from the graph, updating the necessary data structures.
 
-    //Check if the nodes is already loaded in memory, if not load it from disk
-    if (nodes.find(start) == nodes.end())
-    {
-        if (static_cast<uint64_t>(start) < meta.next_id)
-        {
-            try
-            {
-                nodes[start] = read_node(static_cast<uint64_t>(start));
-            }
-            catch (const std::exception &e)
-            {
-                Graph::logger.error("Failed to delete edge: could not read node " + std::to_string(start) + ": " + e.what());
-                throw std::runtime_error("Failed to read node " + std::to_string(start) + ": " + e.what());
-            }
-        }
-        else
-        {
-            Graph::logger.error("Failed to delete edge: node " + std::to_string(start) + " does not exist.");
-            throw std::out_of_range("Node " + std::to_string(start) + " does not exist.");
-        }
-    }
-
-    if (nodes.find(end) == nodes.end())
-    {
-        if (static_cast<uint64_t>(end) < meta.next_id)
-        {
-            try
-            {
-                nodes[end] = read_node(static_cast<uint64_t>(end));
-            }
-            catch (const std::exception &e)
-            {
-                Graph::logger.error("Failed to delete edge: could not read node " + std::to_string(end) + ": " + e.what());
-                throw std::runtime_error("Failed to read node " + std::to_string(end) + ": " + e.what());
-            }
-        }
-        else
-        {
-            Graph::logger.error("Failed to delete edge: node " + std::to_string(end) + " does not exist.");
-            throw std::out_of_range("Node " + std::to_string(end) + " does not exist.");
-        }
-    }
-
-    BaseNode *node = nodes[start]; // Get the start node from the base nodes vector
+    // Both endpoints must be resident: the start node owns the adjacency being edited,
+    // and a missing target means the edge cannot exist.
+    BaseNode *node = ensure_loaded(start, "delete edge");
+    ensure_loaded(end, "delete edge");
 
     auto rel_it = node->neighborgs.find(type);
     if (rel_it != node->neighborgs.end())

@@ -6,8 +6,8 @@
 |---|---|
 | Tipo | roadmap |
 | Lingua | en |
-| Ultimo aggiornamento | 2026-08-09 |
-| Commit di riferimento | 858af5b (+ working tree: `delete_edge` overloads, `find_edge_by_id`, reverse-index fix) |
+| Ultimo aggiornamento | 2026-08-10 |
+| Commit di riferimento | 7eaf864 (+ working tree: `ensure_loaded`, self-checking smoke test) |
 | Mirror | — |
 
 ---
@@ -32,7 +32,7 @@ An **embedded, single-thread graph engine with space reclamation**: CRUD on (typ
 - A node's relations live in a **chain** of fixed-width batches (8 lines each), linked by `next_offset` with `head` 1→2→3. Since 2026-08-09 there is **no cap on relation types per node**: a full batch is extended by allocating a fresh one (freelist pop or append) and patching one 8-byte `next_offset` in place — `nodes.idx` is still never touched. Read, whole-node rewrite and delete all walk the chain, and every batch of a deleted chain goes back onto the `rel` bin.
 
 **Traversal & space**
-- `bfs` / `dfs` — policy-based (one template, queue/stack frontier).
+- `bfs` / `dfs` — policy-based (one template, queue/stack frontier). **Lazy-loading** since 2026-08-10: every node is materialised from disk as it is popped from the frontier (`Graph::ensure_loaded`, the single lazy-load path shared with `add_edge` / `delete_node` / `delete_edge`), so a walk of any depth works on a cold store. A node that cannot be read (never-assigned id, tombstoned slot) throws instead of being silently skipped.
 - **Freelist** with exact-size segregated bins: slot+id reuse on `insert` (primitives and COMPLEX **per type**); every freed region (node record, relation batch, edge) is pushed onto the bins on `delete_node` / `update_node_edges`. Sizes are now standardized: one `rel` bin (2213 B batch) and one `edges` bin (48 B single edge) — a freed edge slot is reused by the next `add_edge`. A weight overwrite is O(1) in place → no file growth.
 - **Reverse index** of inbound edges in RAM (rebuilt at load, delete in O(deg_in)). It is keyed **node → node**, with no relation granularity: a source stays in a target's inbound set as long as *any* of its relations still points there (`delete_edge` checks this before dropping it — getting it wrong left edges dangling at tombstoned slots).
 - Consistent `meta` counters (`node_count`, `edge_count`, `free_count`, `free_edge_count`, monotonic ids).
@@ -44,7 +44,7 @@ An **embedded, single-thread graph engine with space reclamation**: CRUD on (typ
 | Freelist **reuse** | All bin families are reused: `nodes`/`complex` on `insert`, `rel` (single 2213 B class) and `edges` (single 48 B class) on `add_edge` / `update_node_edges`. Since 2026-06-19 standard sizes mean one bin file per struct type. **Remaining boundary:** insert-time `write_relation_node_list` for a fresh node still appends an empty batch (negligible growth) |
 | Relation batches | Chained since 2026-08-09, so the 8-types cap is gone. **Remaining boundaries:** a batch left empty by a shrink is only reclaimed by the whole-node rewrite (`update_node_edges`), never by `persist_new_edge`; and `RELATION_LINES_PER_BATCH` stays at 8, so the on-disk floor is still 2213 B per node (lowering it is a schema break) |
 | Single-edge delete | Both `delete_edge` overloads work and keep RAM, disk and the reverse index consistent, but they ride the whole-node rewrite: O(deg) and `edges.dat` grows per call. `delete_edge(edge_id)` resolves the id by scanning (RAM, then O(N+E) on disk) because no `edge_id` → offset index exists |
-| `traverse` | Does **not** lazy-load: only sees nodes already in RAM (`main.cpp` forces the load with an `add_edge "_load"` trick) |
+| `traverse` | Lazy-loads since 2026-08-10, so no caller needs the old `add_edge "_load"` trick. **Remaining boundary:** a walk materialises the whole reachable component and `nodes` has **no eviction**, so RAM only ever grows for the lifetime of the `Graph` |
 | COMPLEX | The JSON attributes are an **opaque string**: no parsing/query over the fields |
 
 ## 🔴 TODO — what is missing
@@ -59,7 +59,7 @@ An **embedded, single-thread graph engine with space reclamation**: CRUD on (typ
   - **Lifecycle parity:** the edge sidecar must be removed and its `prog_number` recycled when the edge is dropped (on `delete_node` and on a future single-edge delete), exactly as COMPLEX node deletion does today.
 - [ ] **Update** a node's payload in place (today only delete + insert)
 - [ ] Query layer: filters, attribute search, traversal with predicates
-- [ ] Lazy-load inside `traverse` (drop the `_load` trick)
+- [x] Lazy-load inside `traverse` (drop the `_load` trick) — done 2026-08-10: `ensure_loaded` on every frontier pop; guarded by `main.cpp` Phase 2, which walks a 2-hop chain from a cold store.
 - [ ] Undirected edges / exposed reverse queries
 
 **Format robustness**
@@ -68,7 +68,7 @@ An **embedded, single-thread graph engine with space reclamation**: CRUD on (typ
 - [ ] Crash safety / transactions / WAL (writes are not atomic)
 
 **Infrastructure**
-- [ ] **No test suite** (only the `main.cpp` smoke test with visual log comparison). Phases 1-7 cover insert / reload / delete+reuse / COMPLEX / compaction / edge chains / relation-batch chaining. **`delete_edge` is not covered by any phase** — both overloads and the reverse-index granularity were verified with a throwaway harness, so there is no regression guard for them.
+- [ ] **No test suite** (only the `main.cpp` smoke test). Since 2026-08-10 it self-checks: every phase states its expectations, and the run ends with a verdict plus a non-zero exit code on failure — no more log eyeballing. Phases 1-7 cover insert / cold-reload traversal / delete+reuse / COMPLEX / compaction / edge chains / relation-batch chaining. **`delete_edge` is not covered by any phase** — both overloads and the reverse-index granularity were verified with a throwaway harness, so there is no regression guard for them.
 - [ ] Real CLI / API (today `main.cpp` is a hand-driven bench)
 - [ ] Thread safety / concurrency (logger has no mutex, no locking)
 

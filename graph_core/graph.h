@@ -37,6 +37,18 @@ private:
     void load_meta();
     void build_in_edges(); // populate in_edges from disk (called once at load)
 
+    /**
+     * Makes node `id` resident in the RAM map and returns it, reading it from disk on
+     * first touch. Single lazy-load path shared by add_edge, delete_node, delete_edge
+     * and traverse, so they cannot drift apart.
+     * @param id     Node id to materialise.
+     * @param action Verb used only to shape the log line ("add edge", "traverse", ...).
+     * @return The resident node — never null.
+     * @throws std::out_of_range if the id was never assigned (>= meta.next_id).
+     * @throws std::runtime_error if the record cannot be read (e.g. a tombstoned slot).
+     */
+    BaseNode *ensure_loaded(int id, const std::string &action);
+
 public:
     Graph();// Basic constructor
 
@@ -185,30 +197,8 @@ public:
         std::unordered_set<int> visited;
         typename Policy::Frontier frontier;
 
-        auto lazy_load_node = [&](int node_id) {
-            if (nodes.find(node_id) == nodes.end())
-            {
-                if (static_cast<uint64_t>(node_id) < meta.next_id)
-                {
-                    try
-                    {
-                        nodes[node_id] = read_node(static_cast<uint64_t>(node_id));
-                    }
-                    catch (const std::exception &e)
-                    {
-                        Graph::logger.error("Failed to traverse: could not read node " + std::to_string(node_id) + ": " + e.what());
-                        throw std::runtime_error("Failed to read node " + std::to_string(node_id) + ": " + e.what());
-                    }
-                }
-                else
-                {
-                    Graph::logger.error("Failed to traverse: node " + std::to_string(node_id) + " does not exist.");
-                    throw std::out_of_range("Node " + std::to_string(node_id) + " does not exist.");
-                }
-            }
-        };
-
-        lazy_load_node(start);
+        // Lazy load the start node; every node popped below is materialised the same way.
+        ensure_loaded(start, "traverse");
 
         // Marks a node as visited, fires the node callback, pushes to frontier
         auto visit = [&](int idx)
@@ -224,16 +214,15 @@ public:
         {
             int current = Policy::pop(frontier);
 
-            lazy_load_node(current); // Ensure the current node is loaded in memory
+            // Materialise the node before expanding it: a node discovered as a
+            // neighbour is NOT resident yet, and skipping it would silently cut the
+            // walk short at depth 1. ensure_loaded either returns the node or throws,
+            // so there is no "not found" case left to handle here.
+            BaseNode *current_node = ensure_loaded(current, "traverse");
 
-            // save some time by looking up the node once instead of per edge
-            auto nodeIt = nodes.find(current);
-            if (nodeIt == nodes.end())
-                continue; // nodo non esiste
-
-            auto it = nodeIt->second->neighborgs.find(type);
-            if (it == nodeIt->second->neighborgs.end())
-                continue;
+            auto it = current_node->neighborgs.find(type);
+            if (it == current_node->neighborgs.end())
+                continue; // this node has no edge of the traversed relation
 
             for (auto &[neighborgIdx, edge] : it->second)
             {
