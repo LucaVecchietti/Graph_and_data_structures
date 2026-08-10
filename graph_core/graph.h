@@ -166,12 +166,46 @@ public:
      * Generic graph traversal — behavior determined by Policy at compile time.
      * NodeFn: callback(int nodeIdx)            — fired when a node is first visited
      * EdgeFn: callback(int from, int to, int weight) — fired for every edge explored
+     * 
+     * @tparam Policy The traversal policy (e.g., BFS or DFS) that defines the order of node exploration.
+     * @tparam NodeFn The type of the node callback function.
+     * @tparam EdgeFn The type of the edge callback function.
+     * 
+     * @param start The ID of the starting node for the traversal.
+     * @param type The relation type of edges to traverse (e.g., "road", "train"). Only edges of this type will be followed during the traversal.
+     * @param on_node The callback function to invoke when a node is first visited.
+     * @param on_edge The callback function to invoke for each edge explored.
+     * 
+     * @throws std::out_of_range if the starting node does not exist.
+     * @throws std::invalid_argument if the relation type exceeds the maximum allowed size.
      */
     template <typename Policy, typename NodeFn, typename EdgeFn>
     void traverse(int start, const std::string &type, NodeFn &&on_node, EdgeFn &&on_edge)
     {
         std::unordered_set<int> visited;
         typename Policy::Frontier frontier;
+
+        //Lazy load the start node if it is not already in memory
+        if (nodes.find(start) == nodes.end())
+        {
+            if (static_cast<uint64_t>(start) < meta.next_id)
+            {
+                try
+                {
+                    nodes[start] = read_node(static_cast<uint64_t>(start));
+                }
+                catch (const std::exception &e)
+                {
+                    Graph::logger.error("Failed to traverse: could not read node " + std::to_string(start) + ": " + e.what());
+                    throw std::runtime_error("Failed to read node " + std::to_string(start) + ": " + e.what());
+                }
+            }
+            else
+            {
+                Graph::logger.error("Failed to traverse: node " + std::to_string(start) + " does not exist.");
+                throw std::out_of_range("Node " + std::to_string(start) + " does not exist.");
+            }
+        }
 
         // Marks a node as visited, fires the node callback, pushes to frontier
         auto visit = [&](int idx)
